@@ -1,0 +1,9 @@
+(executable
+ (name verify)
+ (modules verify)
+ (libraries unix str execution))
+
+(executable
+ (name fault)
+ (modules fault)
+ (libraries unix))

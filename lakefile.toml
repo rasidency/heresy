@@ -1,0 +1,7 @@
+name = "heresy"
+version = "0.2.0"
+defaultTargets = ["Proof"]
+
+[[lean_lib]]
+name = "Proof"
+srcDir = "proof"

@@ -1,0 +1,12 @@
+(install
+ (section doc)
+ (files lean-toolchain lakefile.toml lake-manifest.json
+  (proof/Proof.lean as proof/Proof.lean)
+  (assets/pipeline.svg as assets/pipeline.svg)
+  (assets/capability.svg as assets/capability.svg)))
+
+(rule
+ (alias runtest)
+ (deps (source_tree examples) test/lowering.c test/values.c)
+ (action (run %{exe:test/verify.exe} %{exe:src/heresy.exe} %{exe:test/fault.exe})))
+

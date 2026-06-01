@@ -1,0 +1,10 @@
+(executable
+ (name embed)
+ (modules embed)
+ (libraries str))
+
+(executable
+ (name release)
+ (modules release)
+ (link_deps ../src/heresy.exe)
+ (libraries unix str execution))

@@ -1,0 +1,14 @@
+opam-version: "2.0"
+version: "0.2.0"
+synopsis: "Compile a checked subset of Fil-C to standalone Haskell"
+maintainer: "ebdilo"
+description: "OCaml translator and capability runtime for Fil-C"
+depends: [
+  "ocaml" {= "5.5.0"}
+  "dune" {= "3.24.2"}
+]
+build: [
+  ["dune" "build" "-p" name "-j" jobs]
+  ["dune" "runtest" "-p" name "-j" jobs] {with-test}
+  ["lake" "build"] {with-test}
+]

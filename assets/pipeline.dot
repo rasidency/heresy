@@ -1,0 +1,16 @@
+digraph pipeline {
+  graph [rankdir=LR, bgcolor=white, pad=0.2, nodesep=0.4, ranksep=0.45, fontname="CMU Serif", fontsize=18];
+  node [shape=box, fontname="CMU Serif", fontsize=18, color=black, fontcolor=black, penwidth=0.9, margin="0.16,0.12"];
+  edge [color=black, penwidth=0.9, arrowsize=0.65];
+  source [label="Fil-C source"];
+  ast [label="Typed AST\nbefore instrumentation"];
+  lower [label="OCaml lowering\nLP64 layout and control flow"];
+  module [label="Standalone Haskell\nembedded capability runtime"];
+  generated [label="GHC execution"];
+  native [label="Native Fil-C execution"];
+  compare [label="Differential checks\noutput and termination"];
+  source -> ast -> lower -> module -> generated -> compare;
+  source -> native [minlen=4];
+  native -> compare;
+  { rank=same; generated; native; }
+}

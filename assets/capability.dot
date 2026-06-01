@@ -1,0 +1,36 @@
+digraph capability {
+  graph [rankdir=TB, bgcolor=white, pad=0.2, nodesep=0.5, ranksep=0.45, fontname="CMU Serif", fontsize=18];
+  node [shape=plain, fontname="CMU Serif", fontsize=18, fontcolor=black];
+  edge [color=black, penwidth=0.9, arrowsize=0.65];
+  store [label=<
+    <TABLE BORDER="1" CELLBORDER="0" CELLSPACING="0" CELLPADDING="9" COLOR="black">
+      <TR><TD><B>Pointer store</B></TD></TR>
+      <TR><TD><FONT FACE="CMU Typewriter Text" POINT-SIZE="16">08 20 00 00 00 00 00 00</FONT></TD></TR>
+      <TR><TD PORT="cap">shadow = #29</TD></TR>
+    </TABLE>
+  >];
+  write [label=<
+    <TABLE BORDER="1" CELLBORDER="0" CELLSPACING="0" CELLPADDING="9" COLOR="black">
+      <TR><TD><B>Integer write</B></TD></TR>
+      <TR><TD><FONT FACE="CMU Typewriter Text" POINT-SIZE="16">09 20 00 00 00 00 00 00</FONT></TD></TR>
+      <TR><TD>shadow = #29</TD></TR>
+    </TABLE>
+  >];
+  load [label=<
+    <TABLE BORDER="1" CELLBORDER="0" CELLSPACING="0" CELLPADDING="9" COLOR="black">
+      <TR><TD><B>Pointer load</B></TD></TR>
+      <TR><TD><FONT FACE="CMU Typewriter Text" POINT-SIZE="16">address = 0x2009</FONT></TD></TR>
+      <TR><TD PORT="cap">capability = #29</TD></TR>
+    </TABLE>
+  >];
+  allocation [shape=box, penwidth=0.9, margin="0.16,0.12", label="Allocation #29\n[0x2000, 0x2010)\nlive = true"];
+  access [shape=box, penwidth=0.9, margin="0.16,0.12", label="Dereference of n bytes at a\nlive ∧ lower ≤ a ≤ upper\nn ≤ upper − a"];
+  freed [shape=box, penwidth=0.9, margin="0.16,0.12", label="free(base)\nlive = false for every alias"];
+  { rank=same; store; write; load; }
+  { rank=same; allocation; access; }
+  store -> write -> load;
+  store:cap -> allocation [style=dashed];
+  load:cap -> allocation [style=dashed];
+  allocation -> access;
+  allocation -> freed;
+}

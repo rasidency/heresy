@@ -1,0 +1,19 @@
+name: Verify
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - run: docker build -f Containerfile -t heresy .
+      - run: docker run --rm --network none heresy
+      - run: >-
+          docker run --rm --network none heresy sh -c
+          'dune exec --profile release tools/release.exe -- /tmp/first &&
+          dune exec --profile release tools/release.exe -- /tmp/second &&
+          cmp /tmp/first/checksums.txt /tmp/second/checksums.txt &&
+          cd /tmp/first && sha256sum -c checksums.txt &&
+          tar -xzf heresy.tar.gz && ./heresy/bin/heresy --version'

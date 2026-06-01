@@ -1,0 +1,855 @@
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+module Heap
+  ( Value(Number, Single, DoublePrecision), CType(..), Flow(..), R, nullPointer, noValue, marshal, convert
+  , number, truth, normalise, cast, panic, at, offset, load, store
+  , frame, declare, variable, parameter, global, literal, materialise, clear
+  , freeze
+  , chain, discard, branch, loop, postloop, selection, dispatch, logic, boolean, binary, unary
+  , assign, update, realBinary, realUpdate, function, invoke, execute
+  , argumentArea, vaStart, vaCopy, vaArg, vaAvailable
+  ) where
+
+import Control.Monad
+import Control.Monad.Except
+import Control.Monad.State.Strict
+import Data.Bits
+import qualified Data.ByteString.Char8 as B
+import Data.Char
+import Data.IORef
+import Data.List (intercalate)
+import GHC.Environment (getFullArgs)
+import qualified GHC.Foreign as F
+import GHC.Float (castFloatToWord32, castWord32ToFloat, castDoubleToWord64, castWord64ToDouble, float2Double, double2Float)
+import GHC.IO.Encoding (getFileSystemEncoding)
+import qualified Data.IntMap.Strict as M
+import qualified Data.Map.Strict as S
+import Numeric (showHex, showOct)
+import System.Environment
+import System.Exit
+import System.IO
+import System.IO.Error (tryIOError, ioeGetErrorString)
+
+data Capability = NoCapability | Capability !Int !(IORef Object) deriving Eq
+instance Show Capability where
+  show NoCapability = "0"
+  show (Capability ident _) = show ident
+data Value = Number !Integer | Pointer !Capability !Integer | Function !Integer !String | Stream !Int !Integer
+  | Single !Float | DoublePrecision !Double | Aggregate !Int !(M.IntMap Integer) !(M.IntMap Value) | NoValue deriving (Eq, Show)
+data CType = IntegerType !Int !Bool | PointerType | FloatingType !Int | AggregateType !Int deriving (Eq, Show)
+data Flow = Next | Return !Value | Break | Continue | Jump !Int deriving (Eq, Show)
+data Fault = Panic !String | Finish !Int deriving (Eq, Show)
+data Object = Object
+  { base :: !Integer, extent :: !Int, live :: !Bool, storage :: !String
+  , bytes :: !(M.IntMap Integer), shadow :: !(M.IntMap Value), origin :: !String }
+data World = World
+  { serial :: !Int, address :: !Integer
+  , frames :: ![S.Map String Value], globals :: !(S.Map String Value)
+  , literals :: !(S.Map String Value), functions :: !(S.Map String ([Value] -> R Value))
+  , symbols :: !(S.Map String Integer)
+  , location :: !String, events :: !Int, recent :: ![String], tracing :: !Bool, history :: !Bool
+  , streams :: !(M.IntMap Handle), nextStream :: !Int }
+newtype R a = R { unR :: ExceptT Fault (StateT World IO) a }
+  deriving (Functor, Applicative, Monad, MonadIO, MonadState World, MonadError Fault)
+
+number :: Value -> Integer
+number (Number n) = n
+number (Pointer _ n) = n
+number (Function code _) = code
+number (Stream _ raw) = raw
+number (Single value) = toInteger (castFloatToWord32 value)
+number (DoublePrecision value) = toInteger (castDoubleToWord64 value)
+number (Aggregate _ _ _) = 0
+number NoValue = 0
+
+truth :: Value -> Bool
+truth (Single value) = value /= 0
+truth (DoublePrecision value) = value /= 0
+truth v = number v /= 0
+
+normalise :: Int -> Bool -> Integer -> Integer
+normalise width signed n =
+  let modulus = 2 ^ width
+      bits = n `mod` modulus
+  in if signed && bits >= modulus `div` 2 then bits - modulus else bits
+
+cast :: CType -> Value -> Value
+cast (IntegerType w s) v = Number (normalise w s (number v))
+cast PointerType p@(Pointer _ _) = p
+cast PointerType f@(Function _ _) = f
+cast PointerType s@(Stream _ _) = s
+cast PointerType (Number n) = Pointer NoCapability (normalise 64 False n)
+cast PointerType NoValue = nullPointer
+cast PointerType (Aggregate _ _ _) = nullPointer
+cast PointerType (Single _) = nullPointer
+cast PointerType (DoublePrecision _) = nullPointer
+cast (FloatingType 32) value = Single (castWord32ToFloat (fromInteger (number value)))
+cast (FloatingType _) value = DoublePrecision (castWord64ToDouble (fromInteger (number value)))
+cast (AggregateType _) v = v
+
+convert :: CType -> Value -> R Value
+convert (FloatingType 32) value = pure (Single (asSingle value))
+convert (FloatingType _) value = pure (DoublePrecision (asDouble value))
+convert ty@(IntegerType width signed) value = case value of
+  Single real -> integer (float2Double real)
+  DoublePrecision real -> integer real
+  _ -> pure (cast ty value)
+  where
+    integer real
+      | isNaN real || isInfinite real = panic "non-finite floating-to-integer conversion"
+      | otherwise =
+          let result = truncate real
+          in if normalise width signed result == result then pure (Number result)
+             else panic "floating-to-integer conversion out of range"
+convert ty value = pure (cast ty value)
+
+nullPointer :: Value
+nullPointer = Pointer NoCapability 0
+
+noValue :: Value
+noValue = NoValue
+
+marshal :: CType -> Value -> Value
+marshal (IntegerType width _) value = Number (normalise width False (number value))
+marshal PointerType value = cast PointerType value
+marshal (FloatingType width) value = Number (normalise width False (number value))
+marshal (AggregateType _) value = value
+
+slotSize :: Int -> Integer
+slotSize size = ((toInteger size + 7) `div` 8) * 8
+
+argumentArea :: [Value] -> R Value
+argumentArea values = do
+  let slot value = case value of
+        Aggregate size _ _ -> (AggregateType size, value)
+        _ | addressed value -> (PointerType, value)
+          | otherwise -> (IntegerType 64 False, value)
+      slots = map slot values
+      offsets = scanl (\index (ty, _) -> index + slotSize (widthOf ty)) 0 slots
+  size <- hostSize (last offsets)
+  area <- allocate "argument" size
+  forM_ (zip offsets slots) $ \(index, (ty, value)) ->
+    void (store ty (offset index area) value)
+  freeze (pure area)
+  pure area
+
+vaStart :: Value -> [CType] -> R Value -> R Value
+vaStart area named list = do
+  pointer <- list
+  let start = sum (map (slotSize . widthOf) named)
+  store PointerType pointer (offset start area) >> pure (Number 0)
+
+vaCopy :: R Value -> R Value -> R Value
+vaCopy destination source = do
+  pointer <- destination
+  cursor <- source >>= load PointerType
+  store PointerType pointer cursor >> pure (Number 0)
+
+vaArg :: CType -> R Value -> R Value
+vaArg ty list = do
+  pointer <- list
+  cursor <- load PointerType pointer
+  value <- load ty cursor
+  void (store PointerType pointer (offset (slotSize (widthOf ty)) cursor))
+  pure value
+
+vaAvailable :: R Value -> R Value
+vaAvailable list = do
+  cursor <- list >>= load PointerType
+  case cursor of
+    Pointer NoCapability _ -> pure (boolean False)
+    Pointer capability raw -> do
+      object <- readObject capability
+      pure (boolean (live object && raw >= base object && raw + 8 <= base object + toInteger (extent object)))
+    _ -> pure (boolean False)
+
+readObject :: Capability -> R Object
+readObject NoCapability = panic "access through a pointer with no allocation capability"
+readObject (Capability _ reference) = liftIO (readIORef reference)
+
+writeObject :: Capability -> Object -> R ()
+writeObject NoCapability _ = panic "access through a pointer with no allocation capability"
+writeObject (Capability _ reference) object = liftIO (writeIORef reference object)
+
+panic :: String -> R a
+panic message = do
+  loc <- gets location
+  throwError (Panic (loc ++ ": " ++ message))
+
+at :: String -> R a -> R a
+at loc action = do
+  old <- gets location
+  modify' (\w -> w { location = loc })
+  result <- action
+  modify' (\w -> w { location = old })
+  pure result
+
+event :: String -> R ()
+event message = do
+  recorded <- gets history
+  when recorded $ do
+    n <- gets events
+    loc <- gets location
+    let packed = B.pack (show (n + 1) ++ "  " ++ message ++ "  [" ++ loc ++ "]")
+    B.length packed `seq` modify' (\w -> w { events = n + 1, recent = take 8 (B.unpack packed : recent w) })
+    enabled <- gets tracing
+    when enabled (liftIO (B.hPutStrLn stderr packed))
+
+allocate :: String -> Int -> R Value
+allocate kind size = do
+  let alignment = if kind == "global" then 8 else 16
+  when (size < 0 || size > maxBound - alignment + 1) (panic "allocation size exceeds the host representation")
+  w <- get
+  let ident = serial w
+      start = ((address w + 15) `div` 16) * 16
+      rounded = ((size + alignment - 1) `div` alignment) * alignment
+      object = Object start rounded True kind M.empty M.empty (location w)
+  when (ident == maxBound || start + toInteger rounded >= 4611686018427387904) (panic "virtual address space exhausted")
+  reference <- liftIO (newIORef object)
+  put w { serial = ident + 1
+        , address = start + toInteger (max rounded 1) + 16 }
+  event ("allocate #" ++ show ident ++ " " ++ show rounded ++ " bytes (" ++ kind ++ ")")
+  pure (Pointer (Capability ident reference) start)
+
+checked :: Int -> Value -> R (Capability, Object, Int)
+checked size (Pointer capability raw) = do
+  object <- readObject capability
+  unless (live object) (panic ("use after free of allocation #" ++ show capability ++ "; allocated at " ++ origin object))
+  let displacement = raw - base object
+  when (size < 0 || displacement < 0 || displacement > toInteger (extent object) || toInteger size > toInteger (extent object) - displacement)
+    (panic ("out of bounds in allocation #" ++ show capability ++ ": offset " ++ show displacement ++ ", access " ++ show size ++ ", extent " ++ show (extent object)))
+  pure (capability, object, fromInteger displacement)
+checked _ _ = panic "memory access requires a data pointer"
+
+widthOf :: CType -> Int
+widthOf PointerType = 8
+widthOf (IntegerType width _) = width `div` 8
+widthOf (AggregateType width) = width
+widthOf (FloatingType width) = width `div` 8
+
+aggregateBytes :: Int -> Int -> M.IntMap a -> M.IntMap a
+aggregateBytes start count values =
+  M.mapKeysMonotonic (subtract start) (M.takeWhileAntitone (< start + count) (M.dropWhileAntitone (< start) values))
+
+aggregateShadow :: Int -> Int -> M.IntMap Value -> M.IntMap Value
+aggregateShadow start count = aggregateBytes start (max 0 (count - 7))
+
+load :: CType -> Value -> R Value
+load ty pointer = do
+  (ident, object, displacement) <- checked (widthOf ty) pointer
+  when (ty == PointerType && number pointer `mod` 8 /= 0) (panic "unaligned pointer load")
+  let raw = sum [M.findWithDefault 0 (displacement + i) (bytes object) * 256 ^ i | i <- [0 .. widthOf ty - 1]]
+      value = case ty of
+        IntegerType width signed -> Number (normalise width signed raw)
+        FloatingType _ -> cast ty (Number raw)
+        AggregateType size -> Aggregate size (aggregateBytes displacement size (bytes object)) (aggregateShadow displacement size (shadow object))
+        PointerType -> case M.lookup displacement (shadow object) of
+          Just (Pointer cap _) -> Pointer cap raw
+          Just (Function _ name) -> Function raw name
+          Just (Stream streamId _) -> Stream streamId raw
+          _ -> Pointer NoCapability raw
+  unless (storage object == "literal") (event ("load #" ++ show ident ++ "+" ++ show displacement ++ " = " ++ describe value))
+  pure value
+
+store :: CType -> Value -> Value -> R Value
+store (AggregateType size) pointer value@(Aggregate actual payload caps) | size == actual = do
+  (ident, object, displacement) <- checked size pointer
+  when (readOnly object) (panic "write to read-only memory")
+  when (not (M.null caps) && number pointer `mod` 8 /= 0) (panic "unaligned aggregate pointer store")
+  let replace start count new old =
+        let before = M.takeWhileAntitone (< start) old
+            after = M.dropWhileAntitone (< start + count) old
+        in M.unions [before, M.mapKeysMonotonic (+ start) new, after]
+      firstWord = ((displacement + 7) `div` 8) * 8
+      pastWords = max firstWord (displacement + size - 7)
+      updated = replace displacement size payload (bytes object)
+      retained = M.union (M.takeWhileAntitone (< firstWord) (shadow object)) (M.dropWhileAntitone (< pastWords) (shadow object))
+      capabilities = M.union (M.mapKeysMonotonic (+ displacement) caps) retained
+  writeObject ident (object { bytes = updated, shadow = capabilities })
+  pure value
+store (AggregateType _) _ _ = panic "incompatible aggregate value"
+store _ _ (Aggregate _ _ _) = panic "aggregate value used as a scalar"
+store ty pointer value = do
+  (ident, object, displacement) <- checked (widthOf ty) pointer
+  when (readOnly object) (panic "write to read-only memory")
+  when (ty == PointerType && number pointer `mod` 8 /= 0) (panic "unaligned pointer store")
+  let converted = cast ty value
+      raw = number converted
+      updated = foldl (\m i -> M.insert (displacement + i) ((raw `div` (256 ^ i)) `mod` 256) m) (bytes object) [0 .. widthOf ty - 1]
+      caps = if ty == PointerType then M.insert displacement converted (shadow object) else shadow object
+  writeObject ident (object { bytes = updated, shadow = caps })
+  event ("store #" ++ show ident ++ "+" ++ show displacement ++ " = " ++ describe converted)
+  pure converted
+
+describe :: Value -> String
+describe (Number n) = show n
+describe (Single value) = show value
+describe (DoublePrecision value) = show value
+describe (Pointer cap raw) = "pointer(#" ++ show cap ++ ", " ++ show raw ++ ")"
+describe (Function _ name) = "function(" ++ name ++ ")"
+describe (Stream ident _) = "stream(#" ++ show ident ++ ")"
+describe (Aggregate size _ _) = "aggregate(" ++ show size ++ " bytes)"
+describe NoValue = "void"
+
+offset :: Integer -> Value -> Value
+offset n (Pointer cap raw) = Pointer cap (normalise 64 False (raw + n))
+offset n (Function raw name) = Function (normalise 64 False (raw + n)) name
+offset n (Stream ident raw) = Stream ident (normalise 64 False (raw + n))
+offset _ v = v
+
+addressed :: Value -> Bool
+addressed (Pointer _ _) = True
+addressed (Function _ _) = True
+addressed (Stream _ _) = True
+addressed _ = False
+
+release :: Value -> R ()
+release (Pointer NoCapability 0) = pure ()
+release pointer@(Pointer ident _) = do
+  (_, object, displacement) <- checked 0 pointer
+  unless (storage object == "heap" && displacement == 0) (panic "free requires the start of a heap allocation")
+  writeObject ident (object { live = False, bytes = M.empty, shadow = M.empty })
+  event ("free #" ++ show ident ++ "; all aliases invalidated")
+release _ = panic "free requires a data pointer"
+
+frame :: R Flow -> R Value
+frame action = do
+  modify' (\w -> w { frames = S.empty : frames w })
+  flow <- action `catchError` (\fault -> modify' (\w -> w { frames = tail (frames w) }) >> throwError fault)
+  modify' (\w -> w { frames = tail (frames w) })
+  case flow of
+    Return value -> pure value
+    Next -> pure (Number 0)
+    _ -> panic "loop control escaped its function"
+
+declare :: String -> Int -> R Value
+declare name size = do
+  p <- allocate "local" size
+  modify' (\w -> w { frames = case frames w of
+    [] -> []
+    env : rest -> S.insert name p env : rest })
+  pure p
+
+variable :: String -> R Value
+variable name = do
+  w <- get
+  case (case frames w of [] -> Nothing; env : _ -> S.lookup name env) of
+    Just pointer -> pure pointer
+    Nothing -> maybe (panic ("unknown variable " ++ name)) pure (S.lookup name (globals w))
+
+parameter :: String -> CType -> Value -> R ()
+parameter name ty value = declare name (widthOf ty) >>= \p -> void (store ty p value)
+
+temporary :: Int -> (Value -> R ()) -> R Value
+temporary size initialiseObject = do
+  pointer <- allocate "local" size
+  initialiseObject pointer
+  pure pointer
+
+materialise :: CType -> R Value -> R Value
+materialise ty action = do
+  value <- action
+  temporary (widthOf ty) (\pointer -> void (store ty pointer value))
+
+clear :: Int -> Value -> R ()
+clear size pointer = void (store (AggregateType size) pointer (Aggregate size M.empty M.empty))
+
+global :: String -> Int -> R Value
+global name size = do
+  p <- allocate "global" size
+  modify' (\w -> w { globals = S.insert name p (globals w) })
+  pure p
+
+readOnly :: Object -> Bool
+readOnly object = storage object `elem` ["literal", "constant"]
+
+freeze :: R Value -> R ()
+freeze action = do
+  pointer <- action
+  case pointer of
+    Pointer capability _ -> do
+      object <- readObject capability
+      writeObject capability (object { storage = "constant" })
+    _ -> panic "read-only storage requires a data pointer"
+
+literal :: String -> R Value
+literal text = do
+  found <- gets (S.lookup text . literals)
+  case found of
+    Just p -> pure p
+    Nothing -> do
+      oldEvents <- gets events
+      oldRecent <- gets recent
+      oldTracing <- gets tracing
+      oldHistory <- gets history
+      modify' (\w -> w { tracing = False, history = False })
+      pointer <- allocate "global" (length text + 1)
+      forM_ (zip [0..] (map ord text ++ [0])) $ \(i, c) -> void (store (IntegerType 8 False) (offset i pointer) (Number (toInteger c)))
+      case pointer of
+        Pointer capability _ -> do
+          object <- readObject capability
+          writeObject capability (object { storage = "literal" })
+          modify' (\w -> w { literals = S.insert text pointer (literals w) })
+        _ -> pure ()
+      modify' (\w -> w { events = oldEvents, recent = oldRecent, tracing = oldTracing, history = oldHistory })
+      pure pointer
+
+argument :: String -> R Value
+argument text = do
+  payload <- liftIO $ do
+    encoding <- getFileSystemEncoding
+    F.withCString encoding text B.packCString
+  pointer <- allocate "argument" (B.length payload + 1)
+  forM_ (zip [0..] (B.unpack payload ++ ['\0'])) $ \(i, c) -> void (store (IntegerType 8 False) (offset i pointer) (Number (toInteger (ord c))))
+  pure pointer
+
+readString :: Value -> R String
+readString pointer = collect pointer []
+  where
+    collect current reversed = do
+      value <- load (IntegerType 8 False) current
+      if number value == 0 then pure (reverse reversed)
+        else collect (offset 1 current) (chr (fromInteger (number value)) : reversed)
+
+chain :: [R Flow] -> R Flow
+chain [] = pure Next
+chain (action : rest) = action >>= \flow -> if flow == Next then chain rest else pure flow
+
+discard :: R Value -> R Flow
+discard action = action >> pure Next
+
+branch :: R Value -> R Flow -> R Flow -> R Flow
+branch condition yes no = condition >>= \v -> if truth v then yes else no
+
+loop :: R Value -> R Flow -> R Value -> R Flow
+loop condition body advance = do
+  value <- condition
+  if not (truth value) then pure Next else do
+    result <- body
+    case result of
+      Return v -> pure (Return v)
+      Break -> pure Next
+      _ -> advance >> loop condition body advance
+
+postloop :: R Flow -> R Value -> R Flow
+postloop body condition = do
+  result <- body
+  case result of
+    Return value -> pure (Return value)
+    Break -> pure Next
+    _ -> do
+      value <- condition
+      if truth value then postloop body condition else pure Next
+
+selection :: R Value -> [(Maybe (R Value, R Value), R Flow)] -> R Flow
+selection condition entries = do
+  value <- number <$> condition
+  let search fallback [] = pure fallback
+      search fallback remaining@((label, _) : rest) = case label of
+        Nothing -> search (Just remaining) rest
+        Just (lower, upper) -> do
+          lo <- number <$> lower
+          hi <- number <$> upper
+          if lo <= value && value <= hi then pure (Just remaining) else search fallback rest
+  selected <- search Nothing entries
+  result <- maybe (pure Next) (chain . map snd) selected
+  pure (if result == Break then Next else result)
+
+dispatch :: Int -> [(Int, R Flow)] -> R Flow
+dispatch entry blocks = go entry
+  where
+    table = M.fromList blocks
+    go index = case M.lookup index table of
+      Nothing -> panic "invalid control-flow target"
+      Just action -> do
+        result <- action
+        case result of
+          Jump next -> go next
+          _ -> pure result
+
+logic :: Bool -> R Value -> R Value -> R Value
+logic conjunction left right = do
+  a <- left
+  if truth a == conjunction then boolean . truth <$> right else pure (boolean (not conjunction))
+
+boolean :: Bool -> Value
+boolean b = Number (if b then 1 else 0)
+
+calculate :: String -> Int -> Bool -> Integer -> Value -> Value -> Either String Value
+calculate op width signed stride a b =
+  let x = number a; y = number b
+      wrap n = Right (Number (normalise width signed n))
+      comparison f = Right (boolean (f x y))
+      arithmetic n = if signed && (n < negate (2 ^ (width - 1)) || n >= 2 ^ (width - 1))
+        then Left "signed integer overflow" else wrap n
+  in case op of
+    "+" -> case (a, b) of
+      (_, Number _) | addressed a -> Right (offset (y * stride) a)
+      (Number _, _) | addressed b -> Right (offset (x * stride) b)
+      _ -> arithmetic (x + y)
+    "-" -> case (a, b) of
+      (_, Number _) | addressed a -> Right (offset (negate y * stride) a)
+      _ | addressed a && addressed b -> if stride == 0 then Left "zero pointer stride" else wrap ((x - y) `quot` stride)
+      _ -> arithmetic (x - y)
+    "*" -> arithmetic (x * y)
+    "/" -> if y == 0 then Left "division by zero" else arithmetic (x `quot` y)
+    "%" -> if y == 0 then Left "division by zero" else if signed && x == negate (2 ^ (width - 1)) && y == -1 then Left "signed division overflow" else wrap (x `rem` y)
+    "&" -> wrap (x .&. y)
+    "|" -> wrap (x .|. y)
+    "^" -> wrap (xor x y)
+    "<<" -> if y < 0 || y >= toInteger width then Left "invalid shift count" else if signed && x < 0 then Left "left shift of a negative integer" else arithmetic (shiftL x (fromInteger y))
+    ">>" -> if y < 0 || y >= toInteger width then Left "invalid shift count" else wrap (shiftR x (fromInteger y))
+    "==" -> comparison (==)
+    "!=" -> comparison (/=)
+    "<" -> comparison (<)
+    "<=" -> comparison (<=)
+    ">" -> comparison (>)
+    ">=" -> comparison (>=)
+    _ -> Left ("unsupported binary operator " ++ op)
+
+binary :: String -> Int -> Bool -> Integer -> R Value -> R Value -> R Value
+binary op width signed stride left right = do
+  a <- left
+  b <- right
+  either panic pure (calculate op width signed stride a b)
+
+unary :: String -> CType -> R Value -> R Value
+unary op ty expression = do
+  value <- expression
+  case op of
+    "!" -> pure (boolean (not (truth value)))
+    "~" -> pure (cast ty (Number (complement (number value))))
+    "-" -> case ty of
+      IntegerType w s -> either panic pure (calculate "-" w s 1 (Number 0) value)
+      FloatingType 32 -> pure (Single (negate (asSingle value)))
+      FloatingType _ -> pure (DoublePrecision (negate (asDouble value)))
+      _ -> panic "invalid unary minus"
+    "+" -> pure value
+    _ -> panic ("unsupported unary operator " ++ op)
+
+assign :: CType -> R Value -> R Value -> R Value
+assign ty destination expression = do
+  p <- destination
+  value <- expression
+  store ty p value
+
+update :: String -> CType -> Int -> Bool -> Integer -> Bool -> R Value -> R Value -> R Value
+update op ty width signed stride postfix destination expression = do
+  pointer <- destination
+  old <- load ty pointer
+  value <- expression
+  result <- either panic pure (calculate op width signed stride old value)
+  stored <- store ty pointer result
+  pure (if postfix then old else stored)
+
+asSingle :: Value -> Float
+asSingle (Single value) = value
+asSingle (DoublePrecision value) = double2Float value
+asSingle value = fromInteger (number value)
+
+asDouble :: Value -> Double
+asDouble (DoublePrecision value) = value
+asDouble (Single value) = float2Double value
+asDouble value = fromInteger (number value)
+
+realOperation :: (Ord a, Fractional a) => String -> (a -> Value) -> a -> a -> R Value
+realOperation op wrap left right = case op of
+  "+" -> pure (wrap (left + right))
+  "-" -> pure (wrap (left - right))
+  "*" -> pure (wrap (left * right))
+  "/" -> pure (wrap (left / right))
+  "==" -> pure (boolean (left == right))
+  "!=" -> pure (boolean (left /= right))
+  "<" -> pure (boolean (left < right))
+  "<=" -> pure (boolean (left <= right))
+  ">" -> pure (boolean (left > right))
+  ">=" -> pure (boolean (left >= right))
+  _ -> panic ("unsupported floating operator " ++ op)
+
+realBinary :: String -> Int -> R Value -> R Value -> R Value
+realBinary op width left right = do
+  a <- left
+  b <- right
+  if width == 32 then realOperation op Single (asSingle a) (asSingle b)
+    else realOperation op DoublePrecision (asDouble a) (asDouble b)
+
+realUpdate :: String -> Int -> CType -> Bool -> R Value -> R Value -> R Value
+realUpdate op width ty postfix destination expression = do
+  pointer <- destination
+  old <- load ty pointer
+  result <- realBinary op width (pure old) expression >>= convert ty
+  stored <- store ty pointer result
+  pure (if postfix then old else stored)
+
+function :: String -> R Value
+function name = do
+  ident <- gets (S.lookup name . symbols)
+  maybe (panic ("unknown function " ++ name)) (\code -> pure (Function code name)) ident
+
+invoke :: Maybe CType -> R Value -> [R Value] -> R Value
+invoke expected callee arguments = do
+  target <- callee
+  values <- sequence arguments
+  result <- case target of
+    Function raw name -> do
+      canonical <- gets (S.lookup name . symbols)
+      unless (canonical == Just raw) (panic "call through an invalid function pointer")
+      defined <- gets (S.lookup name . functions)
+      case defined of
+        Just action -> action values
+        Nothing -> do
+          let arities = [("malloc",1),("calloc",2),("free",1),("memcpy",3),("memmove",3),("memset",3),("strlen",1),("strcmp",2),
+                ("puts",1),("putchar",1),("vprintf",2),("exit",1),("fopen",2),("fclose",1),("fread",4),("fwrite",4),
+                ("zhasvalidcap",1),("zis_readonly",1),("zgetlower",1),("zgetupper",1)]
+              accepted = maybe values (`take` values) (lookup name arities)
+          value <- builtin name accepted
+          let resultType
+                | name `elem` ["free", "exit"] = Nothing
+                | name `elem` ["malloc", "calloc", "memcpy", "memmove", "memset", "fopen", "zgetlower", "zgetupper"] = Just PointerType
+                | name `elem` ["strlen", "fread", "fwrite"] = Just (IntegerType 64 False)
+                | name `elem` ["zhasvalidcap", "zis_readonly"] = Just (IntegerType 8 False)
+                | otherwise = Just (IntegerType 32 True)
+          pure (maybe NoValue (\ty -> marshal ty value) resultType)
+    _ -> panic "call through an invalid function pointer"
+  case (expected, result) of
+    (Nothing, _) -> pure (Number 0)
+    (Just _, NoValue) -> panic "callee returned no value to a non-void callsite"
+    (Just (AggregateType size), Aggregate actual _ _) | size == actual -> pure result
+    (Just (AggregateType _), _) -> panic "callee returned an incompatible aggregate value"
+    (Just _, Aggregate _ _ _) -> panic "callee returned an aggregate to a scalar callsite"
+    (Just ty, value) -> pure (cast ty value)
+
+decimalField :: String -> R Int
+decimalField = foldM step 0
+  where
+    step n c = do
+      let digit = digitToInt c
+      if n > (maxBound - digit) `div` 10 then panic "printf field exceeds the host representation"
+        else pure (n * 10 + digit)
+
+fixedDecimal :: Int -> Double -> String
+fixedDecimal precision value
+  | isNaN value = sign ++ "nan"
+  | isInfinite value = sign ++ "inf"
+  | precision == 0 = sign ++ digits
+  | otherwise = sign ++ integer ++ "." ++ fractional
+  where
+    sign = if testBit (castDoubleToWord64 value) 63 then "-" else ""
+    scale = 10 ^ precision :: Integer
+    digits = show (round (toRational (abs value) * fromInteger scale) :: Integer)
+    padded = replicate (max 0 (precision - length digits + 1)) '0' ++ digits
+    (integer, fractional) = splitAt (length padded - precision) padded
+
+format :: (CType -> arguments -> R (Value, arguments)) -> String -> arguments -> R String
+format _ [] _ = pure []
+format takeArgument ('%' : '%' : rest) values = ('%' :) <$> format takeArgument rest values
+format takeArgument ('%' : rest) values = do
+  let (digits, following) = span isDigit rest
+      (fraction, remainingFormat) = case following of
+        '.' : afterDot -> let (places, remaining) = span isDigit afterDot in (Just places, remaining)
+        _ -> (Nothing, following)
+      (modifier, suffix) = span (`elem` "lhz") remainingFormat
+      bits = case modifier of "hh" -> 8; "h" -> 16; "l" -> 64; "ll" -> 64; "z" -> 64; _ -> 32
+  unless (modifier `elem` ["", "h", "hh", "l", "ll", "z"]) (panic "invalid printf length modifier")
+  width <- decimalField digits
+  case suffix of
+    specifier : more -> do
+      when (fraction /= Nothing && specifier /= 'f') (panic "unsupported printf precision")
+      let ty = case specifier of
+            's' -> PointerType
+            'f' -> FloatingType 64
+            _ -> IntegerType (max 32 bits) False
+      (value, remaining) <- takeArgument ty values
+      let real = castWord64ToDouble (fromInteger (number value))
+      piece <- case specifier of
+        'd' -> pure (show (normalise bits True (number value)))
+        'i' -> pure (show (normalise bits True (number value)))
+        'u' -> pure (show (normalise bits False (number value)))
+        'x' -> pure (showHex (normalise bits False (number value)) "")
+        'X' -> pure (map toUpper (showHex (normalise bits False (number value)) ""))
+        'o' -> pure (showOct (normalise bits False (number value)) "")
+        'c' -> pure [chr (fromInteger (number value `mod` 256))]
+        's' -> readString value
+        'f' -> do
+          unless (modifier `elem` ["", "l"]) (panic "unsupported floating printf length")
+          precision <- maybe (pure 6) decimalField fraction
+          pure (fixedDecimal precision real)
+        _ -> panic ("unsupported printf conversion %" ++ [specifier])
+      let zero = take 1 digits == "0" && specifier `elem` "diuxXof" &&
+            (specifier /= 'f' || not (isNaN real || isInfinite real))
+          padding = replicate (max 0 (width - length piece)) (if zero then '0' else ' ')
+          padded = if zero && take 1 piece == "-" then "-" ++ padding ++ drop 1 piece else padding ++ piece
+      remainingText <- format takeArgument more remaining
+      pure (padded ++ remainingText)
+    _ -> panic "invalid printf argument list"
+format takeArgument (c : rest) values = (c :) <$> format takeArgument rest values
+
+takeValue :: CType -> [Value] -> R (Value, [Value])
+takeValue _ (value : rest) = pure (value, rest)
+takeValue _ [] = panic "invalid printf argument list"
+
+takeVariadic :: CType -> Value -> R (Value, Value)
+takeVariadic ty cursor = do
+  value <- vaArg ty (pure cursor)
+  pure (value, cursor)
+
+printBytes :: String -> R Value
+printBytes text = do
+  liftIO (B.putStr (B.pack text))
+  pure (Number (toInteger (length text)))
+
+copyMemory :: Value -> Value -> Int -> R Value
+copyMemory destination _ 0 = pure destination
+copyMemory destination source count = do
+  when (count < 0) (panic "invalid memory copy length")
+  (_, src, srcOffset) <- checked count source
+  (ident, dst, dstOffset) <- checked count destination
+  when (readOnly dst) (panic "write to read-only memory")
+  let payload = [M.findWithDefault 0 (srcOffset + i) (bytes src) | i <- [0 .. count - 1]]
+      copied = foldl (\m (i, v) -> M.insert (dstOffset + i) v m) (bytes dst) (zip [0..] payload)
+      sourceCaps = [(i, v) | (i, v) <- M.toList (shadow src), i < srcOffset + count, i + 8 > srcOffset]
+      aligned = srcOffset `mod` 8 == dstOffset `mod` 8
+      caps = [(dstOffset + i, M.findWithDefault nullPointer (srcOffset + i) (shadow src)) | i <- [0 .. count - 8], (srcOffset + i) `mod` 8 == 0, (dstOffset + i) `mod` 8 == 0]
+  when (not aligned && not (null sourceCaps)) (panic "unaligned pointer-bearing memory copy")
+  writeObject ident (dst { bytes = copied, shadow = foldl (\m (i,v) -> M.insert i v m) (shadow dst) caps })
+  event ("copy " ++ show count ++ " bytes to #" ++ show ident ++ "+" ++ show dstOffset)
+  pure destination
+
+io :: IO a -> R a
+io action = liftIO (tryIOError action) >>= either (panic . ("file I/O: " ++) . ioeGetErrorString) pure
+
+stream :: Value -> R Handle
+stream (Stream ident raw) = do
+  unless (raw == 4611686018427387904 + toInteger ident) (panic "closed or invalid file stream")
+  handle <- gets (M.lookup ident . streams)
+  maybe (panic "closed or invalid file stream") pure handle
+stream _ = panic "file operation requires a valid stream"
+
+transferSize :: Value -> Value -> R Int
+transferSize size count = do
+  hostSize (number size * number count)
+
+hostSize :: Integer -> R Int
+hostSize count = do
+  when (count < 0 || count > toInteger (maxBound :: Int)) (panic "size exceeds the host representation")
+  pure (fromInteger count)
+
+builtin :: String -> [Value] -> R Value
+builtin "fopen" [path, mode] = do
+  raw <- readString path
+  name <- io $ do
+    encoding <- getFileSystemEncoding
+    B.useAsCString (B.pack raw) (F.peekCString encoding)
+  access <- readString mode
+  selected <- case access of
+    "rb" -> pure ReadMode
+    "wb" -> pure WriteMode
+    _ -> panic "fopen supports rb and wb modes"
+  ident <- gets nextStream
+  when (toInteger ident >= 4611686018427387904) (panic "stream identity space exhausted")
+  opened <- liftIO (tryIOError (openBinaryFile name selected))
+  case opened of
+    Left _ -> pure nullPointer
+    Right handle -> do
+      modify' (\w -> w { streams = M.insert ident handle (streams w), nextStream = ident + 1 })
+      pure (Stream ident (4611686018427387904 + toInteger ident))
+builtin "fclose" [value@(Stream ident _)] = do
+  handle <- stream value
+  io (hClose handle)
+  modify' (\w -> w { streams = M.delete ident (streams w) })
+  pure (Number 0)
+builtin "fread" [destination, size, count, value] = do
+  total <- transferSize size count
+  handle <- stream value
+  if total == 0 then pure (Number 0) else do
+    (ident, object, displacement) <- checked total destination
+    when (readOnly object) (panic "file read into read-only memory")
+    payload <- io (B.hGet handle total)
+    let updated = B.foldl' (\(i, m) byte -> (i + 1, M.insert i (toInteger (ord byte)) m)) (displacement, bytes object) payload
+    writeObject ident (object { bytes = snd updated })
+    event ("read " ++ show (B.length payload) ++ " bytes into #" ++ show ident)
+    pure (Number (toInteger (B.length payload) `div` number size))
+builtin "fwrite" [source, size, count, value] = do
+  total <- transferSize size count
+  handle <- stream value
+  if total == 0 then pure (Number 0) else do
+    (_, object, displacement) <- checked total source
+    let payload = B.pack [chr (fromInteger (M.findWithDefault 0 (displacement + i) (bytes object))) | i <- [0 .. total - 1]]
+    io (B.hPut handle payload)
+    event ("write " ++ show total ++ " bytes")
+    pure count
+builtin "malloc" [size] = hostSize (number size) >>= allocate "heap"
+builtin "calloc" [n, size] = hostSize (number n * number size) >>= allocate "heap"
+builtin "free" [p] = release p >> pure (Number 0)
+builtin "memcpy" [destination, source, count] = hostSize (number count) >>= copyMemory destination source
+builtin "memmove" [destination, source, count] = hostSize (number count) >>= copyMemory destination source
+builtin "memset" [destination, value, count] = do
+  n <- hostSize (number count)
+  when (n /= 0) (void (checked n destination))
+  forM_ [0 .. n - 1] $ \i -> void (store (IntegerType 8 False) (offset (toInteger i) destination) value)
+  pure destination
+builtin "strlen" [p] = Number . toInteger . length <$> readString p
+builtin "strcmp" [a, b] = do
+  x <- readString a
+  y <- readString b
+  pure (Number (case compare x y of LT -> -1; EQ -> 0; GT -> 1))
+builtin "zhasvalidcap" [Pointer NoCapability _] = pure (boolean False)
+builtin "zhasvalidcap" [Pointer capability _] = boolean . live <$> readObject capability
+builtin "zhasvalidcap" [Function _ _] = pure (boolean True)
+builtin "zhasvalidcap" [Stream ident _] = boolean . M.member ident <$> gets streams
+builtin "zhasvalidcap" [_] = pure (boolean False)
+builtin "zis_readonly" [Pointer NoCapability _] = pure (boolean False)
+builtin "zis_readonly" [Pointer capability _] = boolean . readOnly <$> readObject capability
+builtin "zis_readonly" [_] = pure (boolean False)
+builtin name [Pointer capability _] | name == "zgetlower" || name == "zgetupper" =
+  case capability of
+    NoCapability -> pure nullPointer
+    _ -> do
+      object <- readObject capability
+      pure (Pointer capability (base object + if name == "zgetupper" && live object then toInteger (extent object) else 0))
+builtin "puts" [p] = do
+  text <- readString p
+  liftIO (B.putStr (B.pack (text ++ "\n")))
+  pure (Number 0)
+builtin "putchar" [v] = do
+  let byte = number v `mod` 256
+  liftIO (B.putStr (B.singleton (chr (fromInteger byte))))
+  pure (Number byte)
+builtin "printf" (p : values) = readString p >>= \pattern -> format takeValue pattern values >>= printBytes
+builtin "vprintf" [p, list] = readString p >>= \pattern -> format takeVariadic pattern list >>= printBytes
+builtin "exit" [code] = throwError (Finish (fromInteger (number code `mod` 256)))
+builtin name _ = panic ("unsupported external call " ++ name)
+
+execute :: [(String, [Value] -> R Value)] -> R () -> IO ()
+execute entries initialiser = do
+  args <- getArgs
+  original <- getFullArgs
+  program <- case original of [] -> getProgName; name : _ -> pure name
+  traceMode <- lookupEnv "HERESY_TRACE"
+  unless (traceMode `elem` [Nothing, Just "0", Just "1", Just "recent"]) $ do
+    hPutStrLn stderr "HERESY_TRACE must be 0, 1 or recent"
+    exitWith (ExitFailure 64)
+  let enabled = traceMode == Just "1"
+      recorded = enabled || traceMode == Just "recent"
+  let names = map fst entries ++ ["malloc", "calloc", "free", "memcpy", "memmove", "memset", "strlen", "strcmp", "puts", "putchar", "printf", "vprintf", "exit", "zhasvalidcap", "zis_readonly", "zgetlower", "zgetupper", "fopen", "fread", "fwrite", "fclose"]
+      codes = S.fromList (zip names [9223372036854775808..])
+      initial = World 1 4096 [] S.empty S.empty (S.fromList entries) codes "startup" 0 [] False False M.empty 1
+      action = do
+        initialiser
+        strings <- mapM argument (program : args)
+        argv <- allocate "argument" ((length strings + 1) * 8)
+        forM_ (zip [0..] (strings ++ [nullPointer])) $ \(i,p) -> void (store PointerType (offset (i * 8) argv) p)
+        modify' (\w -> w { events = 0, recent = [], tracing = enabled, history = recorded })
+        mainFunction <- gets (S.lookup "main" . functions)
+        case mainFunction of
+          Nothing -> panic "no main function"
+          Just f -> f [Number (toInteger (length strings)), argv]
+  (result, final) <- runStateT (runExceptT (unR action)) initial
+  forM_ (M.elems (streams final)) (void . tryIOError . hClose)
+  hFlush stdout
+  case result of
+    Right value -> let code = fromInteger (number value `mod` 256) in exitWith (if code == 0 then ExitSuccess else ExitFailure code)
+    Left (Finish code) -> exitWith (if code == 0 then ExitSuccess else ExitFailure code)
+    Left (Panic message) -> do
+      hPutStrLn stderr ("heresy panic: " ++ message)
+      unless (enabled || null (recent final)) $ hPutStrLn stderr (intercalate "\n" (reverse (recent final)))
+      exitWith (ExitFailure 70)

@@ -1,0 +1,18 @@
+(executable
+ (name heresy)
+ (public_name heresy)
+ (modules heresy runtime)
+ (libraries unix str execution))
+
+(library
+ (name execution)
+ (wrapped false)
+ (modules process)
+ (libraries unix))
+
+(rule
+ (targets runtime.ml)
+ (deps ../runtime/Heap.hs)
+ (action
+  (with-stdout-to %{targets}
+   (run %{exe:../tools/embed.exe} %{dep:../runtime/Heap.hs} %{version:heresy}))))
