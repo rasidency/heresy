@@ -1,8 +1,10 @@
-The translator lowers the Fil-C typed AST before instrumentation into a standalone Haskell module, computing LP64 layout in OCaml and carrying integer, binary32, binary64 and pointer values through an embedded capability runtime.
+The translator lowers the Fil-C typed AST before instrumentation into a standalone Haskell module, using frontend record layouts and carrying integer, binary32, binary64, x87 extended-precision and pointer values through an embedded capability runtime.
 
 ![Typed AST lowering into Haskell with native differential execution](assets/pipeline.svg)
 
-Layouts cover named structures, unions, nested arrays and flexible array members, with aggregate calls and returns copying payload and shadow slots together while scalar calls use eight-byte slots. Variadic calls expose a read-only argument area with independent `va_copy` cursors, while switch fall-through and jumps to labels lower to explicit continuations over shared frame storage.
+Record offsets preserve packed members and bit-fields, while aggregate copies carry payload and shadow slots together and variadic calls expose a read-only argument area with alignment and independent `va_copy` cursors. Computed jumps validate label identity before dispatch, and pthread workers share allocations and scalar atomics while initialising independent thread-local storage.
+
+Runtime array bounds are captured at declarations and function entry, with byte strides retained for indexing, pointer arithmetic and `sizeof` even after the variables used to compute the bounds have changed.
 
 ## Memory
 

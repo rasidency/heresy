@@ -127,20 +127,28 @@ let rec walk f node =
   List.iter (walk f) inner
 let read path = let channel = open_in_bin path in Fun.protect ~finally:(fun () -> close_in channel) (fun () -> really_input_string channel (in_channel_length channel))
 let write path content = let channel = open_out_bin path in Fun.protect ~finally:(fun () -> close_out channel) (fun () -> output_string channel content)
-let builtins = ["malloc"; "calloc"; "free"; "memcpy"; "memmove"; "memset"; "strlen"; "strcmp"; "puts"; "putchar"; "printf"; "vprintf"; "exit"; "zhasvalidcap"; "zgetlower"; "zgetupper"; "zis_readonly"; "fopen"; "fread"; "fwrite"; "fclose"]
+let thread_functions = ["pthread_create"; "pthread_join"; "pthread_self"; "pthread_equal"]
+let builtins = ["malloc"; "calloc"; "free"; "memcpy"; "memmove"; "memset"; "strlen"; "strcmp"; "puts"; "putchar"; "printf"; "vprintf"; "exit"; "zhasvalidcap"; "zgetlower"; "zgetupper"; "zis_readonly"; "fopen"; "fread"; "fwrite"; "fclose"] @ thread_functions
 
-type layout = { size : int; alignment : int; fields : (string * int * string) list }
+type member = { id : string; displacement : int; field_type : string; bits : (int * int) option }
+type layout = { size : int; alignment : int; fields : member list }
 type context = {
   source : string;
   content : string;
   aliases : (string, string) Hashtbl.t;
   records : (string, Json.t) Hashtbl.t;
   layouts : (string, layout) Hashtbl.t;
+  frontend_layouts : (string, int * int * int list) Hashtbl.t;
   names : (string, string) Hashtbl.t;
   functions : Json.t list;
   globals : Json.t list;
   pure : (string, Json.t list * string) Hashtbl.t;
   constants : (string, string) Hashtbl.t;
+  label_names : (string, string) Hashtbl.t;
+  vla_bounds : (string, string * Json.t list * bool) Hashtbl.t;
+  vla_aliases : (string, unit) Hashtbl.t;
+  vla_inherited : (string, string) Hashtbl.t;
+  vla_adjusted : (string, unit) Hashtbl.t;
 }
 
 let loc context node =
@@ -155,6 +163,29 @@ let loc context node =
 
 let fail context node message = raise (Error (loc context node ^ ": " ^ message))
 let contains s fragment = try ignore (Str.search_forward (Str.regexp_string fragment) s 0); true with Not_found -> false
+
+let frontend_dump dump =
+  let layouts = Hashtbl.create 32 in
+  let prefix = "*** Dumping AST Record Layout" in
+  let position = try Str.search_forward (Str.regexp "^{") dump 0
+    with Not_found -> raise (Error "missing frontend syntax tree") in
+  let header = String.sub dump 0 position in
+  let parts = Str.split (Str.regexp_string prefix) header in
+  let field block pattern =
+    let re = Str.regexp pattern in
+    try ignore (Str.search_forward re block 0); Str.matched_group 1 block
+    with Not_found -> raise (Error "invalid frontend record layout")
+  in
+  List.iter (fun block ->
+    if String.trim block <> "" then begin
+      let name = field block "Type: \\([^\n]+\\)" in
+      let size = int_of_string (field block "  Size:\\([0-9]+\\)") in
+      let alignment = int_of_string (field block "  Alignment:\\([0-9]+\\)") in
+      let offsets = field block "  FieldOffsets: \\[\\([^]]*\\)\\]" in
+      let offsets = if offsets = "" then [] else List.map (fun value -> int_of_string (String.trim value)) (String.split_on_char ',' offsets) in
+      Hashtbl.add layouts name (size, alignment, offsets)
+    end) parts;
+  layouts, Json.parse (String.sub dump position (String.length dump - position))
 let clean context original =
   let rec resolve seen s =
     let stripped = Str.global_replace (Str.regexp "\\b\\(const\\|volatile\\|restrict\\|__restrict\\|__restrict__\\)\\b") "" s in
@@ -164,7 +195,7 @@ let clean context original =
     | _ -> stripped
   in resolve [] original
 
-type modifier = Indirection of bool | Dimension of int | Parameters of string
+type modifier = Indirection of bool | Dimension of string | Parameters of string
 
 let rec declarator ?(qualified=false) context original =
   let t = if qualified then
@@ -178,7 +209,15 @@ let rec declarator ?(qualified=false) context original =
   let tag = Hashtbl.fold (fun name _ longest ->
     if String.starts_with ~prefix:"enum (" name && String.starts_with ~prefix:name tag_type && String.length name > String.length longest then name else longest
   ) context.aliases "" in
-  if tag <> "" then position := prefix + String.length tag else
+  if tag <> "" then position := prefix + String.length tag
+  else if String.starts_with ~prefix:"_Atomic(" tag_type then begin
+    position := prefix + 8;
+    let depth = ref 1 in
+    while !position < length && !depth > 0 do
+      (match t.[!position] with '(' -> incr depth | ')' -> decr depth | _ -> ());
+      incr position
+    done
+  end else
     while !position < length && not (String.contains "*[(" t.[!position]) do incr position done;
   let base = String.trim (String.sub t 0 !position) in
   let fail () = raise (Error ("unsupported declarator " ^ t)) in
@@ -203,12 +242,13 @@ let rec declarator ?(qualified=false) context original =
     let rec suffix reversed = match peek () with
       | '[' ->
           incr position;
-          let start = !position in
-          while !position < length && t.[!position] <> ']' do incr position done;
+          let start = !position and depth = ref 0 in
+          while !position < length && (t.[!position] <> ']' || !depth <> 0) do
+            (match t.[!position] with '[' -> incr depth | ']' -> decr depth | _ -> ());
+            incr position
+          done;
           let bound = String.trim (String.sub t start (!position - start)) in
-          let count = if bound = "" then 0 else
-            match int_of_string_opt bound with Some n when n >= 0 -> n | _ -> fail () in
-          expect ']'; suffix (Dimension count :: reversed)
+          expect ']'; suffix (Dimension bound :: reversed)
       | '(' ->
           incr position;
           let start = !position and depth = ref 1 in
@@ -248,28 +288,49 @@ let render_type base modifiers =
   let postfix text = if String.starts_with ~prefix:"*" text then "(" ^ text ^ ")" else text in
   let text = List.fold_left (fun text -> function
     | Indirection readonly -> (if readonly then "*const " else "*") ^ text
-    | Dimension count -> postfix text ^ "[" ^ string_of_int count ^ "]"
+    | Dimension bound -> postfix text ^ "[" ^ bound ^ "]"
     | Parameters parameters -> postfix text ^ "(" ^ parameters ^ ")") "" modifiers in
   String.trim (base ^ " " ^ text)
 
 let pointer context t = match snd (declarator context t) with Indirection _ :: _ -> true | _ -> false
 let array context t = match declarator context t with
-  | base, Dimension count :: rest -> Some (render_type base rest, count)
+  | base, Dimension bound :: rest ->
+      let count = if bound = "" then 0 else match int_of_string_opt bound with
+        | Some n when n >= 0 -> n
+        | _ -> raise (Error ("unsupported variable-length array layout " ^ t))
+      in Some (render_type base rest, count)
   | _ -> None
 let element context t = match declarator context t with
   | base, (Indirection _ | Dimension _) :: rest -> render_type base rest
   | _ -> raise (Error ("cannot index type " ^ t))
+
+let dynamic_array context t =
+  let _, mods = declarator context t in
+  match mods with
+  | Dimension _ :: _ -> List.exists (function
+      | Dimension bound -> bound <> "" && int_of_string_opt bound = None
+      | _ -> false) mods
+  | _ -> false
 
 let aggregate context t =
   match declarator context t with
   | base, [] -> String.starts_with ~prefix:"struct " base || String.starts_with ~prefix:"union " base
   | _ -> false
 
+let atomic_underlying context t =
+  let t = clean context t in
+  if String.starts_with ~prefix:"_Atomic(" t then match declarator context t with
+    | base, [] -> Some (String.sub base 8 (String.length base - 9))
+    | _ -> None
+  else None
+
+let value_type context t = Option.value (atomic_underlying context t) ~default:t
+
 let floating context t =
-  match clean context t with "float" -> Some 32 | "double" -> Some 64 | _ -> None
+  match clean context (value_type context t) with "float" -> Some 32 | "double" -> Some 64 | "long double" -> Some 80 | _ -> None
 
 let scalar context t =
-  let t = clean context t in
+  let t = clean context (value_type context t) in
   let signed = not (contains t "unsigned") && t <> "_Bool" in
   let base = String.trim (Str.global_replace (Str.regexp "unsigned\\|signed") "" t) in
   let width = match base with
@@ -289,33 +350,51 @@ let rec layout context original =
       let l = layout context inner in
       if count > max_int / max 1 l.size then raise (Error "array size exceeds the host representation");
       { l with size = l.size * count; fields = [] }
+  | None when atomic_underlying context t <> None ->
+      let inner = value_type context t in
+      if aggregate context inner then raise (Error ("unsupported atomic aggregate type " ^ t));
+      layout context inner
   | None when t = "struct __va_list_tag" -> { size = 24; alignment = 8; fields = [] }
   | None when String.starts_with ~prefix:"struct " t || String.starts_with ~prefix:"union " t ->
-      let union = String.starts_with ~prefix:"union " t in
-      let prefix = if union then 6 else 7 in
-      let name = String.sub t prefix (String.length t - prefix) in
-      begin match Hashtbl.find_opt context.layouts name with
+      begin match Hashtbl.find_opt context.layouts t with
       | Some result -> result
       | None ->
-          let record = match Hashtbl.find_opt context.records name with Some r -> r | None -> raise (Error ("incomplete or external record " ^ t)) in
-          let offset, alignment, fields = List.fold_left (fun (offset, alignment, fields) field ->
-            if kind field <> "FieldDecl" || Json.bool (field |> fun n -> Json.get "isBitfield" n) then fail context field "unsupported record field";
-            let l = layout context (ty field) in
-            let aligned = if union then 0 else (offset + l.alignment - 1) / l.alignment * l.alignment in
-            if l.size > max_int - aligned then fail context field "record size exceeds the host representation";
-            (if union then max offset l.size else aligned + l.size), max alignment l.alignment, (text field "id", aligned, ty field) :: fields
-          ) (0, 1, []) (children record) in
-          let result = { size = (offset + alignment - 1) / alignment * alignment; alignment; fields = List.rev fields } in
-          Hashtbl.add context.layouts name result; result
+          let record = match Hashtbl.find_opt context.records t with Some r -> r | None -> raise (Error ("incomplete or external record " ^ t)) in
+          let members = List.filter (fun node -> kind node = "FieldDecl") (children record) in
+          let size, alignment, offsets = match Hashtbl.find_opt context.frontend_layouts t with
+            | Some (size, alignment, offsets) when size mod 8 = 0 && alignment mod 8 = 0 &&
+                  List.length members = List.length offsets -> size / 8, alignment / 8, offsets
+            | _ -> fail context record ("missing or invalid frontend layout for " ^ t)
+          in
+          let fields = List.filter_map (fun (node, offset) ->
+            let bitfield = Json.bool (field node "isBitfield") in
+            if bitfield && text node "name" = "" then None else
+            let bits = if bitfield then match children node with
+              | width :: _ ->
+                  let width = match int_of_string_opt (text width "value") with
+                    | Some width when width > 0 && width <= fst (scalar context (ty node)) -> width
+                    | _ -> fail context node "invalid bit-field width"
+                  in Some (offset mod 8, width)
+              | _ -> fail context node "missing bit-field width"
+            else if offset mod 8 = 0 then None else fail context node "unaligned record field metadata" in
+            Some { id = text node "id"; displacement = offset / 8; field_type = ty node; bits }
+          ) (List.combine members offsets) in
+          let result = { size; alignment; fields } in
+          Hashtbl.add context.layouts t result; result
       end
   | None ->
       let width = match floating context t with Some width -> width | None -> fst (scalar context t) in
-      { size = width / 8; alignment = width / 8; fields = [] }
+      let size = if width = 80 then 16 else width / 8 in
+      { size; alignment = size; fields = [] }
 
-let ctype context t =
+let rec ctype context t =
   if pointer context t then "PointerType"
-  else if aggregate context t then "(AggregateType " ^ string_of_int (layout context t).size ^ ")"
-  else match floating context t with
+  else if aggregate context t then
+    let shape = layout context t in
+    "(AggregateType " ^ string_of_int shape.size ^ " " ^ string_of_int shape.alignment ^ ")"
+  else match atomic_underlying context t with
+    | Some inner -> "(AtomicType " ^ ctype context inner ^ ")"
+    | None -> match floating context t with
     | Some width -> "(FloatingType " ^ string_of_int width ^ ")"
     | None ->
         let width, signed = scalar context t in
@@ -365,13 +444,16 @@ let floating_literal context node =
   let constructor = match floating context (ty node) with
     | Some 32 -> "Single"
     | Some 64 -> "DoublePrecision"
+    | Some 80 -> "extendedLiteral"
     | _ -> fail context node "unsupported floating literal type"
   in
   let decimal = Str.regexp "^[0-9]+\\(\\.[0-9]+\\)?\\([eE][+-]?[0-9]+\\)?$" in
   let value = if value = "INF" || value = "Inf" then "(1 / 0)"
     else if Str.string_match decimal value 0 then value
     else fail context node "unsupported floating literal spelling"
-  in "pure (" ^ constructor ^ " " ^ value ^ ")"
+  in
+  if constructor = "extendedLiteral" && value = "(1 / 0)" then "pure (Extended 0x7fff8000000000000000)"
+  else "pure (" ^ constructor ^ " " ^ value ^ ")"
 
 let rec callee_name node =
   match kind node, children node with
@@ -380,23 +462,62 @@ let rec callee_name node =
   | ("ParenExpr" | "ImplicitCastExpr"), [child] -> callee_name child
   | _ -> ""
 
+let record_member context node base =
+  let t = if Json.bool (field node "isArrow") then element context (ty base) else ty base in
+  match List.find_opt (fun member -> member.id = text node "referencedMemberDecl") (layout context t).fields with
+  | Some member -> member
+  | None -> fail context node "unknown struct member"
+
+let member_type context member =
+  match member.bits with
+  | None -> ctype context member.field_type
+  | Some (shift, width) ->
+      let _, signed = scalar context member.field_type in
+      "(BitField " ^ string_of_int shift ^ " " ^ string_of_int width ^ " " ^ bool signed ^ ")"
+
+let rec access_type context node =
+  match kind node, children node with
+  | "MemberExpr", [base] -> member_type context (record_member context node base)
+  | ("ParenExpr" | "ConstantExpr"), [child] -> access_type context child
+  | _ -> ctype context (ty node)
+
+let rec dynamic_origin context node =
+  match kind node, children node with
+  | "DeclRefExpr", _ ->
+      let id = text (field node "referencedDecl") "id" in
+      Option.map (fun (_, _, indirect) -> id, if indirect then -1 else 0) (Hashtbl.find_opt context.vla_bounds id)
+  | ("ParenExpr" | "ConstantExpr" | "ImplicitCastExpr"), [child] -> dynamic_origin context child
+  | "ArraySubscriptExpr", [base; _] -> Option.map (fun (id, rank) -> id, rank + 1) (dynamic_origin context base)
+  | "UnaryOperator", [pointer] when text node "opcode" = "*" ->
+      Option.map (fun (id, rank) -> id, rank + 1) (dynamic_origin context pointer)
+  | "BinaryOperator", [a; b] when List.mem (text node "opcode") ["+"; "-"] ->
+      begin match dynamic_origin context a with Some _ as rank -> rank | None -> dynamic_origin context b end
+  | _ -> None
+
+let vla_shape context id = par ("variable " ^ quote (Hashtbl.find context.names id))
+
 let rec lvalue context node =
   match kind node, children node with
   | "DeclRefExpr", _ -> "variable " ^ key context node
   | ("ParenExpr" | "ConstantExpr"), [child] -> lvalue context child
   | "UnaryOperator", [child] when text node "opcode" = "*" -> expression context child
   | "ArraySubscriptExpr", [base; index] ->
-      "binary \"+\" 64 False " ^ string_of_int (layout context (ty node)).size ^ " " ^ par (expression context base) ^ " " ^ par (expression context index)
+      let base_code = par (expression context base) and index_code = par (expression context index) in
+      if dynamic_array context (ty node) then begin
+        match dynamic_origin context base with
+        | Some (id, depth) ->
+            "vlaIndex " ^ string_of_int (depth + 1) ^ " " ^ vla_shape context id ^ " " ^ base_code ^ " " ^ index_code
+        | None -> fail context node "unsupported variable-length array index without a known shape"
+      end else
+        "binary \"+\" 64 False " ^ string_of_int (layout context (ty node)).size ^ " " ^ base_code ^ " " ^ index_code
   | "MemberExpr", [base] ->
-      let t, code =
-        if Json.bool (field node "isArrow") then element context (ty base), expression context base
-        else if text base "valueCategory" = "lvalue" then ty base, lvalue context base
-        else ty base, "materialise " ^ ctype context (ty base) ^ " " ^ par (expression context base)
+      let member = record_member context node base in
+      let code =
+        if Json.bool (field node "isArrow") then expression context base
+        else if text base "valueCategory" = "lvalue" then lvalue context base
+        else "materialise " ^ ctype context (ty base) ^ " " ^ par (expression context base)
       in
-      let record = layout context t in
-      let _, displacement, _ = match List.find_opt (fun (id, _, _) -> id = text node "referencedMemberDecl") record.fields with
-        | Some f -> f | None -> fail context node "unknown struct member"
-      in par ("offset " ^ string_of_int displacement ^ " <$> " ^ par code)
+      par ("offset " ^ string_of_int member.displacement ^ " <$> " ^ par code)
   | "CompoundLiteralExpr", [init] ->
       let t = ty node in
       let stores = initialise context init t "p" in
@@ -407,12 +528,16 @@ let rec lvalue context node =
 
 and expression context node =
   let t = ty node in
-  if contains t "volatile" || contains t "_Atomic" then fail context node "volatile and atomic accesses are unsupported";
   let ex = expression context in
   let lv = lvalue context in
   match kind node, children node with
   | ("IntegerLiteral" | "CharacterLiteral"), _ -> "pure (Number " ^ par (text node "value") ^ ")"
   | "FloatingLiteral", _ -> floating_literal context node
+  | "AddrLabelExpr", _ ->
+      begin match Hashtbl.find_opt context.label_names (text node "labelDeclId") with
+      | Some name -> "function " ^ quote name
+      | None -> fail context node "unknown label address"
+      end
   | "StringLiteral", _ -> "literal " ^ quote (decode_string (text node "value"))
   | ("ParenExpr" | "ConstantExpr"), [child] -> ex child
   | "DeclRefExpr", _ ->
@@ -428,9 +553,9 @@ and expression context node =
       end else par (lv node ^ " >>= load " ^ ctype context t)
   | ("ImplicitCastExpr" | "CStyleCastExpr"), [child] ->
       begin match text node "castKind" with
-      | "LValueToRValue" -> par (lv child ^ " >>= load " ^ ctype context t)
+      | "LValueToRValue" -> par (lv child ^ " >>= load " ^ access_type context child)
       | "ArrayToPointerDecay" -> if kind child = "StringLiteral" then ex child else lv child
-      | "NoOp" | "FunctionToPointerDecay" | "BitCast" -> ex child
+      | "NoOp" | "FunctionToPointerDecay" | "BitCast" | "AtomicToNonAtomic" | "NonAtomicToAtomic" -> ex child
       | "IntegralToBoolean" | "FloatingToBoolean" | "PointerToBoolean" ->
           par ("boolean . truth <$> " ^ par (ex child))
       | "NullToPointer" -> "pure nullPointer"
@@ -444,9 +569,40 @@ and expression context node =
       let arg = field node "argType" in
       let t = if arg = Json.Null then (match children with [child] -> ty child | _ -> "") else
         let s = text arg "desugaredQualType" in if s = "" then text arg "qualType" else s in
-      let l = layout context t in
-      let result = if text node "name" = "sizeof" then l.size else l.alignment in
-      "pure (Number " ^ string_of_int result ^ ")"
+      if dynamic_array context t then begin
+        if text node "name" <> "sizeof" then
+          let base, _ = declarator context t in
+          "pure (Number " ^ string_of_int (layout context base).alignment ^ ")"
+        else if arg <> Json.Null then begin
+          let alias = text arg "typeAliasDeclId" in
+          if Hashtbl.mem context.vla_aliases alias then "vlaSize 0 " ^ vla_shape context alias else
+          let base, modifiers = declarator context t in
+          let rec dimensions bound_nodes = function
+            | Dimension bound :: rest ->
+                begin match int_of_string_opt bound, bound_nodes with
+                | Some count, _ ->
+                    let width, dims = dimensions bound_nodes rest in
+                    width, ("pure (Number " ^ string_of_int count ^ ")") :: dims
+                | None, node :: tail ->
+                    let width, dims = dimensions tail rest in
+                    width, ex node :: dims
+                | _ -> fail context node "missing typed variable-length bounds in sizeof"
+                end
+            | rest when bound_nodes = [] -> (layout context (render_type base rest)).size, []
+            | _ -> fail context node "unexpected variable-length bounds in sizeof"
+          in
+          let width, dims = dimensions children modifiers in
+          "vlaExtent " ^ string_of_int width ^ " [" ^ join (List.map par dims) ^ "]"
+        end else match children with
+          | [child] -> begin match dynamic_origin context child with
+              | Some (id, depth) -> par (lv child ^ " >> vlaSize " ^ string_of_int depth ^ " " ^ vla_shape context id)
+              | None -> fail context node "unsupported sizeof variable-length array without a known shape"
+            end
+          | _ -> fail context node "unsupported sizeof variable-length type expression"
+      end else
+        let l = layout context t in
+        let result = if text node "name" = "sizeof" then l.size else l.alignment in
+        "pure (Number " ^ string_of_int result ^ ")"
   | "UnaryOperator", [child] ->
       begin match text node "opcode" with
       | "&" when kind child = "DeclRefExpr" && kind (field child "referencedDecl") = "FunctionDecl" -> ex child
@@ -455,13 +611,25 @@ and expression context node =
       | ("++" | "--") as op ->
           let op = quote (if op = "++" then "+" else "-") in
           let postfix = bool (Json.bool (field node "isPostfix")) in
-          let update = match floating context t with
+          let update () = match floating context t with
             | Some width -> "realUpdate " ^ op ^ " " ^ string_of_int width ^ " " ^ ctype context t
             | None ->
                 let width, signed = if pointer context t then 64, false else scalar context t in
-                let stride = if pointer context t then (layout context (element context t)).size else 1 in
-                "update " ^ op ^ " " ^ ctype context t ^ " " ^ string_of_int width ^ " " ^ bool signed ^ " " ^ string_of_int stride
-          in update ^ " " ^ postfix ^ " " ^ par (lv child) ^ " (pure (Number 1))"
+                if pointer context t && dynamic_array context (element context t) then
+                  match dynamic_origin context child with
+                  | Some (id, rank) -> "vlaUpdate " ^ op ^ " " ^ string_of_int (rank + 1) ^ " " ^ vla_shape context id
+                  | None -> fail context child "unsupported variable-length pointer update without a known shape"
+                else
+                  let stride = if pointer context t then (layout context (element context t)).size else 1 in
+                  "update " ^ op ^ " " ^ access_type context child ^ " " ^ string_of_int width ^ " " ^ bool signed ^ " " ^ string_of_int stride
+          in
+          begin match atomic_underlying context (ty child) with
+          | None -> update () ^ " " ^ postfix ^ " " ^ par (lv child) ^ " (pure (Number 1))"
+          | Some t ->
+              let stride = if pointer context t then (layout context (element context t)).size else 1 in
+              "atomicModify " ^ op ^ " " ^ ctype context t ^ " " ^ string_of_int stride ^ " " ^ postfix ^
+              " " ^ par (lv child) ^ " (pure (Number 5)) (pure (Number 1))"
+          end
       | op -> "unary " ^ quote op ^ " " ^ ctype context t ^ " " ^ par (ex child)
       end
   | ("BinaryOperator" | "CompoundAssignOperator"), [left; right] ->
@@ -472,21 +640,74 @@ and expression context node =
         let synthetic = match left with Json.Object fields -> Json.Object (("type", computation) :: List.remove_assoc "type" fields) | _ -> left in
         let update = match floating context (ty synthetic) with
           | Some width -> "realUpdate " ^ quote op ^ " " ^ string_of_int width ^ " " ^ ctype context (ty left)
-          | None -> "update " ^ quote op ^ " " ^ ctype context (ty left) ^ " " ^ operation context node op synthetic right
-        in update ^ " False " ^ par (lv left) ^ " " ^ par (ex right)
+          | None when pointer context (ty synthetic) && dynamic_array context (element context (ty synthetic)) ->
+              begin match dynamic_origin context left with
+              | Some (id, rank) -> "vlaUpdate " ^ quote op ^ " " ^ string_of_int (rank + 1) ^ " " ^ vla_shape context id
+              | None -> fail context left "unsupported variable-length pointer update without a known shape"
+              end
+          | None -> "update " ^ quote op ^ " " ^ access_type context left ^ " " ^ operation context node op synthetic right
+        in
+        begin match atomic_underlying context (ty left) with
+        | None -> update ^ " False " ^ par (lv left) ^ " " ^ par (ex right)
+        | Some t ->
+            let stride = if pointer context t then (layout context (element context t)).size else 1 in
+            "atomicModify " ^ quote op ^ " " ^ ctype context t ^ " " ^ string_of_int stride ^
+            " False " ^ par (lv left) ^ " (pure (Number 5)) " ^ par (ex right)
+        end
       else begin match op with
-      | "=" -> "assign " ^ ctype context (ty left) ^ " " ^ par (lv left) ^ " " ^ par (ex right)
+      | "=" -> "assign " ^ access_type context left ^ " " ^ par (lv left) ^ " " ^ par (ex right)
       | "," -> par (ex left ^ " >> " ^ par (ex right))
       | "&&" | "||" -> "logic " ^ bool (op = "&&") ^ " " ^ par (ex left) ^ " " ^ par (ex right)
       | _ ->
-          let operation = match floating context (ty left) with
-            | Some width -> "realBinary " ^ quote op ^ " " ^ string_of_int width
-            | None -> "binary " ^ quote op ^ " " ^ operation context node op left right
+          let varying_pointer node =
+            pointer context (ty node) && dynamic_array context (element context (ty node))
+          in
+          let operation =
+            if List.mem op ["+"; "-"] && (varying_pointer left || varying_pointer right) then
+              let left_shape = varying_pointer left in
+              let object_node = if left_shape then left else right in
+              match dynamic_origin context object_node with
+              | Some (id, rank) ->
+                  "vlaBinary " ^ quote op ^ " " ^ string_of_int (rank + 1) ^ " " ^ vla_shape context id
+              | None -> fail context node "unsupported variable-length pointer arithmetic without a known shape"
+            else match floating context (ty left) with
+              | Some width -> "realBinary " ^ quote op ^ " " ^ string_of_int width
+              | None -> "binary " ^ quote op ^ " " ^ operation context node op left right
           in operation ^ " " ^ par (ex left) ^ " " ^ par (ex right)
       end
   | "ConditionalOperator", [condition; yes; no] -> par (ex condition ^ " >>= \\v -> if truth v then " ^ par (ex yes) ^ " else " ^ par (ex no))
-  | ("ArraySubscriptExpr" | "MemberExpr" | "CompoundLiteralExpr"), _ -> par (lv node ^ " >>= load " ^ ctype context t)
+  | ("ArraySubscriptExpr" | "MemberExpr" | "CompoundLiteralExpr"), _ -> par (lv node ^ " >>= load " ^ access_type context node)
   | "VAArgExpr", [list] -> "vaArg " ^ ctype context t ^ " " ^ par (ex list)
+  | "AtomicExpr", target :: operands ->
+      let value = value_type context (element context (ty target)) in
+      let ty = ctype context value in
+      let target = par (ex target) in
+      let args = List.map (fun node -> par (ex node)) operands in
+      begin match text node "name", args with
+      | "__c11_atomic_init", [_]
+      | ("__c11_atomic_load" | "__atomic_load_n"), [_]
+      | ("__c11_atomic_store" | "__atomic_store_n" | "__c11_atomic_exchange" | "__atomic_exchange_n"), [_; _] ->
+          let name = text node "name" in
+          let op = if contains name "init" then "init" else if contains name "load" then "load"
+            else if contains name "exchange" then "exchange" else "store" in
+          "atomicAccess " ^ quote op ^ " " ^ ty ^ " " ^ target ^ " [" ^ join args ^ "]"
+      | ("__c11_atomic_compare_exchange_strong" | "__c11_atomic_compare_exchange_weak"), [_; _; _; _] ->
+          "atomicCompare " ^ ty ^ " " ^ target ^ " " ^ String.concat " " args
+      | name, [order; operand] when contains name "fetch" ->
+          let operations = ["add", "+"; "sub", "-"; "and", "&"; "or", "|"; "xor", "^"] in
+          let opname = match List.find_opt (fun (part, _) ->
+            String.ends_with ~suffix:("_" ^ part) name || String.ends_with ~suffix:("_" ^ part ^ "_fetch") name) operations with
+            | Some (_, op) -> op
+            | None -> fail context node ("unsupported atomic operation " ^ name)
+          in
+          let stride = if pointer context value && String.starts_with ~prefix:"__c11" name then
+            (layout context (element context value)).size else 1 in
+          let operation = if pointer context value then "atomicPointerStep " ^ quote opname
+            else "atomicModify " ^ quote opname ^ " " ^ ty in
+          operation ^ " " ^ string_of_int stride ^ " " ^
+          bool (not (String.ends_with ~suffix:"_fetch" name)) ^ " " ^ target ^ " " ^ order ^ " " ^ operand
+      | name, _ -> fail context node ("unsupported atomic operation " ^ name)
+      end
   | "CallExpr", callee :: arguments ->
       begin match callee_name callee, arguments with
       | "__builtin_va_start", [list; _] -> "vaStart callArea namedTypes " ^ par (ex list)
@@ -494,6 +715,8 @@ and expression context node =
       | "__builtin_va_end", [list] -> par (ex list ^ " >> pure (Number 0)")
       | "zcan_va_arg", [list] -> "vaAvailable " ^ par (ex list)
       | "zargs", [] -> "pure callArea"
+      | ("__c11_atomic_thread_fence" | "__c11_atomic_signal_fence" | "__atomic_thread_fence" | "__atomic_signal_fence"), [order] ->
+          par (ex order ^ " >> pure (Number 0)")
       | _ ->
       let expected = if clean context t = "void" then "Nothing" else par ("Just " ^ ctype context t) in
       let arguments = List.map (fun arg -> par ("marshal " ^ ctype context (ty arg) ^ " <$> " ^ par (ex arg))) arguments in
@@ -502,6 +725,13 @@ and expression context node =
   | _ -> fail context node ("unsupported expression " ^ kind node)
 
 and initialise context node t destination =
+  let member_initialiser member value =
+    let target = par ("offset " ^ string_of_int member.displacement ^ " " ^ destination) in
+    match member.bits with
+    | None -> initialise context value member.field_type target
+    | Some _ when kind value = "ImplicitValueInitExpr" -> []
+    | Some _ -> [par (expression context value ^ " >>= store " ^ member_type context member ^ " " ^ target ^ " >> pure ()")]
+  in
   match kind node with
   | "ImplicitValueInitExpr" -> []
   | "InitListExpr" ->
@@ -509,17 +739,16 @@ and initialise context node t destination =
         let fields = (layout context t).fields in
         let selected = text (field node "field") "id" in
         let member = if selected = "" then List.hd fields else
-          match List.find_opt (fun (id, _, _) -> id = selected) fields with Some f -> f | None -> fail context node "unknown union initialiser" in
-        let _, displacement, member_type = member in
+          match List.find_opt (fun member -> member.id = selected) fields with Some f -> f | None -> fail context node "unknown union initialiser" in
         begin match children node with
         | [] -> []
-        | [value] -> initialise context value member_type (par ("offset " ^ string_of_int displacement ^ " " ^ destination))
+        | [value] -> member_initialiser member value
         | _ -> fail context node "invalid union initialiser"
         end
       else if String.starts_with ~prefix:"struct " (clean context t) then
         let fields = (layout context t).fields in
         let rec go values fields = match values, fields with
-          | value :: values, (_, displacement, t) :: fields -> initialise context value t (par ("offset " ^ string_of_int displacement ^ " " ^ destination)) @ go values fields
+          | value :: values, member :: fields -> member_initialiser member value @ go values fields
           | [], _ -> [] | _ -> fail context node "too many record initialisers"
         in go (children node) fields
       else
@@ -534,10 +763,30 @@ and initialise context node t destination =
   | _ -> [par (expression context node ^ " >>= store " ^ ctype context t ^ " " ^ destination ^ " >> pure ()")]
 
 let declaration context node =
+  let id = text node "id" in
+  if Hashtbl.mem context.vla_aliases id then begin
+    let base, bounds, _ = Hashtbl.find context.vla_bounds id in
+    "vlaAlias " ^ key context node ^ " " ^ string_of_int (layout context base).size ^
+    " [" ^ join (List.map (fun bound -> par (expression context bound)) bounds) ^ "]"
+  end else
   if List.mem (kind node) ["TypedefDecl"; "EnumDecl"; "StaticAssertDecl"] then "(pure Next)" else
   if kind node <> "VarDecl" then fail context node ("unsupported local declaration " ^ kind node) else
   if List.mem (text node "storageClass") ["static"; "extern"] then "(pure Next)" else
+  match Hashtbl.find_opt context.vla_bounds id with
+  | Some (base, bounds, false) ->
+      begin match Hashtbl.find_opt context.vla_inherited id with
+      | Some alias -> "vlaFromAlias " ^ key context node ^ " " ^ vla_shape context alias
+      | None ->
+          "vlaDeclare " ^ key context node ^ " " ^ string_of_int (layout context base).size ^
+          " [" ^ join (List.map (fun bound -> par (expression context bound)) bounds) ^ "]"
+      end
+  | shape ->
   let lines = ["p <- variable " ^ key context node] in
+  let lines = match shape with
+    | Some (base, bounds, true) -> lines @ ["vlaBind 0 p " ^ string_of_int (layout context base).size ^
+        " [" ^ join (List.map (fun bound -> par (expression context bound)) bounds) ^ "]"]
+    | _ -> lines
+  in
   let initialisers = match List.rev (children node) with
     | [] -> []
     | init :: _ ->
@@ -586,6 +835,10 @@ let control_flow context body =
     | Some id -> id
     | None -> fail context node "unknown jump target"
   in
+  let destinations = Hashtbl.to_seq labels |> List.of_seq |> List.sort (fun (_, a) (_, b) -> compare a b) in
+  let destinations = List.filter_map (fun (id, block) ->
+    Option.map (fun name -> "(" ^ quote name ^ ", " ^ string_of_int block ^ ")") (Hashtbl.find_opt context.label_names id)
+  ) destinations in
   let rec lower cases break continue next node =
     let descend = lower cases break continue in
     let edge action = block (located node action) in
@@ -614,6 +867,8 @@ let control_flow context body =
     | "BreakStmt", _ -> break
     | "ContinueStmt", _ -> continue
     | "GotoStmt", _ -> target node "targetLabelDeclId"
+    | "IndirectGotoStmt", [address] ->
+        edge ("indirectJump [" ^ join destinations ^ "] " ^ par (expression context address))
     | "LabelStmt", [child] ->
         let id = target node "declId" in
         define id (jump (descend next child));
@@ -675,7 +930,7 @@ let next_integer value =
   let magnitude = String.sub magnitude !start (String.length magnitude - !start) in
   (if negative && magnitude <> "0" then "-" else "") ^ magnitude
 
-let context source tree =
+let context source content frontend_layouts vla_bounds vla_aliases vla_inherited vla_adjusted tree =
   let nodes = List.filter (fun n ->
     let origin = field n "loc" in
     let l = if field origin "expansionLoc" = Json.Null then origin else field origin "expansionLoc" in
@@ -693,7 +948,13 @@ let context source tree =
   let statics = ref [] in
   List.iter (walk (fun node -> if kind node = "VarDecl" && text node "storageClass" = "static" then statics := node :: !statics)) functions;
   let globals = file_globals @ List.rev !statics in
-  let context = { source; content = read source; aliases = Hashtbl.create 32; records = Hashtbl.create 8; layouts = Hashtbl.create 8; names = Hashtbl.create 64; functions; globals; pure = Hashtbl.create 8; constants = Hashtbl.create 32 } in
+  let context = { source; content; aliases = Hashtbl.create 32; records = Hashtbl.create 8; layouts = Hashtbl.create 8; frontend_layouts; names = Hashtbl.create 64; functions; globals; pure = Hashtbl.create 8; constants = Hashtbl.create 32; label_names = Hashtbl.create 16; vla_bounds; vla_aliases; vla_inherited; vla_adjusted } in
+  List.iter (fun function_node ->
+    walk (fun node -> if kind node = "AddrLabelExpr" then begin
+      let id = text node "labelDeclId" in
+      if not (Hashtbl.mem context.label_names id) then
+        Hashtbl.add context.label_names id ("label:" ^ text function_node "name" ^ ":" ^ string_of_int (Hashtbl.length context.label_names))
+    end) function_node) functions;
   List.iter (fun n -> if kind n = "TypedefDecl" then
     let target = ty n in
     let target = if target = text n "name" then text (field n "type") "qualType" else target in
@@ -762,7 +1023,7 @@ let context source tree =
             | _ -> ()) !anonymous
       | _ -> ())) nodes;
   List.iter (fun n -> if kind n = "RecordDecl" && Json.bool (field n "completeDefinition") then
-    Hashtbl.replace context.records (text n "name") n) (children tree);
+    Hashtbl.replace context.records (text n "tagUsed" ^ " " ^ text n "name") n) (children tree);
   let assign node =
     if not (Hashtbl.mem context.names (text node "id")) then
       Hashtbl.add context.names (text node "id") (text node "name" ^ "." ^ string_of_int (Hashtbl.length context.names))
@@ -784,22 +1045,27 @@ let context source tree =
     if not (List.mem (kind n) ["FunctionDecl"; "VarDecl"; "RecordDecl"; "EnumDecl"; "TypedefDecl"; "StaticAssertDecl"; "EmptyDecl"]) then
       fail context n ("unsupported top-level declaration " ^ kind n);
     if kind n = "RecordDecl" && Json.bool (field n "completeDefinition") then begin
-      Hashtbl.replace context.records (text n "name") n
+      Hashtbl.replace context.records (text n "tagUsed" ^ " " ^ text n "name") n
     end;
     walk (fun d ->
-      if contains (ty d) "volatile" || contains (ty d) "_Atomic" then fail context d "volatile and atomic types are unsupported";
-      if String.ends_with ~suffix:"Attr" (kind d) && not (Json.bool (field d "inherited") || Json.bool (field d "implicit")) then
+      if String.ends_with ~suffix:"Attr" (kind d) && kind d <> "PackedAttr" &&
+        not (Json.bool (field d "inherited") || Json.bool (field d "implicit")) then
         fail context d ("unsupported declaration attribute " ^ kind d);
-      if kind d = "VarDecl" && text d "tls" <> "" then fail context d "thread-local storage is unsupported";
       if kind d = "RecordDecl" && kind n <> "RecordDecl" then fail context d "local record declarations are unsupported";
       if kind d = "CompoundLiteralExpr" then assign d;
+      if kind d = "TypedefDecl" && Hashtbl.mem context.vla_aliases (text d "id") then assign d;
       if List.mem (kind d) ["VarDecl"; "ParmVarDecl"] then begin
         if text d "storageClass" = "extern" then begin
           match Hashtbl.find_opt definitions (text d "name") with
           | None -> ()
           | Some definition -> Hashtbl.replace context.names (text d "id") (Hashtbl.find context.names (text definition "id"))
         end else assign d;
-        ignore (layout context (ty d))
+        if not (Hashtbl.mem vla_bounds (text d "id")) then begin
+          let _, modifiers = declarator context (ty d) in
+          if List.exists (function Dimension bound -> bound <> "" && int_of_string_opt bound = None | _ -> false) modifiers then
+            fail context d "unsupported variable-length declarator without captured bounds";
+          ignore (layout context (ty d))
+        end
       end) n
   ) nodes;
   List.iter (fun f ->
@@ -868,6 +1134,15 @@ let emit context =
           "pure (Number (" ^ binding "k" name ^ " " ^ String.concat " " (List.map (fun a -> "(number " ^ a ^ ")") args) ^ "))"
       | None ->
           let bindings = List.mapi (fun i p -> "parameter " ^ key context p ^ " " ^ ctype context (ty p) ^ " a" ^ string_of_int i) params in
+          let shapes = List.filter_map (fun p ->
+            match Hashtbl.find_opt context.vla_bounds (text p "id") with
+            | Some (base, bounds, true) ->
+                let drop = if Hashtbl.mem context.vla_adjusted (text p "id") then "1" else "0" in
+                Some ("(variable " ^ key context p ^ " >>= \\p -> vlaBind " ^ drop ^ " p " ^
+                  string_of_int (layout context base).size ^ " [" ^
+                  join (List.map (fun bound -> par (expression context bound)) bounds) ^ "])")
+            | _ -> None) params in
+          let bindings = bindings @ shapes in
           let bindings = if !introspects then
             ("callArea <- argumentArea callArguments") ::
             ("let { namedTypes = [" ^ join (List.map (fun p -> ctype context (ty p)) params) ^ "] }") :: bindings
@@ -875,9 +1150,11 @@ let emit context =
           let locals = ref [] and graph = ref false in
           walk (fun node ->
             if (kind node = "CompoundLiteralExpr" && not (Hashtbl.mem global_literals (text node "id"))) ||
-              (kind node = "VarDecl" && not (List.mem (text node "storageClass") ["static"; "extern"])) then
+              (kind node = "VarDecl" &&
+                (match Hashtbl.find_opt context.vla_bounds (text node "id") with Some (_, _, false) -> false | _ -> true) &&
+                not (List.mem (text node "storageClass") ["static"; "extern"])) then
               locals := ("at " ^ quote (loc context node) ^ " (void (" ^ allocate "declare" node ^ "))") :: !locals;
-            if List.mem (kind node) ["SwitchStmt"; "GotoStmt"; "LabelStmt"] then graph := true) body;
+            if List.mem (kind node) ["SwitchStmt"; "GotoStmt"; "IndirectGotoStmt"; "LabelStmt"] then graph := true) body;
           let body = if !graph then control_flow context body else statement context body in
           "frame (do { " ^ String.concat "; " (bindings @ List.rev !locals @ [body]) ^ " })"
     in
@@ -890,30 +1167,41 @@ let emit context =
     if pattern <> "_" then add (binding "f" name ^ " _ = panic " ^ quote ("wrong argument count for " ^ name));
     add ""
   ) context.functions;
-  add "initialise :: R ()\ninitialise = do";
-  let compound_literals = ref [] in
-  List.iter (fun g ->
+  let initialise_globals label globals =
+    add (label ^ " :: R ()\n" ^ label ^ " = do");
+    let compound_literals = ref [] in
+    List.iter (fun g ->
     add ("  void (" ^ allocate "global" g ^ ")");
     walk (fun node -> if kind node = "CompoundLiteralExpr" then begin
       compound_literals := node :: !compound_literals;
       add ("  void (" ^ allocate "global" node ^ ")")
     end) g
-  ) context.globals;
-  List.iter (fun g -> match List.rev (children g) with
+    ) globals;
+    List.iter (fun g -> match List.rev (children g) with
     | [] -> ()
     | value :: _ ->
         let initialisers = initialise context value (ty g) "p" in
         if initialisers <> [] then add ("  do { p <- variable " ^ key context g ^ "; " ^ String.concat "; " initialisers ^ " }")
-  ) context.globals;
-  List.iter (fun g -> if constant_storage context (ty g) then add ("  freeze (variable " ^ key context g ^ ")"))
-    (context.globals @ List.rev !compound_literals);
-  add "  pure ()\n\nmain :: IO ()";
-  add ("main = execute [" ^ join (List.map (fun f -> "(" ^ quote (text f "name") ^ ", " ^ binding "f" (text f "name") ^ ")") context.functions) ^ "] initialise");
+    ) globals;
+    List.iter (fun g -> if constant_storage context (ty g) then add ("  freeze (variable " ^ key context g ^ ")"))
+      (globals @ List.rev !compound_literals);
+    add "  pure ()\n"
+  in
+  let shared, local = List.partition (fun g -> text g "tls" = "") context.globals in
+  initialise_globals "initialise" shared;
+  initialise_globals "initialiseThread" local;
+  let parallel = ref false in
+  List.iter (walk (fun node -> if kind node = "DeclRefExpr" && List.mem (callee_name node) thread_functions then
+    parallel := true)) context.functions;
+  add "main :: IO ()";
+  let labels = Hashtbl.to_seq_values context.label_names |> List.of_seq |> List.sort String.compare in
+  add ("main = execute [" ^ join (List.map (fun f -> "(" ^ quote (text f "name") ^ ", " ^ binding "f" (text f "name") ^ ")") context.functions) ^
+       "] [" ^ join (List.map quote labels) ^ "] " ^ bool !parallel ^ " initialise initialiseThread");
   Buffer.contents lines
 
 let explain context =
   print_endline "Frontend: Fil-C 0.687 typed AST, before instrumentation";
-  print_endline "Target: x86_64, LP64, little endian, single threaded";
+  print_endline "Target: x86_64, LP64, little endian";
   Printf.printf "Functions: %d; pure kernels: %d\n" (List.length context.functions) (Hashtbl.length context.pure);
   Hashtbl.to_seq context.layouts |> List.of_seq |> List.sort compare |> List.iter (fun (name, l) ->
     Printf.printf "Record %s: %d bytes, alignment %d\n" name l.size l.alignment);
@@ -974,6 +1262,206 @@ let find_frontend () =
         try Unix.access candidate [Unix.X_OK]; Some candidate with Unix.Unix_error _ -> None) paths in
       Option.value installed ~default:(Filename.concat (Sys.getenv "HOME") ".cache/heresy/filc-0.687-linux-x86_64/build/bin/clang")
 
+let json_string value =
+  let buffer = Buffer.create (String.length value + 2) in
+  Buffer.add_char buffer '"';
+  String.iter (function
+    | '"' -> Buffer.add_string buffer "\\\""
+    | '\\' -> Buffer.add_string buffer "\\\\"
+    | c when Char.code c < 32 -> Buffer.add_string buffer (Printf.sprintf "\\u%04x" (Char.code c))
+    | c -> Buffer.add_char buffer c) value;
+  Buffer.add_char buffer '"';
+  Buffer.contents buffer
+
+let prepare_frontend source content dump =
+  let layouts, tree = frontend_dump (dump []) in
+  let bounds = Hashtbl.create 16 in
+  let aliases = Hashtbl.create 16 and inherited = Hashtbl.create 16 in
+  let adjusted = Hashtbl.create 16 in
+  let edits = ref [] in
+  let varying node =
+    let t = ty node in
+    let pattern = Str.regexp "\\[\\([^]]+\\)\\]" in
+    let rec search start =
+      match (try Some (Str.search_forward pattern t start) with Not_found -> None) with
+      | None -> false
+      | Some _ ->
+          let size = String.trim (Str.matched_group 1 t) and next = Str.match_end () in
+          int_of_string_opt size = None || search next
+    in
+    search 0
+  in
+  let offset range =
+    let range = if field range "expansionLoc" = Json.Null then range else field range "expansionLoc" in
+    match int_of_string_opt (text range "offset") with
+    | Some index when index >= 0 && index < String.length content -> index
+    | _ -> raise (Error "unsupported variable-length array source location")
+  in
+  let probe index order parameter t =
+    let rec unique name = if contains content name then unique (name ^ "_") else name in
+    let marker = unique ("__heresy_vla_" ^ string_of_int index ^ "_" ^ string_of_int order) in
+    if String.contains t '\n' && (contains t "//" || contains t "\\\n") then
+      raise (Error "unsupported multiline array bound with comments or line splices");
+    let t = String.map (function '\n' | '\r' -> ' ' | c -> c) t in
+    edits := (index, order, marker, parameter, t) :: !edits
+  in
+  let parameter_type node =
+    let loc = field node "loc" and range = field node "range" in
+    let start = offset (field range "begin") and name = offset loc and finish = field range "end" in
+    let after_name = name + String.length (text node "name") in
+    if text finish "tokLen" = "" || after_name > String.length content then None else
+    let finish = offset finish + int_of_string (text finish "tokLen") in
+    if finish <= after_name || start > name || finish > String.length content then None else
+    let suffix = String.sub content after_name (finish - after_name) |> String.trim in
+    if not (String.starts_with ~prefix:"[" suffix) then None else
+    let qualifiers = Str.regexp "[ \t\r\n]*\\(static\\|const\\|volatile\\|restrict\\|__restrict__\\|__restrict\\|_Atomic\\)\\b" in
+    let rec skip cursor =
+      if Str.string_match qualifiers suffix cursor then skip (Str.match_end ()) else cursor
+    in
+    let rest = String.sub suffix (skip 1) (String.length suffix - skip 1) |> String.trim in
+    let rest = if String.starts_with ~prefix:"]" rest then "1" ^ rest else rest in
+    let base = String.sub content start (name - start) in
+    let base = Str.replace_first (Str.regexp "register[ \t\r\n]+") "" base in
+    Some (base ^ "[" ^ rest)
+  in
+  let declarations function_node =
+    begin match List.find_opt (fun node -> kind node = "CompoundStmt") (children function_node) with
+    | Some body ->
+        List.iteri (fun order node -> if kind node = "ParmVarDecl" then
+          let captured = match parameter_type node with
+            | Some t -> Some (t, true)
+            | None when varying node -> Some (ty node, false)
+            | None -> None
+          in
+          Option.iter (fun (t, array) ->
+            let index = offset (field (field body "range") "begin") in
+            if content.[index] <> '{' then raise (Error "unsupported variable-length parameter source location");
+            probe (index + 1) order (Some (text node "name", array)) t) captured) (children function_node)
+    | None -> ()
+    end;
+    walk (fun node -> if kind node = "CompoundStmt" then
+      List.iter (fun declaration -> if kind declaration = "DeclStmt" then
+        match children declaration with
+        | [variable] when kind variable = "VarDecl" && varying variable ->
+            let t = ty variable in
+            if text (field variable "type") "typeAliasDeclId" = "" then begin
+              probe (offset (field (field declaration "range") "begin")) Int.max_int None t
+            end
+        | variables when List.exists (fun node -> kind node = "VarDecl" && varying node) variables ->
+            raise (Error "unsupported variable-length array in a shared declaration")
+        | _ -> ()) (children node)) function_node
+  in
+  List.iter (fun node ->
+    let loc = field node "loc" in
+    let loc = if field loc "expansionLoc" = Json.Null then loc else field loc "expansionLoc" in
+    if kind node = "FunctionDecl" && text loc "offset" <> "" && field loc "includedFrom" = Json.Null then
+      declarations node) (children tree);
+  let edits = List.sort_uniq compare !edits in
+  let markers = Hashtbl.create (List.length edits) in
+  let content, layouts, tree = if edits = [] then content, layouts, tree else begin
+  let buffer = Buffer.create (String.length content) in
+  let previous = ref 0 in
+  List.iter (fun (index, _, marker, parameter, t) ->
+    if index < !previous then raise (Error "overlapping variable-length array declarations");
+    Buffer.add_substring buffer content !previous (index - !previous);
+    Buffer.add_string buffer ("typedef __typeof__(" ^ t ^ ") " ^ marker ^ "; ");
+    Hashtbl.add markers marker parameter;
+    previous := index) edits;
+  Buffer.add_substring buffer content !previous (String.length content - !previous);
+  let content = Buffer.contents buffer in
+  let directory = temporary_directory (Filename.get_temp_dir_name ()) in
+  let layouts, tree = Fun.protect ~finally:(fun () -> remove directory) (fun () ->
+    let copy = Filename.concat directory "input.c" and overlay = Filename.concat directory "overlay.json" in
+    write copy content;
+    write overlay ("{\"version\":0,\"use-external-names\":false,\"roots\":[{\"type\":\"file\",\"name\":" ^
+      json_string source ^ ",\"external-contents\":" ^ json_string copy ^ "}]}");
+    frontend_dump (dump ["-ivfsoverlay"; overlay])) in
+  content, layouts, tree end in
+  let rec shape node =
+    let add dimension element =
+      let base, rest = shape element in base, dimension :: rest
+    in
+    match kind node, children node with
+    | ("TypeOfType" | "ParenType"), [element] -> shape element
+    | "VariableArrayType", [element; bound] -> add bound element
+    | "ConstantArrayType", [element] ->
+        let size = text node "size" in
+        if size = "" then raise (Error "invalid fixed array dimension");
+        add (Json.Object ["kind", Json.String "IntegerLiteral"; "value", Json.String size]) element
+    | _ -> ty node, []
+  in
+  let rec rooted_shape node =
+    match kind node, children node with
+    | ("TypeOfType" | "ParenType"), [element] -> rooted_shape element
+    | "PointerType", [element] ->
+        let base, dimensions = shape element in base, dimensions, true
+    | _ -> let base, dimensions = shape node in base, dimensions, false
+  in
+  let captured = ref 0 in
+  let capture ?(array=false) ?(hidden=[]) variable alias =
+    match children alias with
+    | [declared] ->
+        let base, dimensions, indirect = rooted_shape declared in
+        if dimensions = [] then raise (Error "missing translated variable-length array bounds");
+        incr captured;
+        let id = text variable "id" in
+        List.iter (walk (fun node -> if kind node = "DeclRefExpr" &&
+          List.mem (text (field node "referencedDecl") "id") hidden then
+          raise (Error "unsupported array bound with shadowed parameter name"))) dimensions;
+        if array then begin
+          let dynamic = ref false in
+          walk (fun node -> if kind node = "VariableArrayType" then dynamic := true) declared;
+          if !dynamic then begin
+            Hashtbl.add adjusted id ();
+            Hashtbl.add bounds id (base, dimensions, true)
+          end
+        end else
+          Hashtbl.add bounds id (base, dimensions, indirect)
+    | _ -> raise (Error "missing variable-length array type from frontend")
+  in
+  let rec bind = function
+    | probe :: declaration :: rest ->
+        begin match children probe, kind declaration, children declaration with
+        | [alias], "DeclStmt", [variable] when Hashtbl.find_opt markers (text alias "name") = Some None && kind variable = "VarDecl" ->
+            capture variable alias;
+            bind rest
+        | _ -> bind (declaration :: rest)
+        end
+    | _ -> ()
+  in
+  List.iter (fun node -> if kind node = "FunctionDecl" then
+    let parameters = List.filter (fun node -> kind node = "ParmVarDecl") (children node) in
+    List.iter (fun body -> if kind body = "CompoundStmt" then
+      List.iter (fun declaration -> match children declaration with
+        | [alias] -> begin match Hashtbl.find_opt markers (text alias "name") with
+          | Some (Some (name, array)) ->
+              let remaining = List.drop_while (fun node -> text node "name" <> name) parameters in
+              let parameter = List.hd remaining in
+              capture ~array ~hidden:(List.map (fun node -> text node "id") remaining) parameter alias
+          | _ -> ()
+          end
+        | _ -> ()) (children body)) (children node)) (children tree);
+  walk (fun node -> if kind node = "CompoundStmt" then bind (children node)) tree;
+  if !captured <> List.length edits then raise (Error "unresolved variable-length array bounds");
+  walk (fun node -> if kind node = "TypedefDecl" && varying node && not (Hashtbl.mem markers (text node "name")) then
+    match children node with
+    | [declared] ->
+        let base, dimensions, indirect = rooted_shape declared in
+        if dimensions <> [] && not indirect then begin
+          let id = text node "id" in
+          Hashtbl.replace bounds id (base, dimensions, false);
+          Hashtbl.replace aliases id ()
+        end
+    | _ -> ()) tree;
+  walk (fun node -> if kind node = "VarDecl" && varying node then
+    let alias = text (field node "type") "typeAliasDeclId" in
+    if Hashtbl.mem aliases alias then begin
+      let id = text node "id" in
+      Hashtbl.replace bounds id (Hashtbl.find bounds alias);
+      Hashtbl.replace inherited id alias
+    end) tree;
+  content, layouts, bounds, aliases, inherited, adjusted, tree
+
 let main () =
   let source = ref "" and output = ref "" and executable = ref "" and report = ref false in
   let check = ref false and timeout = ref 0. and ghc = ref "ghc" in
@@ -1000,8 +1488,12 @@ let main () =
   if not (contains version "Fil-C 0.687") then raise (Error "FILCC must select Fil-C 0.687; ordinary Clang is not accepted");
   let machine = String.trim (capture frontend ["-dumpmachine"]) in
   if machine <> "x86_64-unknown-linux-gnu" then raise (Error ("unsupported frontend target " ^ machine));
-  let tree = capture frontend ["-x"; "c"; "-std=c11"; "-Werror"; "-Wno-return-stack-address"; "-ferror-limit=20"; "-fno-color-diagnostics"; "-Xclang"; "-ast-dump=json"; "-fsyntax-only"; source] |> Json.parse in
-  let context = context source tree in
+  let dump extra = capture frontend (extra @ ["-x"; "c"; "-std=c11"; "-Werror";
+    "-Wno-return-stack-address"; "-Wno-pointer-arith"; "-ferror-limit=20"; "-fno-color-diagnostics";
+    "-Xclang"; "-fdump-record-layouts-complete"; "-Xclang"; "-fdump-record-layouts-simple";
+    "-Xclang"; "-ast-dump=json"; "-fsyntax-only"; source]) in
+  let content, frontend_layouts, bounds, aliases, inherited, adjusted, tree = prepare_frontend source (read source) dump in
+  let context = context source content frontend_layouts bounds aliases inherited adjusted tree in
   let generated = emit context in
   if !check then begin
     Printf.printf "Checked %s\n" (Filename.basename source);
@@ -1018,7 +1510,7 @@ let main () =
     Fun.protect ~finally:(fun () -> remove workspace) (fun () ->
       let main = Filename.concat workspace "Main.hs" and target = Filename.concat workspace "heresy" in
       write main generated;
-      let code = Process.run ~timeout:!timeout !ghc ["-O1"; "-v0"; "-rtsopts"; "-package-env"; "-"; "-hide-all-packages";
+      let code = Process.run ~timeout:!timeout !ghc ["-O1"; "-v0"; "-rtsopts"; "-threaded"; "-package-env"; "-"; "-hide-all-packages";
         "-package"; "base"; "-package"; "bytestring"; "-package"; "containers"; "-package"; "mtl";
         "-i"; "-i" ^ workspace; "-outputdir"; workspace; main; "-o"; target] in
       if code <> 0 then raise (Error ("GHC exited with status " ^ string_of_int code));

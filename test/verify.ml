@@ -204,6 +204,16 @@ let () =
        contains values "padding 5 6 1 0 0 32\n");
     check "flexible array members retain their enclosing allocation bounds"
       (contains values "flexible 18 8 8 2 17\n");
+    check "packed bit-fields preserve adjacent fields and dispatch tables retain label identity"
+      (contains values "packed 12 1 9 5 6 3 19 a6\ndispatch 35 15 3\n");
+    check "pointer atomics keep the atomic value separate from the integer payload"
+      (contains values "atomics 2147483647 -2147483648 0 1 23 40 0 4 40 71\n");
+    check "threads share atomic objects and have independent thread-local storage"
+      (contains values "threads 8000 6 6 5 1 0\n" && success "build/values" ["+RTS"; "-N2"; "-RTS"] = values);
+    check "extended precision survives calls, variadic alignment and IEEE boundary cases"
+      (contains values "extended layout 16 16 48 7\nextended 1.0000000000000000001084 1 1 1 1 1 -0.0\n");
+    check "variable array bounds control indexing, pointer strides and adjusted parameters"
+      (contains values "vla 4 6 15 1 60 20 19 1 21 24 3\narray args 5 6 20\nshape 16 16 50 6 19 45\n");
     let exhausted = "build/exhausted.c" in
     write exhausted "#include <stdarg.h>\nint read(int x, int n, ...){va_list a;va_start(a,n);return va_arg(a,int);}int main(void){return read(0,0);}";
     ignore (success compiler [exhausted; "--build"; "build/exhausted"]);
@@ -246,9 +256,8 @@ let () =
     let code, _, errors = run "build/constant" [] in
     check "constant globals reject stores" (code = 70 && contains errors "read-only memory");
     let denied = [
-      "attribute", "struct __attribute__((packed)) S{char x;long y;};int main(void){return 0;}";
+      "attribute", "struct __attribute__((aligned(64))) S{char x;long y;};int main(void){return 0;}";
       "constructor", "void __attribute__((constructor)) init(void){} int main(void){return 0;}";
-      "thread", "_Thread_local int value;int main(void){return value;}";
       "localrecord", "struct S{int value;};int main(void){struct S{long value;};struct S x;return sizeof(x);}";
       "unresolved", "extern int missing;int main(void){return missing;}"
     ] in
@@ -312,7 +321,7 @@ let () =
     let code, _, errors = run "build/invalidstream" [] in
     check "preserved stream capabilities reject the wrong address" (code = 70 && contains errors "invalid file stream");
     let unsupported = "build/unsupported.c" in
-    write unsupported "int main(void) { long double x = 1.25L; return (int)x; }";
+    write unsupported "int main(void) { __asm__(\"nop\"); return 0; }";
     let code, _, errors = run compiler [unsupported] in
     check "unsupported constructs fail closed" (code <> 0 && contains errors "unsupported");
     let env = with_environment "FILCC" fault |> Array.to_list |> List.filter (fun item -> not (String.starts_with ~prefix:"HERESY_FAULT=" item)) |> fun entries -> Array.of_list ("HERESY_FAULT=ordinary" :: entries) in
