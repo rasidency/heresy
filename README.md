@@ -1,4 +1,4 @@
-The translator lowers the Fil-C typed AST before instrumentation into a standalone Haskell module, using frontend record layouts and carrying integer, binary32, binary64, x87 extended-precision and pointer values through an embedded capability runtime.
+The translator lowers the Fil-C typed AST before instrumentation into a standalone Haskell module, using frontend record layouts and carrying integers up to 128 bits, binary32, binary64, x87 extended-precision and pointers through an embedded capability runtime.
 
 ![Typed AST lowering into Haskell with native differential execution](assets/pipeline.svg)
 

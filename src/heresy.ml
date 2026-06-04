@@ -339,6 +339,7 @@ let scalar context t =
     | "int" -> 32
     | "" when t = "unsigned" || t = "signed" -> 32
     | "long" | "long int" | "long long" | "long long int" -> 64
+    | "__int128" -> 128
     | _ -> raise (Error ("unsupported scalar type " ^ t))
   in width, signed
 

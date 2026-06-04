@@ -125,6 +125,39 @@ void extended_values(void) {
          not_a_number != not_a_number && inf > a, -0.0L);
 }
 
+typedef unsigned __int128 Wide;
+
+Wide wide_argument(int a, int b, ...) {
+  va_list list;
+  va_start(list, b);
+  Wide value = va_arg(list, Wide);
+  int tail = va_arg(list, int);
+  va_end(list);
+  printf("wide argument %lu %lu %d\n", sizeof(value), _Alignof(Wide), a + b + tail);
+  return value;
+}
+
+void wide_slot(int a, ...) {
+  unsigned long *words = zargs();
+  va_list list;
+  va_start(list, a);
+  Wide value = va_arg(list, Wide);
+  va_end(list);
+  printf("wide slot %lu %lu %lu %lu %lu\n", words[1], words[2], words[3],
+         (unsigned long)value, (unsigned long)(value >> 64));
+}
+
+void wide_values(void) {
+  Wide value = ((Wide)345 << 64) + 189;
+  Wide roundtrip = wide_argument(2, 5, value, 7);
+  Wide overflow = (Wide)-1;
+  overflow += roundtrip;
+  __int128 signed_value = -((__int128)50 << 70);
+  printf("wide %d %d %ld %.0f\n", roundtrip == value, overflow == value - 1,
+         (long)(signed_value >> 70), (double)((__int128)-3));
+  wide_slot(9, value, 74);
+}
+
 int adjusted_rows(int n, int m, int a[n++][m++], int b[static n++]) {
   printf("array args %d %d %lu\n", n, m, sizeof *a);
   return a[1][2] + b[0];
@@ -318,6 +351,7 @@ int main(int argc, char **argv) {
   atomic_values();
   concurrent_values();
   extended_values();
+  wide_values();
   variable_array_values(3, 5);
   return 0;
 }

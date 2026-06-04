@@ -358,6 +358,97 @@ theorem argument_extent_padding (widths : List Nat) :
   unfold argument_extent
   omega
 
+def aligned_slot (cursor width alignment : Nat) : Nat × Nat :=
+  let start := ((cursor + alignment - 1) / alignment) * alignment
+  (start, start + slot_size width)
+
+theorem aligned_slot_valid (cursor width alignment : Nat) (positive : 0 < alignment) :
+    let (start, finish) := aligned_slot cursor width alignment
+    cursor ≤ start ∧ start < cursor + alignment ∧ start % alignment = 0 ∧
+      start + width ≤ finish := by
+  have covers := slot_covers_payload width
+  have split := Nat.mod_add_div (cursor + alignment - 1) alignment
+  have remainder := Nat.mod_lt (cursor + alignment - 1) positive
+  have aligned : (cursor + alignment - 1) / alignment * alignment % alignment = 0 := by
+    simp
+  simp only [aligned_slot]
+  rw [Nat.mul_comm alignment] at split
+  exact ⟨by omega, by omega, aligned, Nat.add_le_add_left covers _⟩
+
+def array_extent (width : Nat) : List Nat → Nat
+  | [] => width
+  | count :: rest => count * array_extent width rest
+
+def array_spans (width : Nat) : List Nat → List Nat
+  | [] => [width]
+  | count :: rest => (count * array_extent width rest) :: array_spans width rest
+
+theorem array_span_at (width : Nat) (dimensions : List Nat) (rank : Nat)
+    (inside : rank ≤ dimensions.length) :
+    (array_spans width dimensions)[rank]? = some (array_extent width (dimensions.drop rank)) := by
+  induction dimensions generalizing rank with
+  | nil =>
+    have zero : rank = 0 := by simpa using inside
+    simp [array_spans, array_extent, zero]
+  | cons count rest step =>
+    cases rank with
+    | zero => simp [array_spans, array_extent]
+    | succ rank =>
+      simpa [array_spans] using step rank (by simpa using inside)
+
+def array_offset (width : Nat) : List Nat → List Nat → Option Nat
+  | [], [] => some 0
+  | count :: rest, index :: indices =>
+    if index < count then
+      (array_offset width rest indices).map (fun inner => index * array_extent width rest + inner)
+    else none
+  | _, _ => none
+
+theorem array_index_in_bounds (width : Nat) (dimensions indices : List Nat) (offset : Nat)
+    (resolved : array_offset width dimensions indices = some offset) :
+    offset + width ≤ array_extent width dimensions := by
+  induction dimensions generalizing indices offset with
+  | nil =>
+    cases indices with
+    | nil =>
+      simp [array_offset] at resolved
+      subst offset
+      simp [array_extent]
+    | cons index rest => simp [array_offset] at resolved
+  | cons count rest step =>
+    cases indices with
+    | nil => simp [array_offset] at resolved
+    | cons index indices =>
+      by_cases inside : index < count
+      · cases inner : array_offset width rest indices with
+        | none => simp [array_offset, inside, inner] at resolved
+        | some inner_offset =>
+          simp only [array_offset, if_pos inside, inner, Option.map_some, Option.some.injEq] at resolved
+          subst offset
+          let stride := array_extent width rest
+          have fits : inner_offset + width ≤ stride := step indices inner_offset inner
+          calc
+            index * stride + inner_offset + width ≤ index * stride + stride := by omega
+            _ = (index + 1) * stride := by simp [Nat.add_mul]
+            _ ≤ count * stride := Nat.mul_le_mul_right stride inside
+            _ = array_extent width (count :: rest) := rfl
+      · simp [array_offset, inside] at resolved
+
+def field_store (position width previous value : Nat) : Nat :=
+  let low_mask := 2 ^ width - 1
+  let mask := low_mask <<< position
+  (previous ^^^ (previous &&& mask)) ||| ((value &&& low_mask) <<< position)
+
+theorem field_store_bit (position width previous value index : Nat) :
+    (field_store position width previous value).testBit index =
+      if position ≤ index ∧ index - position < width then value.testBit (index - position)
+      else previous.testBit index := by
+  simp only [field_store, Nat.testBit_or, Nat.testBit_xor, Nat.testBit_and, Nat.testBit_shiftLeft,
+    Nat.testBit_two_pow_sub_one]
+  by_cases after_start : position ≤ index <;> by_cases before_end : index - position < width <;>
+    cases previous.testBit index <;> cases value.testBit (index - position) <;>
+    simp [after_start, before_end]
+
 end Heresy
 
 #print axioms Heresy.lower_correct
@@ -374,3 +465,7 @@ end Heresy
 #print axioms Heresy.named_prefix_leaves_variadic_suffix
 #print axioms Heresy.next_variadic_span
 #print axioms Heresy.argument_extent_covers_slots
+#print axioms Heresy.aligned_slot_valid
+#print axioms Heresy.array_span_at
+#print axioms Heresy.array_index_in_bounds
+#print axioms Heresy.field_store_bit

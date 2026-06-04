@@ -42,7 +42,7 @@ data Capability = NoCapability | Capability !Int !(IORef Object) deriving Eq
 instance Show Capability where
   show NoCapability = "0"
   show (Capability ident _) = show ident
-data Value = Number !Integer | Pointer !Capability !Integer | Function !Integer !String | Stream !Int !Integer
+data Value = Number !Integer | Wide !Integer | Pointer !Capability !Integer | Function !Integer !String | Stream !Int !Integer
   | Single !Float | DoublePrecision !Double | Extended !Integer
   | Aggregate !Int !Int !(M.IntMap Integer) !(M.IntMap Value) | NoValue deriving (Eq, Show)
 data CType = IntegerType !Int !Bool | PointerType | FloatingType !Int | AggregateType !Int !Int
@@ -77,6 +77,7 @@ locked action = R $ ExceptT $ StateT $ \world ->
 
 number :: Value -> Integer
 number (Number n) = n
+number (Wide n) = n
 number (Pointer _ n) = n
 number (Function code _) = code
 number (Stream _ raw) = raw
@@ -104,6 +105,7 @@ cast PointerType p@(Pointer _ _) = p
 cast PointerType f@(Function _ _) = f
 cast PointerType s@(Stream _ _) = s
 cast PointerType (Number n) = Pointer NoCapability (normalise 64 False n)
+cast PointerType (Wide n) = Pointer NoCapability (normalise 64 False n)
 cast PointerType NoValue = nullPointer
 cast PointerType (Aggregate _ _ _ _) = nullPointer
 cast PointerType (Single _) = nullPointer
@@ -140,6 +142,7 @@ noValue :: Value
 noValue = NoValue
 
 marshal :: CType -> Value -> Value
+marshal (IntegerType 128 _) value = Wide (normalise 128 False (number value))
 marshal (IntegerType width _) value = Number (normalise width False (number value))
 marshal PointerType value = cast PointerType value
 marshal (FloatingType 80) value = cast (FloatingType 80) value
@@ -154,7 +157,11 @@ slotSize size = ((toInteger size + 7) `div` 8) * 8
 addSlot :: Integer -> CType -> (Integer, Integer)
 addSlot from ty =
   let alignment = case ty of FloatingType 80 -> 16; AggregateType _ a -> max 8 (toInteger a); _ -> 8
-      start = ((from + alignment - 1) `div` alignment) * alignment
+  in alignedSlot from ty alignment
+
+alignedSlot :: Integer -> CType -> Integer -> (Integer, Integer)
+alignedSlot from ty alignment =
+  let start = ((from + alignment - 1) `div` alignment) * alignment
   in (start, start + slotSize (widthOf ty))
 
 argumentArea :: [Value] -> R Value
@@ -162,6 +169,7 @@ argumentArea values = do
   let slot value = case value of
         Aggregate size alignment _ _ -> (AggregateType size alignment, value)
         Extended _ -> (FloatingType 80, value)
+        Wide _ -> (IntegerType 128 False, value)
         _ | addressed value -> (PointerType, value)
           | otherwise -> (IntegerType 64 False, value)
       slots = map slot values
@@ -189,7 +197,9 @@ vaArg :: CType -> R Value -> R Value
 vaArg ty list = do
   pointer <- list
   cursor <- load PointerType pointer
-  let (start, next) = addSlot (number cursor) ty
+  let (start, next) = case ty of
+        IntegerType 128 _ -> alignedSlot (number cursor) ty 16
+        _ -> addSlot (number cursor) ty
   value <- load ty (offset (start - number cursor) cursor)
   void (store PointerType pointer (offset (next - number cursor) cursor))
   pure value
@@ -349,6 +359,7 @@ storeCell declared pointer value = do
 
 describe :: Value -> String
 describe (Number n) = show n
+describe (Wide n) = show n
 describe (Single value) = show value
 describe (DoublePrecision value) = show value
 describe (Extended bits) = "extended(0x" ++ showHex bits ")"
