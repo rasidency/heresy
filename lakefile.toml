@@ -1,7 +1,12 @@
 name = "heresy"
 version = "0.2.0"
-defaultTargets = ["Proof"]
+defaultTargets = ["Proof", "certificate"]
 
 [[lean_lib]]
 name = "Proof"
+srcDir = "proof"
+
+[[lean_exe]]
+name = "certificate"
+root = "Certificate"
 srcDir = "proof"

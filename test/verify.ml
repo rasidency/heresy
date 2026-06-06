@@ -214,6 +214,8 @@ let () =
       (contains values "extended layout 16 16 48 7\nextended 1.0000000000000000001084 1 1 1 1 1 -0.0\n");
     check "wide integers preserve fixed and variadic calls and the frontend cursor layout"
       (contains values "wide argument 16 16 14\nwide 1 1 -50 -3\nwide slot 189 345 74 345 74\n");
+    check "complex arithmetic preserves component precision, exceptional values and argument layout"
+      (contains values "complex math 1.50000000 -2.25000000 0 1 1 1 1 1 1 1\ncomplex extended 2.000000000000000000434 -9.00000\ncomplex args 64 1.5 -0.0 7.2 8.5 2.0 -9.0\n");
     check "variable array bounds control indexing, pointer strides and adjusted parameters"
       (contains values "vla 4 6 15 1 60 20 19 1 21 24 3\narray args 5 6 20\nshape 16 16 50 6 19 45\n");
     let exhausted = "build/exhausted.c" in

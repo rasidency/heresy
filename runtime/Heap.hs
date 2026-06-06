@@ -7,6 +7,7 @@ module Heap
   , freeze
   , chain, discard, branch, loop, postloop, selection, dispatch, indirectJump, logic, boolean, binary, unary
   , assign, update, realBinary, realUpdate, function, invoke, execute
+  , imaginary, makeComplex, complexPart, complexBinary, complexUpdate
   , argumentArea, vaStart, vaCopy, vaArg, vaAvailable
   , atomicAccess, atomicModify, atomicCompare, atomicPointerStep
   , vlaDeclare, vlaBind, vlaSize, vlaIndex, vlaBinary, vlaUpdate, vlaExtent, vlaAlias, vlaFromAlias
@@ -43,9 +44,9 @@ instance Show Capability where
   show NoCapability = "0"
   show (Capability ident _) = show ident
 data Value = Number !Integer | Wide !Integer | Pointer !Capability !Integer | Function !Integer !String | Stream !Int !Integer
-  | Single !Float | DoublePrecision !Double | Extended !Integer
+  | Single !Float | DoublePrecision !Double | Extended !Integer | Complex !Int !Value !Value
   | Aggregate !Int !Int !(M.IntMap Integer) !(M.IntMap Value) | NoValue deriving (Eq, Show)
-data CType = IntegerType !Int !Bool | PointerType | FloatingType !Int | AggregateType !Int !Int
+data CType = IntegerType !Int !Bool | PointerType | FloatingType !Int | ComplexType !Int | AggregateType !Int !Int
   | BitField !Int !Int !Bool | AtomicType !CType deriving (Eq, Show)
 data Flow = Next | Return !Value | Break | Continue | Jump !Int deriving (Eq, Show)
 data Fault = Panic !String | Finish !Int deriving (Eq, Show)
@@ -84,6 +85,7 @@ number (Stream _ raw) = raw
 number (Single value) = toInteger (castFloatToWord32 value)
 number (DoublePrecision value) = toInteger (castDoubleToWord64 value)
 number (Extended bits) = bits
+number (Complex width real imag) = number real .|. shiftL (number imag) (8 * widthOf (FloatingType width))
 number (Aggregate _ _ _ _) = 0
 number NoValue = 0
 
@@ -91,6 +93,7 @@ truth :: Value -> Bool
 truth (Single value) = value /= 0
 truth (DoublePrecision value) = value /= 0
 truth (Extended bits) = case unpackExtended bits of Finite _ value -> value /= 0; _ -> True
+truth (Complex _ real imag) = truth real || truth imag
 truth v = number v /= 0
 
 normalise :: Int -> Bool -> Integer -> Integer
@@ -111,14 +114,24 @@ cast PointerType (Aggregate _ _ _ _) = nullPointer
 cast PointerType (Single _) = nullPointer
 cast PointerType (DoublePrecision _) = nullPointer
 cast PointerType (Extended _) = nullPointer
+cast PointerType (Complex _ _ _) = nullPointer
 cast (FloatingType 32) value = Single (castWord32ToFloat (fromInteger (number value)))
 cast (FloatingType 80) value = Extended (normalise 80 False (number value))
 cast (FloatingType _) value = DoublePrecision (castWord64ToDouble (fromInteger (number value)))
+cast (ComplexType width) value =
+  let ty = FloatingType width
+      half = 8 * widthOf ty
+      raw = number value
+  in Complex width (cast ty (Number (normalise half False raw))) (cast ty (Number (shiftR raw half)))
 cast (AggregateType _ _) v = v
 cast (BitField _ width signed) v = Number (normalise width signed (number v))
 cast (AtomicType ty) value = cast ty value
 
 convert :: CType -> Value -> R Value
+convert (ComplexType width) value =
+  Complex width <$> convert (FloatingType width) (complexPart False value)
+                <*> convert (FloatingType width) (complexPart True value)
+convert ty (Complex _ real _) = convert ty real
 convert (FloatingType 32) value = pure (Single (asSingle value))
 convert (FloatingType 80) value = pure (packExtended (asExtended value))
 convert (FloatingType _) value = pure (DoublePrecision (asDouble value))
@@ -147,6 +160,7 @@ marshal (IntegerType width _) value = Number (normalise width False (number valu
 marshal PointerType value = cast PointerType value
 marshal (FloatingType 80) value = cast (FloatingType 80) value
 marshal (FloatingType width) value = Number (normalise width False (number value))
+marshal (ComplexType width) value = cast (ComplexType width) value
 marshal (AggregateType _ _) value = value
 marshal (BitField _ width _) value = Number (normalise width False (number value))
 marshal (AtomicType ty) value = marshal ty value
@@ -156,7 +170,11 @@ slotSize size = ((toInteger size + 7) `div` 8) * 8
 
 addSlot :: Integer -> CType -> (Integer, Integer)
 addSlot from ty =
-  let alignment = case ty of FloatingType 80 -> 16; AggregateType _ a -> max 8 (toInteger a); _ -> 8
+  let alignment = case ty of
+        FloatingType 80 -> 16
+        ComplexType 80 -> 16
+        AggregateType _ a -> max 8 (toInteger a)
+        _ -> 8
   in alignedSlot from ty alignment
 
 alignedSlot :: Integer -> CType -> Integer -> (Integer, Integer)
@@ -169,6 +187,7 @@ argumentArea values = do
   let slot value = case value of
         Aggregate size alignment _ _ -> (AggregateType size alignment, value)
         Extended _ -> (FloatingType 80, value)
+        Complex width _ _ -> (ComplexType width, value)
         Wide _ -> (IntegerType 128 False, value)
         _ | addressed value -> (PointerType, value)
           | otherwise -> (IntegerType 64 False, value)
@@ -279,6 +298,7 @@ widthOf (IntegerType width _) = width `div` 8
 widthOf (AggregateType width _) = width
 widthOf (FloatingType 80) = 16
 widthOf (FloatingType width) = width `div` 8
+widthOf (ComplexType width) = 2 * widthOf (FloatingType width)
 widthOf (BitField bitOffset width _) = (bitOffset + width + 7) `div` 8
 widthOf (AtomicType ty) = widthOf ty
 
@@ -302,6 +322,7 @@ loadCell declared pointer = do
         IntegerType width signed -> Number (normalise width signed raw)
         BitField bitOffset width signed -> Number (normalise width signed (shiftR raw bitOffset))
         FloatingType _ -> cast ty (Number raw)
+        ComplexType _ -> cast ty (Number raw)
         AggregateType size alignment -> Aggregate size alignment (aggregateBytes displacement size (bytes object)) (aggregateShadow displacement size (shadow object))
         AtomicType _ -> NoValue
         PointerType -> case M.lookup displacement (shadow object) of
@@ -363,6 +384,7 @@ describe (Wide n) = show n
 describe (Single value) = show value
 describe (DoublePrecision value) = show value
 describe (Extended bits) = "extended(0x" ++ showHex bits ")"
+describe (Complex _ real imag) = "(" ++ describe real ++ ", " ++ describe imag ++ ")"
 describe (Pointer cap raw) = "pointer(#" ++ show cap ++ ", " ++ show raw ++ ")"
 describe (Function _ name) = "function(" ++ name ++ ")"
 describe (Stream ident _) = "stream(#" ++ show ident ++ ")"
@@ -688,12 +710,17 @@ unary op ty expression = do
   value <- expression
   case op of
     "!" -> pure (boolean (not (truth value)))
+    "~" | ComplexType width <- ty ->
+      Complex width (complexPart False value) <$> unary "-" (FloatingType width) (pure (complexPart True value))
     "~" -> pure (cast ty (Number (complement (number value))))
     "-" -> case ty of
       IntegerType w s -> either panic pure (calculate "-" w s 1 (Number 0) value)
       FloatingType 32 -> pure (Single (negate (asSingle value)))
       FloatingType 80 -> pure (packExtended (negateExtended (asExtended value)))
       FloatingType _ -> pure (DoublePrecision (negate (asDouble value)))
+      ComplexType width ->
+        Complex width <$> unary "-" (FloatingType width) (pure (complexPart False value))
+                      <*> unary "-" (FloatingType width) (pure (complexPart True value))
       _ -> panic "invalid unary minus"
     "+" -> pure value
     _ -> panic ("unsupported unary operator " ++ op)
@@ -875,6 +902,127 @@ realUpdate op width ty postfix destination expression = do
   pointer <- destination
   old <- load ty pointer
   result <- realBinary op width (pure old) expression >>= convert ty
+  stored <- store ty pointer result
+  pure (if postfix then old else stored)
+
+complexPart :: Bool -> Value -> Value
+complexPart imag (Complex _ real imaginaryPart) = if imag then imaginaryPart else real
+complexPart imag value = if imag then Number 0 else value
+
+imaginary :: CType -> R Value -> R Value
+imaginary (ComplexType width) expression =
+  Complex width (cast (FloatingType width) (Number 0)) <$> expression
+imaginary _ _ = panic "imaginary literal requires complex type"
+
+makeComplex :: CType -> R Value -> R Value -> R Value
+makeComplex (ComplexType width) real imag = Complex width <$> real <*> imag
+makeComplex _ _ _ = panic "complex construction requires complex type"
+
+complexBinary :: String -> Int -> R Value -> R Value -> R Value
+complexBinary op width left right = do
+  a <- left
+  b <- right
+  let ar = complexPart False a
+      ai = complexPart True a
+      br = complexPart False b
+      bi = complexPart True b
+      scalar (Complex _ _ _) = False
+      scalar _ = True
+      real operation x y = realBinary operation width (pure x) (pure y)
+      pair = Complex width
+      neg x = unary "-" (FloatingType width) (pure x)
+      comparePair equal = do
+        sameReal <- real "==" ar br
+        sameImag <- real "==" ai bi
+        pure (boolean ((truth sameReal && truth sameImag) == equal))
+      isNan value = case asExtended value of NotANumber _ -> True; _ -> False
+      infinite value = case asExtended value of Infinite _ -> True; _ -> False
+      finite value = case asExtended value of Finite _ _ -> True; _ -> False
+      sign value = case asExtended value of
+        Finite negative _ -> negative
+        Infinite negative -> negative
+        NotANumber raw -> testBit raw 79
+      typed = convert (FloatingType width) . packExtended
+      signOf magnitude value = typed (Finite (sign value) magnitude)
+      unit value = signOf (if infinite value then 1 else 0) value
+      dropNan value = if isNan value then signOf 0 value else pure value
+      productPair x y u v = do
+        ac <- real "*" x u
+        bd <- real "*" y v
+        ad <- real "*" x v
+        bc <- real "*" y u
+        (,) <$> real "-" ac bd <*> real "+" ad bc
+      scaledPair factor (x, y) = do
+        r <- real "*" factor x
+        i <- real "*" factor y
+        pure (pair r i)
+      multiply = do
+        result@(r, i) <- productPair ar ai br bi
+        if not (isNan r && isNan i) then pure (uncurry pair result) else do
+          let leftInf = any infinite [ar, ai]
+              rightInf = any infinite [br, bi]
+          ac <- real "*" ar br
+          bd <- real "*" ai bi
+          ad <- real "*" ar bi
+          bc <- real "*" ai br
+          if not (leftInf || rightInf || any infinite [ac, bd, ad, bc]) then pure (uncurry pair result) else do
+            x <- (if leftInf then unit else dropNan) ar
+            y <- (if leftInf then unit else dropNan) ai
+            u <- (if rightInf then unit else dropNan) br
+            v <- (if rightInf then unit else dropNan) bi
+            factor <- typed (Infinite False)
+            productPair x y u v >>= scaledPair factor
+      scale power value = case asExtended value of
+        Finite negative magnitude -> typed (Finite negative (scaleBinary magnitude power))
+        _ -> pure value
+      divide = do
+        let largest = maximum (0 : [m | Finite _ m <- map asExtended [br, bi]])
+            logarithm value = I# (integerLog2# value)
+            guess = logarithm (numerator largest) - logarithm (denominator largest)
+            power
+              | largest == 0 || any infinite [br, bi] = 0
+              | scaleBinary largest (negate guess) < 1 = guess - 1
+              | otherwise = guess
+        c <- scale (negate power) br
+        d <- scale (negate power) bi
+        cc <- real "*" c c
+        dd <- real "*" d d
+        denominatorValue <- real "+" cc dd
+        numeratorValues <- productPair ar ai c =<< neg d
+        r <- real "/" (fst numeratorValues) denominatorValue >>= scale (negate power)
+        i <- real "/" (snd numeratorValues) denominatorValue >>= scale (negate power)
+        if not (isNan r && isNan i) then pure (pair r i)
+        else if not (truth denominatorValue) && not (isNan ar && isNan ai) then do
+          factor <- typed (Infinite (sign br))
+          scaledPair factor (ar, ai)
+        else if any infinite [ar, ai] && all finite [c, d] then do
+          x <- unit ar
+          y <- unit ai
+          factor <- typed (Infinite False)
+          (neg d >>= productPair x y c) >>= scaledPair factor
+        else if any infinite [br, bi] && all finite [ar, ai] then do
+          cUnit <- unit br
+          dUnit <- unit bi
+          factor <- typed (Finite False 0)
+          (neg dUnit >>= productPair ar ai cUnit) >>= scaledPair factor
+        else pure (pair r i)
+  case op of
+    "==" -> comparePair True
+    "!=" -> comparePair False
+    "+" -> pair <$> real "+" ar br <*> (if scalar a then pure bi else if scalar b then pure ai else real "+" ai bi)
+    "-" -> pair <$> real "-" ar br <*> (if scalar a then neg bi else if scalar b then pure ai else real "-" ai bi)
+    "*" | scalar a -> pair <$> real "*" ar br <*> real "*" ar bi
+        | scalar b -> pair <$> real "*" ar br <*> real "*" ai br
+        | otherwise -> multiply
+    "/" | scalar b -> pair <$> real "/" ar br <*> real "/" ai br
+        | otherwise -> divide
+    _ -> panic ("unsupported complex operator " ++ op)
+
+complexUpdate :: String -> Int -> CType -> Bool -> R Value -> R Value -> R Value
+complexUpdate op width ty postfix destination expression = do
+  pointer <- destination
+  old <- load ty pointer
+  result <- complexBinary op width (pure old) expression >>= convert ty
   stored <- store ty pointer result
   pure (if postfix then old else stored)
 

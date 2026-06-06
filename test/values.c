@@ -5,6 +5,7 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <limits.h>
+#include <complex.h>
 
 struct Packet {
   long sequence;
@@ -156,6 +157,42 @@ void wide_values(void) {
   printf("wide %d %d %ld %.0f\n", roundtrip == value, overflow == value - 1,
          (long)(signed_value >> 70), (double)((__int128)-3));
   wide_slot(9, value, 74);
+}
+
+void complex_arguments(int named, ...) {
+  va_list list;
+  va_start(list, named);
+  float _Complex f = va_arg(list, float _Complex);
+  double _Complex d = va_arg(list, double _Complex);
+  long double _Complex x = va_arg(list, long double _Complex);
+  va_end(list);
+  void *area = zargs();
+  printf("complex args %ld %.1f %.1f %.1f %.1f %.1Lf %.1Lf\n",
+         (char*)zgetupper(area) - (char*)area,
+         __real__ f, __imag__ f, __real__ d, __imag__ d, __real__ x, __imag__ x);
+}
+
+void complex_values(double zero) {
+  double infinity = 1.0 / zero;
+  double nan = zero / zero;
+  double _Complex z = CMPLX(1.5, -2.25);
+  double _Complex w = CMPLX(7.25, 8.5);
+  double _Complex q = z;
+  q *= w;
+  q /= w;
+  double _Complex invalid = CMPLX(nan, 1.0);
+  double _Complex limit = CMPLX(infinity, nan) * w;
+  double _Complex inverse = w / CMPLX(infinity, nan);
+  double _Complex singular = w / CMPLX(-zero, zero);
+  float _Complex f = q;
+  __imag__ f = -0.0f;
+  long double _Complex extended = CMPLXL(0x1.0000000000000002p0L, -2.0L) * CMPLXL(4.0L, -1.0L);
+  printf("complex math %.8f %.8f %d %d %d %d %d %d %d %d\n",
+         __real__ q, __imag__ q, z == w, invalid != invalid, !!invalid,
+         __real__ limit > 0.0, __imag__ limit > 0.0, inverse == CMPLX(0.0, 0.0),
+         __real__ singular < 0.0 && __imag__ singular < 0.0, 1.0f / __imag__ f < 0.0f);
+  printf("complex extended %.21Lf %.5Lf\n", __real__ extended, __imag__ extended);
+  complex_arguments(17, f, w, extended);
 }
 
 int adjusted_rows(int n, int m, int a[n++][m++], int b[static n++]) {
@@ -352,6 +389,7 @@ int main(int argc, char **argv) {
   concurrent_values();
   extended_values();
   wide_values();
+  complex_values(zero);
   variable_array_values(3, 5);
   return 0;
 }

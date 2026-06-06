@@ -329,6 +329,15 @@ let value_type context t = Option.value (atomic_underlying context t) ~default:t
 let floating context t =
   match clean context (value_type context t) with "float" -> Some 32 | "double" -> Some 64 | "long double" -> Some 80 | _ -> None
 
+let complex context t =
+  match clean context (value_type context t) with
+  | "_Complex float" -> Some 32
+  | "_Complex double" -> Some 64
+  | "_Complex long double" -> Some 80
+  | _ -> None
+
+let floating_size = function 80 -> 16 | width -> width / 8
+
 let scalar context t =
   let t = clean context (value_type context t) in
   let signed = not (contains t "unsigned") && t <> "_Bool" in
@@ -384,9 +393,16 @@ let rec layout context original =
           Hashtbl.add context.layouts t result; result
       end
   | None ->
-      let width = match floating context t with Some width -> width | None -> fst (scalar context t) in
-      let size = if width = 80 then 16 else width / 8 in
-      { size; alignment = size; fields = [] }
+      begin match complex context t with
+      | Some width ->
+          let alignment = floating_size width in
+          { size = 2 * alignment; alignment; fields = [] }
+      | None ->
+          let size = match floating context t with
+            | Some width -> floating_size width
+            | None -> fst (scalar context t) / 8
+          in { size; alignment = size; fields = [] }
+      end
 
 let rec ctype context t =
   if pointer context t then "PointerType"
@@ -395,9 +411,10 @@ let rec ctype context t =
     "(AggregateType " ^ string_of_int shape.size ^ " " ^ string_of_int shape.alignment ^ ")"
   else match atomic_underlying context t with
     | Some inner -> "(AtomicType " ^ ctype context inner ^ ")"
-    | None -> match floating context t with
-    | Some width -> "(FloatingType " ^ string_of_int width ^ ")"
-    | None ->
+    | None -> match complex context t, floating context t with
+    | Some width, _ -> "(ComplexType " ^ string_of_int width ^ ")"
+    | None, Some width -> "(FloatingType " ^ string_of_int width ^ ")"
+    | None, None ->
         let width, signed = scalar context t in
         "(IntegerType " ^ string_of_int width ^ " " ^ bool signed ^ ")"
 let key context node =
@@ -502,6 +519,9 @@ let rec lvalue context node =
   | "DeclRefExpr", _ -> "variable " ^ key context node
   | ("ParenExpr" | "ConstantExpr"), [child] -> lvalue context child
   | "UnaryOperator", [child] when text node "opcode" = "*" -> expression context child
+  | "UnaryOperator", [child] when List.mem (text node "opcode") ["__real"; "__imag"] ->
+      let displacement = if text node "opcode" = "__imag" then (layout context (ty node)).size else 0 in
+      par ("offset " ^ string_of_int displacement ^ " <$> " ^ par (lvalue context child))
   | "ArraySubscriptExpr", [base; index] ->
       let base_code = par (expression context base) and index_code = par (expression context index) in
       if dynamic_array context (ty node) then begin
@@ -534,6 +554,8 @@ and expression context node =
   match kind node, children node with
   | ("IntegerLiteral" | "CharacterLiteral"), _ -> "pure (Number " ^ par (text node "value") ^ ")"
   | "FloatingLiteral", _ -> floating_literal context node
+  | "ImaginaryLiteral", [child] ->
+      "imaginary " ^ ctype context t ^ " " ^ par (ex child)
   | "AddrLabelExpr", _ ->
       begin match Hashtbl.find_opt context.label_names (text node "labelDeclId") with
       | Some name -> "function " ^ quote name
@@ -557,12 +579,13 @@ and expression context node =
       | "LValueToRValue" -> par (lv child ^ " >>= load " ^ access_type context child)
       | "ArrayToPointerDecay" -> if kind child = "StringLiteral" then ex child else lv child
       | "NoOp" | "FunctionToPointerDecay" | "BitCast" | "AtomicToNonAtomic" | "NonAtomicToAtomic" -> ex child
-      | "IntegralToBoolean" | "FloatingToBoolean" | "PointerToBoolean" ->
+      | "IntegralToBoolean" | "FloatingToBoolean" | "PointerToBoolean" | "FloatingComplexToBoolean" ->
           par ("boolean . truth <$> " ^ par (ex child))
       | "NullToPointer" -> "pure nullPointer"
       | "ToVoid" -> par (ex child ^ " >> pure (Number 0)")
       | "IntegralCast" -> par ("cast " ^ ctype context t ^ " <$> " ^ par (ex child))
-      | "FloatingCast" | "IntegralToFloating" | "FloatingToIntegral" ->
+      | "FloatingCast" | "IntegralToFloating" | "FloatingToIntegral"
+      | "FloatingRealToComplex" | "FloatingComplexToReal" | "FloatingComplexCast" ->
           par (ex child ^ " >>= convert " ^ ctype context t)
       | conversion -> fail context node ("unsupported cast " ^ conversion)
       end
@@ -609,12 +632,15 @@ and expression context node =
       | "&" when kind child = "DeclRefExpr" && kind (field child "referencedDecl") = "FunctionDecl" -> ex child
       | "&" -> lv child
       | "*" -> par (lv node ^ " >>= load " ^ ctype context t)
+      | ("__real" | "__imag") as op ->
+          par ("complexPart " ^ bool (op = "__imag") ^ " <$> " ^ par (ex child))
       | ("++" | "--") as op ->
           let op = quote (if op = "++" then "+" else "-") in
           let postfix = bool (Json.bool (field node "isPostfix")) in
-          let update () = match floating context t with
-            | Some width -> "realUpdate " ^ op ^ " " ^ string_of_int width ^ " " ^ ctype context t
-            | None ->
+          let update () = match complex context t, floating context t with
+            | Some width, _ -> "complexUpdate " ^ op ^ " " ^ string_of_int width ^ " " ^ ctype context t
+            | None, Some width -> "realUpdate " ^ op ^ " " ^ string_of_int width ^ " " ^ ctype context t
+            | None, None ->
                 let width, signed = if pointer context t then 64, false else scalar context t in
                 if pointer context t && dynamic_array context (element context t) then
                   match dynamic_origin context child with
@@ -639,14 +665,15 @@ and expression context node =
         let op = String.sub op 0 (String.length op - 1) in
         let computation = field node "computeLHSType" in
         let synthetic = match left with Json.Object fields -> Json.Object (("type", computation) :: List.remove_assoc "type" fields) | _ -> left in
-        let update = match floating context (ty synthetic) with
-          | Some width -> "realUpdate " ^ quote op ^ " " ^ string_of_int width ^ " " ^ ctype context (ty left)
-          | None when pointer context (ty synthetic) && dynamic_array context (element context (ty synthetic)) ->
+        let update = match complex context (ty synthetic), floating context (ty synthetic) with
+          | Some width, _ -> "complexUpdate " ^ quote op ^ " " ^ string_of_int width ^ " " ^ ctype context (ty left)
+          | None, Some width -> "realUpdate " ^ quote op ^ " " ^ string_of_int width ^ " " ^ ctype context (ty left)
+          | None, None when pointer context (ty synthetic) && dynamic_array context (element context (ty synthetic)) ->
               begin match dynamic_origin context left with
               | Some (id, rank) -> "vlaUpdate " ^ quote op ^ " " ^ string_of_int (rank + 1) ^ " " ^ vla_shape context id
               | None -> fail context left "unsupported variable-length pointer update without a known shape"
               end
-          | None -> "update " ^ quote op ^ " " ^ access_type context left ^ " " ^ operation context node op synthetic right
+          | None, None -> "update " ^ quote op ^ " " ^ access_type context left ^ " " ^ operation context node op synthetic right
         in
         begin match atomic_underlying context (ty left) with
         | None -> update ^ " False " ^ par (lv left) ^ " " ^ par (ex right)
@@ -671,9 +698,10 @@ and expression context node =
               | Some (id, rank) ->
                   "vlaBinary " ^ quote op ^ " " ^ string_of_int (rank + 1) ^ " " ^ vla_shape context id
               | None -> fail context node "unsupported variable-length pointer arithmetic without a known shape"
-            else match floating context (ty left) with
-              | Some width -> "realBinary " ^ quote op ^ " " ^ string_of_int width
-              | None -> "binary " ^ quote op ^ " " ^ operation context node op left right
+            else match complex context (ty left), complex context (ty right), floating context (ty left) with
+              | Some width, _, _ | _, Some width, _ -> "complexBinary " ^ quote op ^ " " ^ string_of_int width
+              | None, None, Some width -> "realBinary " ^ quote op ^ " " ^ string_of_int width
+              | None, None, None -> "binary " ^ quote op ^ " " ^ operation context node op left right
           in operation ^ " " ^ par (ex left) ^ " " ^ par (ex right)
       end
   | "ConditionalOperator", [condition; yes; no] -> par (ex condition ^ " >>= \\v -> if truth v then " ^ par (ex yes) ^ " else " ^ par (ex no))
@@ -711,6 +739,8 @@ and expression context node =
       end
   | "CallExpr", callee :: arguments ->
       begin match callee_name callee, arguments with
+      | "__builtin_complex", [real; imag] ->
+          "makeComplex " ^ ctype context t ^ " " ^ par (ex real) ^ " " ^ par (ex imag)
       | "__builtin_va_start", [list; _] -> "vaStart callArea namedTypes " ^ par (ex list)
       | "__builtin_va_copy", [destination; source] -> "vaCopy " ^ par (ex destination) ^ " " ^ par (ex source)
       | "__builtin_va_end", [list] -> par (ex list ^ " >> pure (Number 0)")
@@ -735,6 +765,14 @@ and initialise context node t destination =
   in
   match kind node with
   | "ImplicitValueInitExpr" -> []
+  | "InitListExpr" when complex context t <> None ->
+      let width = Option.get (complex context t) in
+      let element = "(FloatingType " ^ string_of_int width ^ ")" in
+      List.concat (List.mapi (fun i value ->
+        if kind value = "ImplicitValueInitExpr" then [] else
+          let place = par ("offset " ^ string_of_int (i * floating_size width) ^ " " ^ destination) in
+          [par (expression context value ^ " >>= store " ^ element ^ " " ^ place ^ " >> pure ()")]
+      ) (children node))
   | "InitListExpr" ->
       if String.starts_with ~prefix:"union " (clean context t) then
         let fields = (layout context t).fields in

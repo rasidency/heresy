@@ -1,4 +1,4 @@
-The translator lowers the Fil-C typed AST before instrumentation into a standalone Haskell module, using frontend record layouts and carrying integers up to 128 bits, binary32, binary64, x87 extended-precision and pointers through an embedded capability runtime.
+The translator lowers the Fil-C typed AST before instrumentation into a standalone Haskell module with an embedded capability runtime, using frontend record layouts and preserving 128-bit integers and real and complex values through x87 extended precision.
 
 ![Typed AST lowering into Haskell with native differential execution](assets/pipeline.svg)
 
@@ -34,4 +34,4 @@ dune runtest --profile release
 lake build
 ```
 
-The differential suite compares generated execution with native Fil-C across memory, layout, control flow and I/O regressions while the Lean development checks a separate model whose correspondence with the implementation remains unproved.
+The differential suite compares generated execution with native Fil-C across memory, layout, control flow and I/O. The Lean certificate checks emitted unsigned integer kernels against the Fil-C AST in CI, while correspondence for the general lowering and runtime remains unproved.

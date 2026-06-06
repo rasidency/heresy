@@ -2,6 +2,7 @@
  (section doc)
  (files lean-toolchain lakefile.toml lake-manifest.json
   (proof/Proof.lean as proof/Proof.lean)
+  (proof/Certificate.lean as proof/Certificate.lean)
   (assets/pipeline.svg as assets/pipeline.svg)
   (assets/capability.svg as assets/capability.svg)))
 

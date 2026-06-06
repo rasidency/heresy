@@ -11,6 +11,11 @@ jobs:
       - run: docker build -f Containerfile -t heresy .
       - run: docker run --rm --network none heresy
       - run: >-
+          docker run --rm --network none heresy sh -eu -c
+          '"$FILCC" -std=c11 -fsyntax-only -Xclang -ast-dump=json examples/machine.c > /tmp/machine.json &&
+          dune exec --profile release -- heresy examples/machine.c -o /tmp/Machine.hs &&
+          lake exe certificate /tmp/machine.json /tmp/Machine.hs'
+      - run: >-
           docker run --rm --network none heresy sh -c
           'dune exec --profile release tools/release.exe -- /tmp/first &&
           dune exec --profile release tools/release.exe -- /tmp/second &&
