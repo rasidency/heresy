@@ -186,6 +186,183 @@ let frontend_dump dump =
       Hashtbl.add layouts name (size, alignment, offsets)
     end) parts;
   layouts, Json.parse (String.sub dump position (String.length dump - position))
+
+module Tags = Map.Make (String)
+
+let resolve_records source content layouts tree =
+  let identities = Hashtbl.create 32 and types = Hashtbl.create 32 in
+  let resolved = Hashtbl.create 32 and queues = Hashtbl.create 32 in
+  let records_by_spelling = Hashtbl.create 32 in
+  let anonymous = Hashtbl.create 16 and aliases = Hashtbl.create 16 in
+  let named = Str.regexp "\\b\\(struct\\|union\\) [A-Za-z_][A-Za-z_0-9]*\\b" in
+  let position node =
+    let location = field node "loc" in
+    let expansion = field location "expansionLoc" in
+    let location = if expansion = Json.Null then location else expansion in
+    let file = text location "file" in
+    if (file <> "" && file <> source) || field location "includedFrom" <> Json.Null then None else
+    match int_of_string_opt (text location "offset") with
+    | Some offset when offset >= 0 && offset <= String.length content ->
+        let line = ref 1 and beginning = ref 0 in
+        for i = 0 to offset - 1 do
+          if content.[i] = '\n' then begin incr line; beginning := i + 1 end
+        done;
+        Some (Printf.sprintf "%s:%d:%d)" source !line (offset - !beginning + 1))
+    | _ -> None
+  in
+  let anonymous_layout node =
+    let tag = text node "tagUsed" in
+    match position node with
+    | None -> None
+    | Some suffix ->
+        Hashtbl.to_seq_keys layouts |> Seq.find (fun name ->
+          String.starts_with ~prefix:(tag ^ " ") name && String.ends_with ~suffix name &&
+          contains name "(unnamed at ")
+  in
+  let identity node =
+    let id = text node "id" in
+    match Hashtbl.find_opt identities (text node "previousDecl") with
+    | Some previous -> Hashtbl.replace identities id previous; previous
+    | None ->
+        let name = "@" ^ string_of_int (Hashtbl.length identities) in
+        let key = text node "tagUsed" ^ " " ^ name in
+        Hashtbl.replace identities id (name, key);
+        name, key
+  in
+  let rec capture_tags node =
+    let record = kind node = "RecordDecl" && text node "tagUsed" <> "" in
+    let captured = if record then Some (identity node) else None in
+    List.iter capture_tags (children node);
+    match captured with
+    | Some (_, key) when Json.bool (field node "completeDefinition") ->
+        let tag = text node "tagUsed" in
+        let label = text node "name" in
+        let spelling = if label = "" then anonymous_layout node else Some (tag ^ " " ^ label) in
+        Option.iter (fun spelling ->
+          let entries = match Hashtbl.find_opt queues spelling with
+            | Some entries -> entries
+            | None -> List.rev (Hashtbl.find_all layouts spelling)
+          in
+          match entries with
+          | layout :: remaining ->
+              Hashtbl.replace queues spelling remaining;
+              Hashtbl.add records_by_spelling spelling key;
+              Hashtbl.replace resolved key layout;
+              if label = "" then begin
+                let variant marker = Str.replace_first (Str.regexp_string "(unnamed at ") marker spelling in
+                let suffix = String.sub spelling (String.index spelling '(') (String.length spelling - String.index spelling '(') in
+                List.iter (fun spelling -> Hashtbl.replace anonymous spelling key)
+                  [spelling; variant "(anonymous at "; tag ^ " " ^
+                    Str.replace_first (Str.regexp_string "(unnamed at ") ("(unnamed " ^ tag ^ " at ") suffix]
+              end
+          | [] -> ()) spelling
+    | _ -> ()
+  in
+  capture_tags tree;
+  Hashtbl.iter (fun spelling remaining ->
+    if remaining <> [] then
+      List.iter (Hashtbl.remove resolved) (Hashtbl.find_all records_by_spelling spelling)) queues;
+  let anon_spellings = Hashtbl.fold (fun raw key acc -> (raw, key) :: acc) anonymous []
+    |> List.sort (fun (a, _) (b, _) -> Int.compare (String.length b) (String.length a))
+    |> List.map (fun (raw, key) -> Str.regexp_string raw, key) in
+  let refer id = if id = "" then Tags.empty else Option.value (Hashtbl.find_opt types id) ~default:Tags.empty in
+  let rec tag_reference node =
+    match Hashtbl.find_opt identities (text (field node "decl") "id") with
+    | Some (_, key) -> Some key
+    | None -> List.find_map tag_reference (children node)
+  in
+  let scoped kind = List.mem kind ["FunctionDecl"; "CompoundStmt"; "ForStmt"; "IfStmt"; "SwitchStmt"; "WhileStmt"; "DoStmt"] in
+  let rec rewrite scope node =
+    match node with
+    | Json.Object fields ->
+        let node_kind = kind node and id = text node "id" in
+        let record = Hashtbl.find_opt identities id in
+        let enclosing = scope in
+        let scope = match record, text node "name" with
+          | Some (_, key), label when label <> "" -> Tags.add (text node "tagUsed" ^ " " ^ label) key scope
+          | _ -> scope
+        in
+        let scope =
+          if node_kind <> "TypedefDecl" then scope else
+          match tag_reference node with
+          | Some key ->
+              let name = text node "name" in
+              let tag = List.hd (String.split_on_char ' ' key) in
+              let spelled = tag ^ " " ^ name in
+              if text (field node "type") "qualType" = spelled && ty node = name then begin
+                let spelling = Str.regexp ("\\b\\(" ^ Str.quote spelled ^ "\\|" ^ Str.quote name ^ "\\)\\b") in
+                Hashtbl.replace aliases id (spelling, key);
+                Tags.add spelled key scope
+              end else scope
+          | None -> scope
+        in
+        let rewrite_children scope children =
+          let rec visit acc scope = function
+            | [] -> List.rev acc, scope
+            | child :: rest ->
+                let child, scope = rewrite scope child in
+                visit (child :: acc) scope rest
+          in visit [] scope children
+        in
+        let inner = children node in
+        let children, after = rewrite_children scope inner in
+        let inherited = match node_kind, inner with
+          | "DeclRefExpr", _ -> refer (text (field node "referencedDecl") "id")
+          | "MemberExpr", _ -> refer (text node "referencedMemberDecl")
+          | "ConditionalOperator", _ :: yes :: _ -> refer (text yes "id")
+          | ("CallExpr" | "ParenExpr" | "ImplicitCastExpr" | "UnaryOperator" | "ArraySubscriptExpr" |
+             "BinaryOperator" | "CompoundAssignOperator" | "ConstantExpr"), first :: rest ->
+              List.fold_left (fun tags child -> Tags.union (fun _ a _ -> Some a) tags (refer (text child "id")))
+                (refer (text first "id")) rest
+          | _ -> Tags.empty
+        in
+        let used = ref Tags.empty in
+        let rename scope extra metadata =
+          match metadata with
+          | Json.Object parts ->
+              let alias_id = text metadata "typeAliasDeclId" in
+              let alias = Hashtbl.find_opt aliases alias_id in
+              let extra = Tags.union (fun _ typedef _ -> Some typedef) (refer alias_id) extra in
+              let rescope spelling =
+                let spelling = Str.global_substitute named (fun s ->
+                  let raw = Str.matched_string s in
+                  match Tags.find_opt raw extra, Tags.find_opt raw scope with
+                  | Some key, _ | None, Some key -> used := Tags.add raw key !used; key
+                  | _ -> raw) spelling in
+                spelling
+              in
+              Json.Object (List.map (function
+                | ("qualType" | "desugaredQualType" as field_name), Json.String raw ->
+                    let raw = List.fold_left (fun raw (pattern, key) -> Str.global_replace pattern key raw) raw anon_spellings in
+                    let value = match alias with
+                      | Some (spelling, key) -> Str.global_replace spelling key raw
+                      | None -> rescope raw
+                    in
+                    field_name, Json.String value
+                | part -> part) parts)
+          | other -> other
+        in
+        let fields = List.map (function
+          | "inner", _ -> "inner", Json.Array children
+          | "array_filler", Json.Array nodes -> "array_filler", Json.Array (fst (rewrite_children scope nodes))
+          | "type", metadata -> "type", rename scope inherited metadata
+          | "argType", metadata -> "argType", rename scope Tags.empty metadata
+          | ("computeLHSType" | "computeResultType" as key), metadata -> key, rename scope inherited metadata
+          | "name", _ when record <> None -> "name", Json.String (fst (Option.get record))
+          | part -> part) fields in
+        if node_kind = "RecordDecl" && text node "name" = "" then begin
+          let name = match record with Some (name, _) -> name | None -> "" in
+          let fields = ("name", Json.String name) :: fields in
+          Json.Object fields, after
+        end else begin
+          if id <> "" then Hashtbl.replace types id !used;
+          Json.Object fields, if scoped node_kind then enclosing else after
+        end
+    | other -> other, scope
+  in
+  let tree, _ = rewrite Tags.empty tree in
+  resolved, tree
+
 let clean context original =
   let rec resolve seen s =
     let stripped = Str.global_replace (Str.regexp "\\b\\(const\\|volatile\\|restrict\\|__restrict\\|__restrict__\\)\\b") "" s in
@@ -338,6 +515,9 @@ let complex context t =
 
 let floating_size = function 80 -> 16 | width -> width / 8
 
+let atomic_width size =
+  Option.value (List.find_opt (fun width -> size <= width) [1; 2; 4; 8; 16]) ~default:size
+
 let scalar context t =
   let t = clean context (value_type context t) in
   let signed = not (contains t "unsigned") && t <> "_Bool" in
@@ -362,8 +542,11 @@ let rec layout context original =
       { l with size = l.size * count; fields = [] }
   | None when atomic_underlying context t <> None ->
       let inner = value_type context t in
-      if aggregate context inner then raise (Error ("unsupported atomic aggregate type " ^ t));
-      layout context inner
+      let l = layout context inner in
+      if aggregate context inner && l.size <= 16 then
+        let size = atomic_width l.size in
+        { l with size; alignment = max l.alignment size }
+      else l
   | None when t = "struct __va_list_tag" -> { size = 24; alignment = 8; fields = [] }
   | None when String.starts_with ~prefix:"struct " t || String.starts_with ~prefix:"union " t ->
       begin match Hashtbl.find_opt context.layouts t with
@@ -404,19 +587,39 @@ let rec layout context original =
           in { size; alignment = size; fields = [] }
       end
 
+let rec has_pointer context t =
+  if pointer context t then true
+  else match array context t with
+  | Some (element, count) -> count <> 0 && has_pointer context element
+  | None when aggregate context t ->
+      List.exists (fun field -> has_pointer context field.field_type) (layout context t).fields
+  | None -> false
+
 let rec ctype context t =
   if pointer context t then "PointerType"
   else if aggregate context t then
     let shape = layout context t in
     "(AggregateType " ^ string_of_int shape.size ^ " " ^ string_of_int shape.alignment ^ ")"
   else match atomic_underlying context t with
-    | Some inner -> "(AtomicType " ^ ctype context inner ^ ")"
+    | Some inner -> atomic_ctype context ~promote:true inner
     | None -> match complex context t, floating context t with
     | Some width, _ -> "(ComplexType " ^ string_of_int width ^ ")"
     | None, Some width -> "(FloatingType " ^ string_of_int width ^ ")"
     | None, None ->
         let width, signed = scalar context t in
         "(IntegerType " ^ string_of_int width ^ " " ^ bool signed ^ ")"
+
+and atomic_ctype context ~promote inner =
+  let ordinary = ctype context inner in
+  if not (aggregate context inner) then "(AtomicType " ^ ordinary ^ ")" else
+  let l = layout context inner in
+  let width = if promote then atomic_width l.size else l.size in
+  let mode =
+    if width > 16 || (not promote && (atomic_width width <> width || l.alignment < width)) then "AtomicCopy"
+    else if width = 8 && l.size = 8 && has_pointer context inner then "AtomicCapability"
+    else "AtomicBytes"
+  in
+  "(AtomicAggregate " ^ string_of_int width ^ " " ^ ordinary ^ " " ^ mode ^ ")"
 let key context node =
   let reference = if field node "referencedDecl" = Json.Null then node else field node "referencedDecl" in
   match Hashtbl.find_opt context.names (text reference "id") with
@@ -708,8 +911,10 @@ and expression context node =
   | ("ArraySubscriptExpr" | "MemberExpr" | "CompoundLiteralExpr"), _ -> par (lv node ^ " >>= load " ^ access_type context node)
   | "VAArgExpr", [list] -> "vaArg " ^ ctype context t ^ " " ^ par (ex list)
   | "AtomicExpr", target :: operands ->
-      let value = value_type context (element context (ty target)) in
+      let target_type = element context (ty target) in
+      let value = value_type context target_type in
       let ty = ctype context value in
+      let access = atomic_ctype context ~promote:(atomic_underlying context target_type <> None) value in
       let target = par (ex target) in
       let args = List.map (fun node -> par (ex node)) operands in
       begin match text node "name", args with
@@ -719,9 +924,18 @@ and expression context node =
           let name = text node "name" in
           let op = if contains name "init" then "init" else if contains name "load" then "load"
             else if contains name "exchange" then "exchange" else "store" in
-          "atomicAccess " ^ quote op ^ " " ^ ty ^ " " ^ target ^ " [" ^ join args ^ "]"
+          "atomicAccess " ^ quote op ^ " " ^ access ^ " " ^ target ^ " [" ^ join args ^ "]"
+      | ("__atomic_load" | "__atomic_store"), [_; _]
+      | "__atomic_exchange", [_; _; _] ->
+          let name = text node "name" in
+          let op = String.sub name 9 (String.length name - 9) in
+          "atomicTransfer " ^ quote op ^ " " ^ access ^ " " ^ target ^ " [" ^ join args ^ "]"
       | ("__c11_atomic_compare_exchange_strong" | "__c11_atomic_compare_exchange_weak"), [_; _; _; _] ->
-          "atomicCompare " ^ ty ^ " " ^ target ^ " " ^ String.concat " " args
+          "atomicCompare False " ^ access ^ " " ^ target ^ " " ^ String.concat " " args
+      | ("__atomic_compare_exchange" | "__atomic_compare_exchange_n" as name), [success; expected; failure; desired; weak] ->
+          let desired = par (weak ^ " >> " ^ desired) in
+          "atomicCompare " ^ bool (name = "__atomic_compare_exchange") ^ " " ^ access ^ " " ^ target ^
+          " " ^ String.concat " " [success; expected; failure; desired]
       | name, [order; operand] when contains name "fetch" ->
           let operations = ["add", "+"; "sub", "-"; "and", "&"; "or", "|"; "xor", "^"] in
           let opname = match List.find_opt (fun (part, _) ->
@@ -765,6 +979,15 @@ and initialise context node t destination =
   in
   match kind node with
   | "ImplicitValueInitExpr" -> []
+  | "InitListExpr" when atomic_underlying context t <> None ->
+      let ordinary = value_type context t in
+      if aggregate context ordinary || complex context ordinary <> None then
+        initialise context node ordinary destination
+      else begin match children node with
+        | [] -> []
+        | [value] -> initialise context value t destination
+        | _ -> fail context node "invalid atomic initialiser"
+      end
   | "InitListExpr" when complex context t <> None ->
       let width = Option.get (complex context t) in
       let element = "(FloatingType " ^ string_of_int width ^ ")" in
@@ -774,7 +997,7 @@ and initialise context node t destination =
           [par (expression context value ^ " >>= store " ^ element ^ " " ^ place ^ " >> pure ()")]
       ) (children node))
   | "InitListExpr" ->
-      if String.starts_with ~prefix:"union " (clean context t) then
+      if aggregate context t && String.starts_with ~prefix:"union " (clean context t) then
         let fields = (layout context t).fields in
         let selected = text (field node "field") "id" in
         let member = if selected = "" then List.hd fields else
@@ -784,21 +1007,32 @@ and initialise context node t destination =
         | [value] -> member_initialiser member value
         | _ -> fail context node "invalid union initialiser"
         end
-      else if String.starts_with ~prefix:"struct " (clean context t) then
+      else if aggregate context t then
         let fields = (layout context t).fields in
         let rec go values fields = match values, fields with
           | value :: values, member :: fields -> member_initialiser member value @ go values fields
           | [], _ -> [] | _ -> fail context node "too many record initialisers"
         in go (children node) fields
-      else
-        let t = element context t in
-        let size = (layout context t).size in
-        let values = if children node <> [] then children node else match Json.list (field node "array_filler") with _ :: values -> values | [] -> [] in
-        List.concat (List.mapi (fun i value -> initialise context value t (par ("offset " ^ string_of_int (i * size) ^ " " ^ destination))) values)
+      else begin match array context t with
+        | Some (element, _) ->
+            let size = (layout context element).size in
+            let values = if children node <> [] then children node else
+              match Json.list (field node "array_filler") with _ :: values -> values | [] -> [] in
+            List.concat (List.mapi (fun i value ->
+              initialise context value element (par ("offset " ^ string_of_int (i * size) ^ " " ^ destination))) values)
+        | None -> begin match children node with
+            | [] -> []
+            | [value] -> initialise context value t destination
+            | _ -> fail context node "invalid scalar initialiser"
+            end
+        end
   | "StringLiteral" when array context t <> None ->
       let value = decode_string (text node "value") ^ "\000" in
       List.init (min (String.length value) (layout context t).size) (fun i ->
         "void (store (IntegerType 8 False) (offset " ^ string_of_int i ^ " " ^ destination ^ ") (Number " ^ string_of_int (Char.code value.[i]) ^ "))")
+  | _ when atomic_underlying context t <> None ->
+      ["void (atomicAccess \"init\" " ^ ctype context t ^ " (pure " ^ destination ^ ") [" ^
+        par (expression context node) ^ "])"]
   | _ -> [par (expression context node ^ " >>= store " ^ ctype context t ^ " " ^ destination ^ " >> pure ()")]
 
 let declaration context node =
@@ -808,7 +1042,7 @@ let declaration context node =
     "vlaAlias " ^ key context node ^ " " ^ string_of_int (layout context base).size ^
     " [" ^ join (List.map (fun bound -> par (expression context bound)) bounds) ^ "]"
   end else
-  if List.mem (kind node) ["TypedefDecl"; "EnumDecl"; "StaticAssertDecl"] then "(pure Next)" else
+  if List.mem (kind node) ["TypedefDecl"; "RecordDecl"; "EnumDecl"; "StaticAssertDecl"] then "(pure Next)" else
   if kind node <> "VarDecl" then fail context node ("unsupported local declaration " ^ kind node) else
   if List.mem (text node "storageClass") ["static"; "extern"] then "(pure Next)" else
   match Hashtbl.find_opt context.vla_bounds id with
@@ -838,6 +1072,154 @@ let declaration context node =
   in
   "(do { " ^ String.concat "; " (lines @ initialisers @ ["pure Next"]) ^ " })"
 
+type asm_token = Assembly of string | Token of string
+
+let assembly_tokens source =
+  let length = String.length source in
+  let rec word i =
+    if i < length then match source.[i] with
+      | 'a' .. 'z' | 'A' .. 'Z' | '0' .. '9' | '_' -> word (i + 1)
+      | _ -> i
+    else i
+  in
+  let rec quoted delimiter i =
+    if i >= length then raise (Error "unsupported inline assembly literal");
+    match source.[i] with
+    | c when c = delimiter -> i + 1
+    | '\\' -> quoted delimiter (i + 2)
+    | _ -> quoted delimiter (i + 1)
+  in
+  let prefix at text =
+    at + String.length text <= length && String.sub source at (String.length text) = text
+  in
+  let rec tokens at acc =
+    if at = length then List.rev acc else
+    match source.[at] with
+    | ' ' | '\t' | '\n' | '\r' -> tokens (at + 1) acc
+    | '/' when prefix at "/*" ->
+        let ending = try Str.search_forward (Str.regexp_string "*/") source (at + 2)
+          with Not_found -> raise (Error "unsupported inline assembly comment") in
+        tokens (ending + 2) acc
+    | '/' when prefix at "//" ->
+        tokens (Option.value (String.index_from_opt source at '\n') ~default:length) acc
+    | '"' ->
+        let next = quoted '"' (at + 1) in
+        tokens next (Assembly (decode_string (String.sub source at (next - at))) :: acc)
+    | '\'' ->
+        tokens (quoted '\'' (at + 1)) (Token "'" :: acc)
+    | c ->
+        let next = max (at + 1) (word at) in
+        let token = if next = at + 1 then String.make 1 c else String.sub source at (next - at) in
+        tokens next (Token token :: acc)
+  in tokens 0 []
+
+let inline_assembly context node =
+  let reject () = fail context node "unsupported inline assembly" in
+  let source =
+    let location field_name =
+      let p = field (field node "range") field_name in
+      if field p "spellingLoc" = Json.Null then p else field p "spellingLoc"
+    in
+    let first = location "begin" and last = location "end" in
+    let first_file = text first "file" and last_file = text last "file" in
+    if first_file <> "" && last_file <> "" && first_file <> last_file then reject ();
+    let file = if first_file <> "" then first_file else last_file in
+    let content =
+      if file <> "" && file <> context.source then (try read file with Sys_error _ -> reject ()) else begin
+        if file = "" && field first "includedFrom" <> Json.Null then reject ();
+        context.content
+      end
+    in
+    let coordinates p =
+      match int_of_string_opt (text p "offset"), int_of_string_opt (text p "tokLen") with
+      | Some offset, Some width when offset >= 0 && width >= 0 && offset <= String.length content - width ->
+          offset, width
+      | _ -> reject ()
+    in
+    let first, _ = coordinates first and last, width = coordinates last in
+    if last + width <= first then reject ();
+    String.sub content first (last + width - first)
+  in
+  let operands = children node in
+  let rec body = function
+    | Token word :: rest when List.mem word ["volatile"; "__volatile"; "__volatile__"; "inline"; "__inline"; "__inline__"] ->
+        body rest
+    | Token "(" :: rest -> rest
+    | _ -> reject ()
+  in
+  let rec template acc = function
+    | Assembly text :: rest -> template (text :: acc) rest
+    | rest when acc <> [] -> String.concat "" (List.rev acc), rest
+    | _ -> reject ()
+  in
+  let rec clobbers = function
+    | [Token ")"] -> true
+    | [Assembly ("memory" | "cc"); Token ")"] -> true
+    | Assembly ("memory" | "cc") :: Token "," :: rest -> clobbers rest
+    | _ -> false
+  in
+  let suffix = function
+    | [Token ")"] | [Token ":"; Token ")"] | [Token ":"; Token ":"; Token ")"] -> true
+    | Token ":" :: Token ":" :: Token ":" :: rest -> clobbers rest
+    | _ -> false
+  in
+  let rec after_operand depth = function
+    | Token ")" :: rest when depth = 0 -> rest
+    | Token ")" :: rest -> after_operand (depth - 1) rest
+    | Token "(" :: rest -> after_operand (depth + 1) rest
+    | _ :: rest -> after_operand depth rest
+    | [] -> reject ()
+  in
+  let instructions, rest = match assembly_tokens source with
+    | Token ("asm" | "__asm" | "__asm__") :: rest -> template [] (body rest)
+    | _ -> reject ()
+  in
+  let instructions = Str.split (Str.regexp "[\r\n;]+") instructions |> List.map String.trim in
+  let neutral instruction = List.mem instruction [""; "nop"; "pause"; "lfence"; "sfence"; "mfence"] in
+  match operands, rest with
+  | [], rest when suffix rest && List.for_all neutral instructions -> "asmBarrier"
+  | [operand], Token ":" :: Assembly "+r" :: Token "(" :: rest
+      when suffix (Token ":" :: after_operand 0 rest) ->
+        let active = List.filter (fun instruction -> not (neutral instruction)) instructions in
+        let operations = match active with
+          | [] -> []
+          | _ ->
+              let t = ty operand in
+              if clean context t = "_Bool" || pointer context t ||
+                floating context t <> None || complex context t <> None || aggregate context t then
+                reject ();
+              let width, _ = scalar context t in
+              let suffix = match width with 8 -> "b" | 16 -> "w" | 32 -> "l" | 64 -> "q" | _ -> reject () in
+              let arithmetic = Str.regexp "^\\([a-z]+\\)[ \t]+[$]\\([-+0-9a-fA-FxX]+\\),[ \t]*%0$" in
+              let unary = Str.regexp "^\\([a-z]+\\)[ \t]+%0$" in
+              let signed_bits = min width 32 in
+              let lower = -(1 lsl (signed_bits - 1)) in
+              let upper = (1 lsl (if width = 64 then signed_bits - 1 else signed_bits)) - 1 in
+              List.map (fun instruction ->
+                let op, value =
+                  if Str.string_match arithmetic instruction 0 then
+                    let mnemonic = Str.matched_group 1 instruction and immediate = Str.matched_group 2 instruction in
+                    let op = match List.assoc_opt mnemonic (List.map (fun (name, op) -> name ^ suffix, op)
+                      ["add", "+"; "sub", "-"; "and", "&"; "or", "|"; "xor", "^"]) with
+                      | Some op -> op | None -> reject () in
+                    let value = match int_of_string_opt immediate with
+                      | Some value when lower <= value && value <= upper -> value
+                      | _ -> reject () in
+                    op, value
+                  else if Str.string_match unary instruction 0 then
+                    match Str.matched_group 1 instruction with
+                    | op when op = "inc" ^ suffix -> "+", 1
+                    | op when op = "dec" ^ suffix -> "-", 1
+                    | op when op = "not" ^ suffix -> "^", -1
+                    | op when op = "neg" ^ suffix -> "neg", 0
+                    | _ -> reject ()
+                  else reject ()
+                in "(" ^ quote op ^ ", " ^ string_of_int width ^ ", " ^ par (string_of_int value) ^ ")"
+              ) active
+        in
+        "asmRegister " ^ access_type context operand ^ " [" ^ join operations ^ "] " ^ par (lvalue context operand)
+  | _ -> reject ()
+
 let rec statement context node =
   let st = statement context in
   let ex = expression context in
@@ -854,7 +1236,8 @@ let rec statement context node =
     | "BreakStmt", _ -> "pure Break"
     | "ContinueStmt", _ -> "pure Continue"
     | ("NullStmt" | ""), _ -> "pure Next"
-    | ("SwitchStmt" | "GotoStmt" | "IndirectGotoStmt" | "LabelStmt" | "GCCAsmStmt"), _ -> fail context node ("unsupported statement " ^ kind node)
+    | "GCCAsmStmt", _ -> inline_assembly context node
+    | ("SwitchStmt" | "GotoStmt" | "IndirectGotoStmt" | "LabelStmt"), _ -> fail context node ("unsupported statement " ^ kind node)
     | _ -> "discard " ^ par (ex node)
   in "at " ^ quote (loc context node) ^ " " ^ par code
 
@@ -1061,8 +1444,8 @@ let context source content frontend_layouts vla_bounds vla_aliases vla_inherited
                   enum_alias (Str.replace_first (Str.regexp_string "enum (unnamed at ") "enum (unnamed enum at " tag) underlying
             | _ -> ()) !anonymous
       | _ -> ())) nodes;
-  List.iter (fun n -> if kind n = "RecordDecl" && Json.bool (field n "completeDefinition") then
-    Hashtbl.replace context.records (text n "tagUsed" ^ " " ^ text n "name") n) (children tree);
+  walk (fun n -> if kind n = "RecordDecl" && Json.bool (field n "completeDefinition") then
+    Hashtbl.replace context.records (text n "tagUsed" ^ " " ^ text n "name") n) tree;
   let assign node =
     if not (Hashtbl.mem context.names (text node "id")) then
       Hashtbl.add context.names (text node "id") (text node "name" ^ "." ^ string_of_int (Hashtbl.length context.names))
@@ -1083,14 +1466,10 @@ let context source content frontend_layouts vla_bounds vla_aliases vla_inherited
   List.iter (fun n ->
     if not (List.mem (kind n) ["FunctionDecl"; "VarDecl"; "RecordDecl"; "EnumDecl"; "TypedefDecl"; "StaticAssertDecl"; "EmptyDecl"]) then
       fail context n ("unsupported top-level declaration " ^ kind n);
-    if kind n = "RecordDecl" && Json.bool (field n "completeDefinition") then begin
-      Hashtbl.replace context.records (text n "tagUsed" ^ " " ^ text n "name") n
-    end;
     walk (fun d ->
       if String.ends_with ~suffix:"Attr" (kind d) && kind d <> "PackedAttr" &&
         not (Json.bool (field d "inherited") || Json.bool (field d "implicit")) then
         fail context d ("unsupported declaration attribute " ^ kind d);
-      if kind d = "RecordDecl" && kind n <> "RecordDecl" then fail context d "local record declarations are unsupported";
       if kind d = "CompoundLiteralExpr" then assign d;
       if kind d = "TypedefDecl" && Hashtbl.mem context.vla_aliases (text d "id") then assign d;
       if List.mem (kind d) ["VarDecl"; "ParmVarDecl"] then begin
@@ -1416,6 +1795,7 @@ let prepare_frontend source content dump =
       json_string source ^ ",\"external-contents\":" ^ json_string copy ^ "}]}");
     frontend_dump (dump ["-ivfsoverlay"; overlay])) in
   content, layouts, tree end in
+  let layouts, tree = resolve_records source content layouts tree in
   let rec shape node =
     let add dimension element =
       let base, rest = shape element in base, dimension :: rest
@@ -1528,7 +1908,7 @@ let main () =
   let machine = String.trim (capture frontend ["-dumpmachine"]) in
   if machine <> "x86_64-unknown-linux-gnu" then raise (Error ("unsupported frontend target " ^ machine));
   let dump extra = capture frontend (extra @ ["-x"; "c"; "-std=c11"; "-Werror";
-    "-Wno-return-stack-address"; "-Wno-pointer-arith"; "-ferror-limit=20"; "-fno-color-diagnostics";
+    "-Wno-return-stack-address"; "-Wno-pointer-arith"; "-Wno-atomic-alignment"; "-ferror-limit=20"; "-fno-color-diagnostics";
     "-Xclang"; "-fdump-record-layouts-complete"; "-Xclang"; "-fdump-record-layouts-simple";
     "-Xclang"; "-ast-dump=json"; "-fsyntax-only"; source]) in
   let content, frontend_layouts, bounds, aliases, inherited, adjusted, tree = prepare_frontend source (read source) dump in

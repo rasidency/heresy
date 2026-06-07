@@ -7,9 +7,10 @@ module Heap
   , freeze
   , chain, discard, branch, loop, postloop, selection, dispatch, indirectJump, logic, boolean, binary, unary
   , assign, update, realBinary, realUpdate, function, invoke, execute
+  , asmBarrier, asmRegister
   , imaginary, makeComplex, complexPart, complexBinary, complexUpdate
   , argumentArea, vaStart, vaCopy, vaArg, vaAvailable
-  , atomicAccess, atomicModify, atomicCompare, atomicPointerStep
+  , AtomicMode(..), atomicAccess, atomicTransfer, atomicModify, atomicCompare, atomicPointerStep
   , vlaDeclare, vlaBind, vlaSize, vlaIndex, vlaBinary, vlaUpdate, vlaExtent, vlaAlias, vlaFromAlias
   ) where
 
@@ -47,7 +48,8 @@ data Value = Number !Integer | Wide !Integer | Pointer !Capability !Integer | Fu
   | Single !Float | DoublePrecision !Double | Extended !Integer | Complex !Int !Value !Value
   | Aggregate !Int !Int !(M.IntMap Integer) !(M.IntMap Value) | NoValue deriving (Eq, Show)
 data CType = IntegerType !Int !Bool | PointerType | FloatingType !Int | ComplexType !Int | AggregateType !Int !Int
-  | BitField !Int !Int !Bool | AtomicType !CType deriving (Eq, Show)
+  | BitField !Int !Int !Bool | AtomicType !CType | AtomicAggregate !Int !CType !AtomicMode deriving (Eq, Show)
+data AtomicMode = AtomicBytes | AtomicCapability | AtomicCopy deriving (Eq, Show)
 data Flow = Next | Return !Value | Break | Continue | Jump !Int deriving (Eq, Show)
 data Fault = Panic !String | Finish !Int deriving (Eq, Show)
 instance E.Exception Fault
@@ -126,6 +128,7 @@ cast (ComplexType width) value =
 cast (AggregateType _ _) v = v
 cast (BitField _ width signed) v = Number (normalise width signed (number v))
 cast (AtomicType ty) value = cast ty value
+cast (AtomicAggregate _ ty _) value = cast ty value
 
 convert :: CType -> Value -> R Value
 convert (ComplexType width) value =
@@ -164,6 +167,7 @@ marshal (ComplexType width) value = cast (ComplexType width) value
 marshal (AggregateType _ _) value = value
 marshal (BitField _ width _) value = Number (normalise width False (number value))
 marshal (AtomicType ty) value = marshal ty value
+marshal (AtomicAggregate _ ty _) value = marshal ty value
 
 slotSize :: Int -> Integer
 slotSize size = ((toInteger size + 7) `div` 8) * 8
@@ -301,6 +305,7 @@ widthOf (FloatingType width) = width `div` 8
 widthOf (ComplexType width) = 2 * widthOf (FloatingType width)
 widthOf (BitField bitOffset width _) = (bitOffset + width + 7) `div` 8
 widthOf (AtomicType ty) = widthOf ty
+widthOf (AtomicAggregate width _ _) = width
 
 aggregateBytes :: Int -> Int -> M.IntMap a -> M.IntMap a
 aggregateBytes start count values =
@@ -309,10 +314,25 @@ aggregateBytes start count values =
 aggregateShadow :: Int -> Int -> M.IntMap Value -> M.IntMap Value
 aggregateShadow start count = aggregateBytes start (max 0 (count - 7))
 
+encodeBytes :: Int -> Integer -> M.IntMap Integer
+encodeBytes size raw = M.fromDistinctAscList [(i, shiftR raw (8 * i) .&. 255) | i <- [0 .. size - 1]]
+
+decodeBytes :: M.IntMap Integer -> Integer
+decodeBytes = M.foldlWithKey' (\raw index byte -> raw .|. shiftL byte (8 * index)) 0
+
 load :: CType -> Value -> R Value
 load ty pointer = locked (loadCell ty pointer)
 
 loadCell :: CType -> Value -> R Value
+loadCell (AtomicAggregate width ty@(AggregateType size alignment) mode) pointer =
+  case mode of
+    AtomicCopy -> loadCell ty pointer
+    AtomicBytes -> do
+      value <- loadCell (IntegerType (8 * width) False) pointer
+      pure (Aggregate size alignment (encodeBytes size (number value)) M.empty)
+    AtomicCapability -> do
+      value <- loadCell (AtomicType PointerType) pointer
+      pure (Aggregate size alignment (encodeBytes size (number value)) (M.singleton 0 value))
 loadCell declared pointer = do
   let ty = case declared of AtomicType inner -> inner; other -> other
   (ident, object, displacement) <- checked (widthOf declared) pointer
@@ -325,6 +345,7 @@ loadCell declared pointer = do
         ComplexType _ -> cast ty (Number raw)
         AggregateType size alignment -> Aggregate size alignment (aggregateBytes displacement size (bytes object)) (aggregateShadow displacement size (shadow object))
         AtomicType _ -> NoValue
+        AtomicAggregate _ _ _ -> NoValue
         PointerType -> case M.lookup displacement (shadow object) of
           Just stored | declared == AtomicType PointerType && I.member displacement (atomicSlots object) -> stored
           Just (Pointer cap _) -> Pointer cap raw
@@ -338,6 +359,20 @@ store :: CType -> Value -> Value -> R Value
 store ty pointer value = locked (storeCell ty pointer value)
 
 storeCell :: CType -> Value -> Value -> R Value
+storeCell (AtomicAggregate width ty@(AggregateType size _) mode) pointer value@(Aggregate actual _ payload caps)
+  | size == actual = do
+      let raw = decodeBytes payload
+      case mode of
+        AtomicCopy -> void (storeCell ty pointer value)
+        AtomicBytes -> void (storeCell (IntegerType (8 * width) False) pointer (Number raw))
+        AtomicCapability -> do
+          let capability = case M.lookup 0 caps of
+                Just (Pointer cap _) -> Pointer cap raw
+                Just (Function _ name) -> Function raw name
+                Just (Stream ident _) -> Stream ident raw
+                _ -> Pointer NoCapability raw
+          void (storeCell (AtomicType PointerType) pointer capability)
+      pure value
 storeCell (AggregateType size _) pointer value@(Aggregate actual _ payload caps) | size == actual = do
   (ident, object, displacement) <- checked size pointer
   when (readOnly object) (panic "write to read-only memory")
@@ -1031,14 +1066,42 @@ atomicAccess op ty target operands = do
   pointer <- target
   values <- sequence operands
   case (op, values) of
-    ("load", [_]) -> load (AtomicType ty) pointer
-    ("init", [value]) -> store ty pointer value >> pure (Number 0)
-    ("store", [_, value]) -> store (AtomicType ty) pointer value >> pure (Number 0)
+    ("load", [_]) -> load ty pointer
+    ("init", [value]) -> locked $ do
+      let ordinary = plainType ty
+          size = widthOf ordinary
+          padding = widthOf ty - size
+      void (storeCell ordinary pointer value)
+      when (padding > 0) (void (storeCell (IntegerType (8 * padding) False) (offset (toInteger size) pointer) (Number 0)))
+      pure (Number 0)
+    ("store", [_, value]) -> store ty pointer value >> pure (Number 0)
     ("exchange", [_, value]) -> locked $ do
-      old <- loadCell (AtomicType ty) pointer
-      void (storeCell (AtomicType ty) pointer value)
+      old <- loadCell ty pointer
+      void (storeCell ty pointer value)
       pure old
     _ -> panic "invalid atomic operands"
+
+plainType :: CType -> CType
+plainType (AtomicType ty) = ty
+plainType (AtomicAggregate _ ty _) = ty
+plainType ty = ty
+
+atomicTransfer :: String -> CType -> R Value -> [R Value] -> R Value
+atomicTransfer op ty target operands = do
+  pointer <- target
+  values <- sequence operands
+  let ordinary = plainType ty
+  locked $ do
+    _ <- case (op, values) of
+      ("load", [_, destination]) -> loadCell ty pointer >>= storeCell ordinary destination
+      ("store", [_, source]) -> loadCell ordinary source >>= storeCell ty pointer
+      ("exchange", [_, source, destination]) -> do
+        desired <- loadCell ordinary source
+        old <- loadCell ty pointer
+        void (storeCell ty pointer desired)
+        storeCell ordinary destination old
+      _ -> panic "invalid atomic transfer operands"
+    pure (Number 0)
 
 atomicModify :: String -> CType -> Integer -> Bool -> R Value -> R Value -> R Value -> R Value
 atomicModify op ty stride oldResult target ordering expression = do
@@ -1067,20 +1130,50 @@ atomicPointerStep op stride oldResult target ordering expression = do
     void (storeCell ty pointer result)
     pure (cast PointerType (if oldResult then old else result))
 
-atomicCompare :: CType -> R Value -> R Value -> R Value -> R Value -> R Value -> R Value
-atomicCompare ty target successOrder expected failureOrder desired = do
+asmBarrier :: R Flow
+asmBarrier = locked (pure Next)
+
+asmRegister :: CType -> [(String, Int, Integer)] -> R Value -> R Flow
+asmRegister ty instructions destination = do
+  pointer <- destination
+  locked $ do
+    let evaluate value (op, width, immediate) =
+          either panic pure $ if op == "neg" then calculate "-" width False 1 (Number 0) value
+          else calculate op width False 1 value (Number immediate)
+    value <- loadCell ty pointer
+    result <- foldM evaluate value instructions
+    void (storeCell ty pointer result)
+    pure Next
+
+atomicCompare :: Bool -> CType -> R Value -> R Value -> R Value -> R Value -> R Value -> R Value
+atomicCompare indirect ty target successOrder expected failureOrder desired = do
   pointer <- target
   void successOrder
   expectation <- expected
   void failureOrder
   desiredValue <- desired
   locked $ do
-    old <- loadCell (AtomicType ty) pointer
-    wanted <- loadCell ty expectation
+    let ordinary = plainType ty
+        bits value = case value of Aggregate _ _ payload _ -> decodeBytes payload; _ -> number value
+    replacement <- if indirect then loadCell ordinary desiredValue else pure desiredValue
+    old <- loadCell ty pointer
+    wanted <- loadCell ordinary expectation
     (_, object, _) <- checked (widthOf ty) pointer
     when (readOnly object) (panic "write to read-only memory")
-    if number old == number wanted then storeCell (AtomicType ty) pointer desiredValue >> pure (boolean True)
-      else storeCell ty expectation old >> pure (boolean False)
+    matches <- case (ty, old, wanted) of
+      (AtomicAggregate _ _ AtomicCopy, Aggregate _ _ actual _, Aggregate _ _ expectedBytes _) ->
+        pure (M.filter (/= 0) actual == M.filter (/= 0) expectedBytes)
+      (AtomicAggregate width _ AtomicBytes, _, _) | width /= widthOf ordinary -> do
+        observed <- loadCell (IntegerType (8 * width) False) pointer
+        pure (number observed == bits wanted)
+      _ -> pure (bits old == bits wanted)
+    if matches then storeCell ty pointer replacement >> pure (boolean True) else do
+      case ty of
+        AtomicAggregate width _ AtomicBytes ->
+          when (width == widthOf ordinary) $
+            void (storeCell (IntegerType (8 * width) False) expectation (Number (bits old)))
+        _ -> void (storeCell ordinary expectation old)
+      pure (boolean False)
 
 function :: String -> R Value
 function name = do

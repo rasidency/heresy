@@ -84,6 +84,80 @@ void concurrent_values(void) {
          a, b, thread_local, first_result == &a && second_result == &b, pthread_equal(first, second));
 }
 
+struct Scoped { int prefix; long *link; int tail; };
+typedef struct { int key; unsigned char value; } Anonymous;
+static const Anonymous fixed = {1, 3};
+struct Nested { struct { int value; } head; union { short narrow; int wide; }; };
+
+void scoped_values(struct Scoped *outer) {
+  typedef struct Scoped Outer;
+  struct Scoped { unsigned flags : 9; long value; };
+  struct Scoped local = {257, 12};
+  Outer copy = *outer;
+  Anonymous pair[2] = {{1, 7}, {14, 3}};
+  struct Nested nested = {{5}, {.wide = 21}};
+  printf("scopes %lu %lu %d %u %ld %d %d %d %d\n",
+         sizeof *outer, sizeof local, outer->tail + copy.tail, local.flags, local.value,
+         pair[1].key + pair[0].value, nested.head.value, nested.wide, zis_readonly((void*)&fixed));
+  {
+    struct Scoped { unsigned char bytes[3]; };
+    struct Scoped inner = {{6}};
+    printf("inner %lu %u\n", sizeof inner, (unsigned)inner.bytes[0]);
+  }
+}
+
+#define KEEP_REGISTER(value) __asm__("" : "+r"(value))
+
+void assembly_values(void) {
+  int values[2] = {41, 8};
+  int index = 0;
+  int *pointer = values;
+  __asm__ __volatile__("" : "+r"(values[index++]) : : "memory");
+  KEEP_REGISTER(pointer);
+  __asm__ __volatile__("nop\n\tpause\n\tmfence" : : : "memory", "cc");
+  unsigned int word = 0xffffffffU;
+  __asm__("addl $5, %0\n\txorl $3, %0\n\tnegl %0" : "+r"(word) : : "cc");
+  printf("asm %d %d %d %x\n", index, zhasvalidcap(pointer), values[0], word);
+}
+
+struct AtomicCap { int *p; };
+struct AtomicWord { int *p; long tag; };
+struct AtomicWide { int *p; long tag, tail; };
+struct AtomicTiny { unsigned char bytes[3]; };
+
+void aggregate_atomics(void) {
+  int a = 7, b = 9;
+  _Atomic(struct AtomicCap) cap;
+  atomic_init(&cap, ((struct AtomicCap){&a}));
+  struct AtomicCap previous = atomic_exchange(&cap, ((struct AtomicCap){&b}));
+  struct AtomicCap current = atomic_load(&cap);
+  printf("atomic cap %d %d\n", *previous.p, *current.p);
+
+  _Atomic(struct AtomicWord) word = (struct AtomicWord){&a, 1};
+  struct AtomicWord *ordinary = (struct AtomicWord*)&word;
+  int preserved = zhasvalidcap(ordinary->p);
+  struct AtomicWord lost = atomic_exchange(&word, ((struct AtomicWord){&b, 2}));
+  struct AtomicWord fresh = atomic_load(&word);
+  printf("atomic word %d %d %ld %d %ld\n",
+         preserved, zhasvalidcap(lost.p), lost.tag, zhasvalidcap(fresh.p), fresh.tag);
+
+  struct AtomicWide wide = {&a, 3, 4}, replacement = {&b, 5, 6}, old;
+  __atomic_exchange(&wide, &replacement, &old, __ATOMIC_SEQ_CST);
+  int won = __atomic_compare_exchange(&wide, &old, &replacement, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+  printf("atomic wide %d %ld %ld %d\n", *old.p, old.tag, old.tail, won);
+
+  _Atomic(struct AtomicTiny) tiny;
+  unsigned char *bytes = (unsigned char*)&tiny;
+  bytes[3] = 171;
+  atomic_init(&tiny, ((struct AtomicTiny){{1, 2, 3}}));
+  unsigned char cleared = bytes[3];
+  bytes[3] = 171;
+  struct AtomicTiny expected = {{9, 8, 7}};
+  won = atomic_compare_exchange_strong(&tiny, &expected, ((struct AtomicTiny){{4, 5, 6}}));
+  printf("atomic tiny %lu %lu %u %u %d %u\n", sizeof tiny, _Alignof(_Atomic(struct AtomicTiny)),
+         (unsigned)cleared, (unsigned)bytes[3], won, (unsigned)expected.bytes[0]);
+}
+
 void atomic_values(void) {
   _Atomic int wrap = INT_MAX;
   int before = atomic_fetch_add(&wrap, 1);
@@ -385,7 +459,11 @@ int main(int argc, char **argv) {
   printf("count %d\n", count);
   padded(2, 5, 6);
   packed_values();
+  struct Scoped scoped = {0, 0, 8};
+  scoped_values(&scoped);
+  assembly_values();
   atomic_values();
+  aggregate_atomics();
   concurrent_values();
   extended_values();
   wide_values();

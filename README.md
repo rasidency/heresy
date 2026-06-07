@@ -2,7 +2,9 @@ The translator lowers the Fil-C typed AST before instrumentation into a standalo
 
 ![Typed AST lowering into Haskell with native differential execution](assets/pipeline.svg)
 
-Record offsets preserve packed members and bit-fields, while aggregate copies carry payload and shadow slots together and variadic calls expose a read-only argument area with alignment and independent `va_copy` cursors. Computed jumps validate label identity before dispatch, and pthread workers share allocations and scalar atomics while initialising independent thread-local storage.
+Record offsets come from the declaration selected in lexical scope, including anonymous members and shadowed tags, while aggregate copies carry payload and shadow slots together and variadic calls retain alignment and independent `va_copy` cursors.
+
+Aggregate atomics use the frontend’s promoted width and distinguish byte operations from pointer atomics and library-sized copies. Register-only assembly covers barriers, identity constraints and single-register integer arithmetic, with the same memory checks as the surrounding Fil-C accesses.
 
 Runtime array bounds are captured at declarations and function entry, with byte strides retained for indexing, pointer arithmetic and `sizeof` even after the variables used to compute the bounds have changed.
 

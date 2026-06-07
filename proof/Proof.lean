@@ -449,6 +449,23 @@ theorem field_store_bit (position width previous value index : Nat) :
     cases previous.testBit index <;> cases value.testBit (index - position) <;>
     simp [after_start, before_end]
 
+def promoted_atomic_compare (width : Nat) (observed expected : Int) : Bool :=
+  observed == unsigned width expected
+
+theorem promoted_atomic_rejects_nonzero_padding (width : Nat) (observed expected : Int)
+    (has_padding : modulus width ≤ observed) :
+    promoted_atomic_compare width observed expected = false := by
+  have expected_bound := (unsigned_bounds width expected).2
+  simp only [promoted_atomic_compare, beq_eq_false_iff_ne]
+  omega
+
+theorem promoted_atomic_compares_payload (width : Nat) (observed expected : Int)
+    (nonnegative : 0 ≤ observed) (unpadded : observed < modulus width) :
+    promoted_atomic_compare width observed expected = true ↔
+      unsigned width observed = unsigned width expected := by
+  rw [unsigned_preserves_bits width observed nonnegative unpadded]
+  simp [promoted_atomic_compare]
+
 end Heresy
 
 #print axioms Heresy.lower_correct
@@ -469,3 +486,4 @@ end Heresy
 #print axioms Heresy.array_span_at
 #print axioms Heresy.array_index_in_bounds
 #print axioms Heresy.field_store_bit
+#print axioms Heresy.promoted_atomic_rejects_nonzero_padding

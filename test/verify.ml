@@ -206,8 +206,14 @@ let () =
       (contains values "flexible 18 8 8 2 17\n");
     check "packed bit-fields preserve adjacent fields and dispatch tables retain label identity"
       (contains values "packed 12 1 9 5 6 3 19 a6\ndispatch 35 15 3\n");
+    check "shadowed tags and anonymous members retain declaration-local layouts"
+      (contains values "scopes 24 16 16 257 12 21 5 21 1\ninner 3 6\n");
+    check "inline barriers preserve capabilities and evaluate register operands once"
+      (contains values "asm 1 1 41 fffffff9\n");
     check "pointer atomics keep the atomic value separate from the integer payload"
       (contains values "atomics 2147483647 -2147483648 0 1 23 40 0 4 40 71\n");
+    check "aggregate atomics preserve native padding, coercions and fallback copies"
+      (contains values "atomic cap 7 9\natomic word 1 0 1 0 2\natomic wide 9 5 6 0\natomic tiny 4 4 0 171 0 9\n");
     check "threads share atomic objects and have independent thread-local storage"
       (contains values "threads 8000 6 6 5 1 0\n" && success "build/values" ["+RTS"; "-N2"; "-RTS"] = values);
     check "extended precision survives calls, variadic alignment and IEEE boundary cases"
@@ -262,7 +268,6 @@ let () =
     let denied = [
       "attribute", "struct __attribute__((aligned(64))) S{char x;long y;};int main(void){return 0;}";
       "constructor", "void __attribute__((constructor)) init(void){} int main(void){return 0;}";
-      "localrecord", "struct S{int value;};int main(void){struct S{long value;};struct S x;return sizeof(x);}";
       "unresolved", "extern int missing;int main(void){return missing;}"
     ] in
     List.iter (fun (name, body) ->
@@ -325,7 +330,7 @@ let () =
     let code, _, errors = run "build/invalidstream" [] in
     check "preserved stream capabilities reject the wrong address" (code = 70 && contains errors "invalid file stream");
     let unsupported = "build/unsupported.c" in
-    write unsupported "int main(void) { __asm__(\"nop\"); return 0; }";
+    write unsupported "int main(void) { __asm__(\"int3\"); return 0; }";
     let code, _, errors = run compiler [unsupported] in
     check "unsupported constructs fail closed" (code <> 0 && contains errors "unsupported");
     let env = with_environment "FILCC" fault |> Array.to_list |> List.filter (fun item -> not (String.starts_with ~prefix:"HERESY_FAULT=" item)) |> fun entries -> Array.of_list ("HERESY_FAULT=ordinary" :: entries) in
