@@ -235,6 +235,8 @@ let () =
     check "multidimensional paths and pointer-to-array strides" (contains lowered "paths 6 10 12 16" && contains lowered "arrays 9 71 5 12 96 32");
     check "union layout and shadow capabilities" (contains lowered "union 2 1 8 1 42 42");
     check "compound declarators preserve object constness" (contains lowered "readonly 1 0 1 5");
+    check "generic selections retain lvalues without evaluating the controlling expression"
+      (contains lowered "generic 0 12 33\n");
     check "enum representation and implicit enumerators" (contains lowered "enum -2 0 -6 1 3 4294967297 16");
     check "unicode identifiers, literals and filesystem paths" (contains lowered "unicode 42 capacité λ");
     check "allocations above the former 64 MiB bound" (contains lowered "allocation 7 9 67108880");

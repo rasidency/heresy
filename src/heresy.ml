@@ -120,9 +120,10 @@ let par s = "(" ^ s ^ ")"
 let join = String.concat ", "
 let rec walk f node =
   f node;
-  let inner = match children node with
-    | [] -> (match Json.list (field node "array_filler") with _ :: values -> values | [] -> [])
-    | inner -> inner
+  let inner = match kind node, children node with
+    | "GenericSelectionExpr", inner -> List.filter (fun child -> Json.bool (field child "selected")) inner
+    | _, [] -> (match Json.list (field node "array_filler") with _ :: values -> values | [] -> [])
+    | _, inner -> inner
   in
   List.iter (walk f) inner
 let read path = let channel = open_in_bin path in Fun.protect ~finally:(fun () -> close_in channel) (fun () -> really_input_string channel (in_channel_length channel))
@@ -696,10 +697,20 @@ let member_type context member =
       let _, signed = scalar context member.field_type in
       "(BitField " ^ string_of_int shift ^ " " ^ string_of_int width ^ " " ^ bool signed ^ ")"
 
+let selected_expression context node =
+  match List.filter (fun child -> Json.bool (field child "selected")) (children node) with
+  | [selected] ->
+      begin match List.rev (children selected) with
+      | expression :: _ -> expression
+      | [] -> fail context node "missing selected generic expression"
+      end
+  | _ -> fail context node "invalid generic selection"
+
 let rec access_type context node =
   match kind node, children node with
   | "MemberExpr", [base] -> member_type context (record_member context node base)
   | ("ParenExpr" | "ConstantExpr"), [child] -> access_type context child
+  | "GenericSelectionExpr", _ -> access_type context (selected_expression context node)
   | _ -> ctype context (ty node)
 
 let rec dynamic_origin context node =
@@ -708,6 +719,7 @@ let rec dynamic_origin context node =
       let id = text (field node "referencedDecl") "id" in
       Option.map (fun (_, _, indirect) -> id, if indirect then -1 else 0) (Hashtbl.find_opt context.vla_bounds id)
   | ("ParenExpr" | "ConstantExpr" | "ImplicitCastExpr"), [child] -> dynamic_origin context child
+  | "GenericSelectionExpr", _ -> dynamic_origin context (selected_expression context node)
   | "ArraySubscriptExpr", [base; _] -> Option.map (fun (id, rank) -> id, rank + 1) (dynamic_origin context base)
   | "UnaryOperator", [pointer] when text node "opcode" = "*" ->
       Option.map (fun (id, rank) -> id, rank + 1) (dynamic_origin context pointer)
@@ -717,10 +729,52 @@ let rec dynamic_origin context node =
 
 let vla_shape context id = par ("variable " ^ quote (Hashtbl.find context.names id))
 
+type asm_token = Assembly of string | Token of string
+
+let assembly_tokens source =
+  let length = String.length source in
+  let rec word i =
+    if i < length then match source.[i] with
+      | 'a' .. 'z' | 'A' .. 'Z' | '0' .. '9' | '_' -> word (i + 1)
+      | _ -> i
+    else i
+  in
+  let rec quoted delimiter i =
+    if i >= length then raise (Error "unsupported inline assembly literal");
+    match source.[i] with
+    | c when c = delimiter -> i + 1
+    | '\\' -> quoted delimiter (i + 2)
+    | _ -> quoted delimiter (i + 1)
+  in
+  let prefix at text =
+    at + String.length text <= length && String.sub source at (String.length text) = text
+  in
+  let rec tokens at acc =
+    if at = length then List.rev acc else
+    match source.[at] with
+    | ' ' | '\t' | '\n' | '\r' -> tokens (at + 1) acc
+    | '/' when prefix at "/*" ->
+        let ending = try Str.search_forward (Str.regexp_string "*/") source (at + 2)
+          with Not_found -> raise (Error "unsupported inline assembly comment") in
+        tokens (ending + 2) acc
+    | '/' when prefix at "//" ->
+        tokens (Option.value (String.index_from_opt source at '\n') ~default:length) acc
+    | '"' ->
+        let next = quoted '"' (at + 1) in
+        tokens next (Assembly (decode_string (String.sub source at (next - at))) :: acc)
+    | '\'' ->
+        tokens (quoted '\'' (at + 1)) (Token "'" :: acc)
+    | c ->
+        let next = max (at + 1) (word at) in
+        let token = if next = at + 1 then String.make 1 c else String.sub source at (next - at) in
+        tokens next (Token token :: acc)
+  in tokens 0 []
+
 let rec lvalue context node =
   match kind node, children node with
   | "DeclRefExpr", _ -> "variable " ^ key context node
   | ("ParenExpr" | "ConstantExpr"), [child] -> lvalue context child
+  | "GenericSelectionExpr", _ -> lvalue context (selected_expression context node)
   | "UnaryOperator", [child] when text node "opcode" = "*" -> expression context child
   | "UnaryOperator", [child] when List.mem (text node "opcode") ["__real"; "__imag"] ->
       let displacement = if text node "opcode" = "__imag" then (layout context (ty node)).size else 0 in
@@ -766,6 +820,20 @@ and expression context node =
       end
   | "StringLiteral", _ -> "literal " ^ quote (decode_string (text node "value"))
   | ("ParenExpr" | "ConstantExpr"), [child] -> ex child
+  | "GenericSelectionExpr", _ -> ex (selected_expression context node)
+  | "StmtExpr", [block] when kind block = "CompoundStmt" ->
+      let statements, result =
+        if clean context t = "void" then children block, "pure noValue"
+        else match List.rev (children block) with
+          | last :: prefix -> List.rev prefix, ex last
+          | [] -> fail context node "missing statement expression result"
+      in
+      let block = Json.Object ["kind", Json.String "CompoundStmt"; "inner", Json.Array statements] in
+      let graph = ref false in
+      walk (fun child ->
+        if List.mem (kind child) ["SwitchStmt"; "LabelStmt"; "GotoStmt"; "IndirectGotoStmt"] then graph := true) block;
+      let body = if !graph then control_flow context block else statement context block in
+      "statementValue " ^ par body ^ " " ^ par result
   | "DeclRefExpr", _ ->
       let reference = field node "referencedDecl" in
       if kind reference = "EnumConstantDecl" then begin
@@ -1035,7 +1103,7 @@ and initialise context node t destination =
         par (expression context node) ^ "])"]
   | _ -> [par (expression context node ^ " >>= store " ^ ctype context t ^ " " ^ destination ^ " >> pure ()")]
 
-let declaration context node =
+and declaration context node =
   let id = text node "id" in
   if Hashtbl.mem context.vla_aliases id then begin
     let base, bounds, _ = Hashtbl.find context.vla_bounds id in
@@ -1072,48 +1140,7 @@ let declaration context node =
   in
   "(do { " ^ String.concat "; " (lines @ initialisers @ ["pure Next"]) ^ " })"
 
-type asm_token = Assembly of string | Token of string
-
-let assembly_tokens source =
-  let length = String.length source in
-  let rec word i =
-    if i < length then match source.[i] with
-      | 'a' .. 'z' | 'A' .. 'Z' | '0' .. '9' | '_' -> word (i + 1)
-      | _ -> i
-    else i
-  in
-  let rec quoted delimiter i =
-    if i >= length then raise (Error "unsupported inline assembly literal");
-    match source.[i] with
-    | c when c = delimiter -> i + 1
-    | '\\' -> quoted delimiter (i + 2)
-    | _ -> quoted delimiter (i + 1)
-  in
-  let prefix at text =
-    at + String.length text <= length && String.sub source at (String.length text) = text
-  in
-  let rec tokens at acc =
-    if at = length then List.rev acc else
-    match source.[at] with
-    | ' ' | '\t' | '\n' | '\r' -> tokens (at + 1) acc
-    | '/' when prefix at "/*" ->
-        let ending = try Str.search_forward (Str.regexp_string "*/") source (at + 2)
-          with Not_found -> raise (Error "unsupported inline assembly comment") in
-        tokens (ending + 2) acc
-    | '/' when prefix at "//" ->
-        tokens (Option.value (String.index_from_opt source at '\n') ~default:length) acc
-    | '"' ->
-        let next = quoted '"' (at + 1) in
-        tokens next (Assembly (decode_string (String.sub source at (next - at))) :: acc)
-    | '\'' ->
-        tokens (quoted '\'' (at + 1)) (Token "'" :: acc)
-    | c ->
-        let next = max (at + 1) (word at) in
-        let token = if next = at + 1 then String.make 1 c else String.sub source at (next - at) in
-        tokens next (Token token :: acc)
-  in tokens 0 []
-
-let inline_assembly context node =
+and inline_assembly context node =
   let reject () = fail context node "unsupported inline assembly" in
   let source =
     let location field_name =
@@ -1220,7 +1247,7 @@ let inline_assembly context node =
         "asmRegister " ^ access_type context operand ^ " [" ^ join operations ^ "] " ^ par (lvalue context operand)
   | _ -> reject ()
 
-let rec statement context node =
+and statement context node =
   let st = statement context in
   let ex = expression context in
   let code = match kind node, children node with
@@ -1239,16 +1266,16 @@ let rec statement context node =
     | "GCCAsmStmt", _ -> inline_assembly context node
     | ("SwitchStmt" | "GotoStmt" | "IndirectGotoStmt" | "LabelStmt"), _ -> fail context node ("unsupported statement " ^ kind node)
     | _ -> "discard " ^ par (ex node)
-  in "at " ^ quote (loc context node) ^ " " ^ par code
+  in "atFlow " ^ quote (loc context node) ^ " " ^ par code
 
-let control_flow context body =
+and control_flow context body =
   let labels = Hashtbl.create 16 in
   let next_id = ref 0 and blocks = ref [] in
   let reserve () = let id = !next_id in incr next_id; id in
   let define id action = blocks := (id, action) :: !blocks in
   let block action = let id = reserve () in define id action; id in
   let jump id = "(pure (Jump " ^ string_of_int id ^ "))" in
-  let located node action = "at " ^ quote (loc context node) ^ " " ^ par action in
+  let located node action = "atFlow " ^ quote (loc context node) ^ " " ^ par action in
   let choose condition yes no =
     "branch " ^ par (expression context condition) ^ " " ^ jump yes ^ " " ^ jump no
   in
@@ -1263,7 +1290,9 @@ let control_flow context body =
   ) destinations in
   let rec lower cases break continue next node =
     let descend = lower cases break continue in
-    let edge action = block (located node action) in
+    let redirect action =
+      "redirectFlow " ^ string_of_int break ^ " " ^ string_of_int continue ^ " " ^ par action in
+    let edge action = block (redirect (located node action)) in
     match kind node, children node with
     | "CompoundStmt", statements ->
         List.fold_left descend next (List.rev statements)
@@ -1272,19 +1301,19 @@ let control_flow context body =
     | "WhileStmt", [condition; loop] ->
         let test = reserve () in
         let first = lower cases next test test loop in
-        define test (located node (choose condition first next));
+        define test (redirect (located node (choose condition first next)));
         test
     | "DoStmt", [loop; condition] ->
         let test = reserve () in
         let first = lower cases next test test loop in
-        define test (located node (choose condition first next));
+        define test (redirect (located node (choose condition first next)));
         first
     | "ForStmt", [init; variable; condition; advance; loop] when kind variable = "" ->
         let test = reserve () in
         let advance = descend test advance in
         let first = lower cases next advance advance loop in
         let condition = if kind condition = "" then jump first else choose condition first next in
-        define test (located node condition);
+        define test (redirect (located node condition));
         descend test init
     | "BreakStmt", _ -> break
     | "ContinueStmt", _ -> continue
@@ -1308,14 +1337,15 @@ let control_flow context body =
         case_target cases node label (descend next child)
     | "DefaultStmt", [child] -> case_target cases node "Nothing" (descend next child)
     | ("NullStmt" | ""), _ -> next
-    | _, _ -> block ("chain [" ^ par (statement context node) ^ ", " ^ jump next ^ "]")
+    | _, _ -> block (redirect ("chain [" ^ par (statement context node) ^ ", " ^ jump next ^ "]"))
   and case_target cases node label start =
     match cases with
     | None -> fail context node "case outside a switch"
     | Some entries -> entries := (label, start) :: !entries; start
   in
   let finish = block "pure Next" in
-  let entry = lower None finish finish finish body in
+  let escape flow = block ("pure " ^ flow) in
+  let entry = lower None (escape "Break") (escape "Continue") finish body in
   let blocks = List.rev_map (fun (id, action) -> "(" ^ string_of_int id ^ ", " ^ par action ^ ")") !blocks in
   "dispatch " ^ string_of_int entry ^ " [" ^ join blocks ^ "]"
 
@@ -1908,7 +1938,8 @@ let main () =
   let machine = String.trim (capture frontend ["-dumpmachine"]) in
   if machine <> "x86_64-unknown-linux-gnu" then raise (Error ("unsupported frontend target " ^ machine));
   let dump extra = capture frontend (extra @ ["-x"; "c"; "-std=c11"; "-Werror";
-    "-Wno-return-stack-address"; "-Wno-pointer-arith"; "-Wno-atomic-alignment"; "-ferror-limit=20"; "-fno-color-diagnostics";
+    "-Wno-return-stack-address"; "-Wno-pointer-arith"; "-Wno-atomic-alignment"; "-Wno-unevaluated-expression";
+    "-ferror-limit=20"; "-fno-color-diagnostics";
     "-Xclang"; "-fdump-record-layouts-complete"; "-Xclang"; "-fdump-record-layouts-simple";
     "-Xclang"; "-ast-dump=json"; "-fsyntax-only"; source]) in
   let content, frontend_layouts, bounds, aliases, inherited, adjusted, tree = prepare_frontend source (read source) dump in

@@ -2,10 +2,10 @@
 {-# LANGUAGE MagicHash #-}
 module Heap
   ( Value(Number, Single, DoublePrecision, Extended), CType(..), Flow(..), R, nullPointer, noValue, marshal, convert, extendedLiteral
-  , number, truth, normalise, cast, panic, at, offset, load, store
+  , number, truth, normalise, cast, panic, at, atFlow, offset, load, store
   , frame, declare, variable, parameter, global, literal, materialise, clear
   , freeze
-  , chain, discard, branch, loop, postloop, selection, dispatch, indirectJump, logic, boolean, binary, unary
+  , chain, discard, statementValue, redirectFlow, branch, loop, postloop, selection, dispatch, indirectJump, logic, boolean, binary, unary
   , assign, update, realBinary, realUpdate, function, invoke, execute
   , asmBarrier, asmRegister
   , imaginary, makeComplex, complexPart, complexBinary, complexUpdate
@@ -51,7 +51,7 @@ data CType = IntegerType !Int !Bool | PointerType | FloatingType !Int | ComplexT
   | BitField !Int !Int !Bool | AtomicType !CType | AtomicAggregate !Int !CType !AtomicMode deriving (Eq, Show)
 data AtomicMode = AtomicBytes | AtomicCapability | AtomicCopy deriving (Eq, Show)
 data Flow = Next | Return !Value | Break | Continue | Jump !Int deriving (Eq, Show)
-data Fault = Panic !String | Finish !Int deriving (Eq, Show)
+data Fault = Panic !String | Finish !Int | Transfer !Flow deriving (Eq, Show)
 instance E.Exception Fault
 data Object = Object
   { base :: !Integer, extent :: !Int, live :: !Bool, storage :: !String
@@ -257,6 +257,12 @@ at loc action = do
   result <- action
   modify' (\w -> w { location = old })
   pure result
+
+atFlow :: String -> R Flow -> R Flow
+atFlow loc action = at loc (action `catchError` transfer)
+  where
+    transfer (Transfer flow) = pure flow
+    transfer fault = throwError fault
 
 event :: String -> R ()
 event message = do
@@ -633,6 +639,21 @@ chain (action : rest) = action >>= \flow -> if flow == Next then chain rest else
 
 discard :: R Value -> R Flow
 discard action = action >> pure Next
+
+statementValue :: R Flow -> R Value -> R Value
+statementValue action result = do
+  flow <- action
+  case flow of
+    Next -> result
+    _ -> throwError (Transfer flow)
+
+redirectFlow :: Int -> Int -> R Flow -> R Flow
+redirectFlow stop restart action = do
+  result <- action
+  case result of
+    Break -> pure (Jump stop)
+    Continue -> pure (Jump restart)
+    _ -> pure result
 
 branch :: R Value -> R Flow -> R Flow -> R Flow
 branch condition yes no = condition >>= \v -> if truth v then yes else no
@@ -1513,6 +1534,7 @@ execute entries labels parallel initialiser initThread = do
   case result of
     Right value -> let code = fromInteger (number value `mod` 256) in exitWith (if code == 0 then ExitSuccess else ExitFailure code)
     Left (Finish code) -> exitWith (if code == 0 then ExitSuccess else ExitFailure code)
+    Left (Transfer _) -> hPutStrLn stderr "heresy panic: control transfer escaped its function" >> exitWith (ExitFailure 70)
     Left (Panic message) -> do
       hPutStrLn stderr ("heresy panic: " ++ message)
       unless (enabled || null (recent final)) $ hPutStrLn stderr (intercalate "\n" (reverse (recent final)))

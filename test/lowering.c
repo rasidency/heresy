@@ -93,6 +93,25 @@ int main(int argc, char **argv) {
   printf("switch");
   for (int i = -4; i < 11; i++) printf(" %d", classify(i));
   printf(" %d\n", loops());
+  int effects = 0, selected = 3;
+  _Generic((++effects), int:selected, default:effects) = 12;
+  int evaluated = _Generic((++effects), int:({
+    int subtotal = 0;
+    for (int i = 0; i < 4; ++i) {
+      int token = ({
+        if (i == 2) continue;
+        if (i == 3) break;
+        i + 10;
+      });
+      subtotal += token;
+    }
+    switch (subtotal) {
+      case 21: subtotal += selected; break;
+      default: return 91;
+    }
+    subtotal;
+  }), default:99);
+  printf("generic %d %d %d\n", effects, selected, evaluated);
   switch (1) {
     int skipped = 99;
     case 0: skipped = 71;
