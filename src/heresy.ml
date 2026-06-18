@@ -131,15 +131,17 @@ let write path content = let channel = open_out_bin path in Fun.protect ~finally
 let thread_functions = ["pthread_create"; "pthread_join"; "pthread_self"; "pthread_equal"]
 let builtins = ["malloc"; "calloc"; "free"; "memcpy"; "memmove"; "memset"; "strlen"; "strcmp"; "puts"; "putchar"; "printf"; "vprintf"; "exit"; "zhasvalidcap"; "zgetlower"; "zgetupper"; "zis_readonly"; "fopen"; "fread"; "fwrite"; "fclose"] @ thread_functions
 
-type member = { id : string; displacement : int; field_type : string; bits : (int * int) option }
+type member = { id : string; name : string; displacement : int; field_type : string; bits : (int * int) option }
 type layout = { size : int; alignment : int; fields : member list }
+type native_field = { native_offset : int; native_width : int option; native_type : string; native_name : string }
+type native_layout = { native_size : int; native_alignment : int; native_fields : native_field list }
 type context = {
   source : string;
   content : string;
   aliases : (string, string) Hashtbl.t;
   records : (string, Json.t) Hashtbl.t;
   layouts : (string, layout) Hashtbl.t;
-  frontend_layouts : (string, int * int * int list) Hashtbl.t;
+  frontend_layouts : (string, native_layout) Hashtbl.t;
   names : (string, string) Hashtbl.t;
   functions : Json.t list;
   globals : Json.t list;
@@ -172,19 +174,54 @@ let frontend_dump dump =
     with Not_found -> raise (Error "missing frontend syntax tree") in
   let header = String.sub dump 0 position in
   let parts = Str.split (Str.regexp_string prefix) header in
-  let field block pattern =
+  let find block pattern =
     let re = Str.regexp pattern in
     try ignore (Str.search_forward re block 0); Str.matched_group 1 block
     with Not_found -> raise (Error "invalid frontend record layout")
   in
+  let column line = match String.index_opt line '|' with
+    | Some bar -> Some (String.trim (String.sub line 0 bar), String.sub line (bar + 1) (String.length line - bar - 1))
+    | None -> None
+  in
+  let bit_offset text =
+    let byte = int_of_string text in
+    if byte < 0 || byte > max_int / 8 then raise (Error "frontend field offset exceeds the host representation");
+    8 * byte
+  in
   List.iter (fun block ->
     if String.trim block <> "" then begin
-      let name = field block "Type: \\([^\n]+\\)" in
-      let size = int_of_string (field block "  Size:\\([0-9]+\\)") in
-      let alignment = int_of_string (field block "  Alignment:\\([0-9]+\\)") in
-      let offsets = field block "  FieldOffsets: \\[\\([^]]*\\)\\]" in
-      let offsets = if offsets = "" then [] else List.map (fun value -> int_of_string (String.trim value)) (String.split_on_char ',' offsets) in
-      Hashtbl.add layouts name (size, alignment, offsets)
+      let columns = List.filter_map column (String.split_on_char '\n' block) in
+      let name, entries = match columns with
+        | ("0", name) :: entries -> String.trim name, entries
+        | _ -> raise (Error "invalid frontend record name")
+      in
+      let native_size = int_of_string (find block "\\[sizeof=\\([0-9]+\\)") in
+      let native_alignment = int_of_string (find block ", align=\\([0-9]+\\)") in
+      let native_fields = List.filter_map (fun (position, field) ->
+        if String.length field < 4 || not (String.starts_with ~prefix:"   " field) || field.[3] = ' ' then None
+        else
+          let position, width = match String.split_on_char ':' position with
+            | [byte] -> bit_offset byte, None
+            | [byte; "-"] -> bit_offset byte, Some 0
+            | [byte; bits] ->
+                begin match String.split_on_char '-' bits with
+                | [first; last] ->
+                    let first = int_of_string first and last = int_of_string last in
+                    if first < 0 || first >= 8 || last < first then raise (Error "invalid frontend bit-field offset");
+                    bit_offset byte + first, Some (last - first + 1)
+                | _ -> raise (Error "invalid frontend bit-field offset")
+                end
+            | _ -> raise (Error "invalid frontend field offset")
+          in
+          let spelling = String.sub field 3 (String.length field - 3) in
+          let native_type, native_name =
+            if String.ends_with ~suffix:" " spelling then String.trim spelling, ""
+            else match String.rindex_opt spelling ' ' with
+              | Some split -> String.sub spelling 0 split, String.sub spelling (split + 1) (String.length spelling - split - 1)
+              | None -> spelling, ""
+          in
+          Some { native_offset = position; native_width = width; native_type; native_name }) entries in
+      Hashtbl.add layouts name { native_size; native_alignment; native_fields }
     end) parts;
   layouts, Json.parse (String.sub dump position (String.length dump - position))
 
@@ -195,6 +232,7 @@ let resolve_records source content layouts tree =
   let resolved = Hashtbl.create 32 and queues = Hashtbl.create 32 in
   let records_by_spelling = Hashtbl.create 32 in
   let anonymous = Hashtbl.create 16 and aliases = Hashtbl.create 16 in
+  let recovered = Hashtbl.create 8 in
   let named = Str.regexp "\\b\\(struct\\|union\\) [A-Za-z_][A-Za-z_0-9]*\\b" in
   let position node =
     let location = field node "loc" in
@@ -230,6 +268,14 @@ let resolve_records source content layouts tree =
         Hashtbl.replace identities id (name, key);
         name, key
   in
+  let remember_anonymous tag spelling key =
+    let variant marker = Str.replace_first (Str.regexp_string "(unnamed at ") marker spelling in
+    let start = String.index spelling '(' in
+    let suffix = String.sub spelling start (String.length spelling - start) in
+    List.iter (fun spelling -> Hashtbl.replace anonymous spelling key)
+      [spelling; variant "(anonymous at "; tag ^ " " ^
+        Str.replace_first (Str.regexp_string "(unnamed at ") ("(unnamed " ^ tag ^ " at ") suffix]
+  in
   let rec capture_tags node =
     let record = kind node = "RecordDecl" && text node "tagUsed" <> "" in
     let captured = if record then Some (identity node) else None in
@@ -249,13 +295,7 @@ let resolve_records source content layouts tree =
               Hashtbl.replace queues spelling remaining;
               Hashtbl.add records_by_spelling spelling key;
               Hashtbl.replace resolved key layout;
-              if label = "" then begin
-                let variant marker = Str.replace_first (Str.regexp_string "(unnamed at ") marker spelling in
-                let suffix = String.sub spelling (String.index spelling '(') (String.length spelling - String.index spelling '(') in
-                List.iter (fun spelling -> Hashtbl.replace anonymous spelling key)
-                  [spelling; variant "(anonymous at "; tag ^ " " ^
-                    Str.replace_first (Str.regexp_string "(unnamed at ") ("(unnamed " ^ tag ^ " at ") suffix]
-              end
+              if label = "" then remember_anonymous tag spelling key
           | [] -> ()) spelling
     | _ -> ()
   in
@@ -263,9 +303,19 @@ let resolve_records source content layouts tree =
   Hashtbl.iter (fun spelling remaining ->
     if remaining <> [] then
       List.iter (Hashtbl.remove resolved) (Hashtbl.find_all records_by_spelling spelling)) queues;
+  Hashtbl.to_seq_keys layouts |> List.of_seq |> List.sort_uniq String.compare
+  |> List.iter (fun spelling ->
+    if contains spelling "(unnamed at " && not (Hashtbl.mem anonymous spelling) then
+      match Hashtbl.find_all layouts spelling with
+      | [layout] ->
+          let tag = List.hd (String.split_on_char ' ' spelling) in
+          let key = tag ^ " @layout" ^ string_of_int (Hashtbl.length recovered) in
+          remember_anonymous tag spelling key;
+          Hashtbl.add recovered key layout
+      | _ -> ());
   let anon_spellings = Hashtbl.fold (fun raw key acc -> (raw, key) :: acc) anonymous []
     |> List.sort (fun (a, _) (b, _) -> Int.compare (String.length b) (String.length a))
-    |> List.map (fun (raw, key) -> Str.regexp_string raw, key) in
+    |> List.map (fun (raw, key) -> raw, Str.regexp_string raw, key) in
   let refer id = if id = "" then Tags.empty else Option.value (Hashtbl.find_opt types id) ~default:Tags.empty in
   let rec tag_reference node =
     match Hashtbl.find_opt identities (text (field node "decl") "id") with
@@ -273,6 +323,27 @@ let resolve_records source content layouts tree =
     | None -> List.find_map tag_reference (children node)
   in
   let scoped kind = List.mem kind ["FunctionDecl"; "CompoundStmt"; "ForStmt"; "IfStmt"; "SwitchStmt"; "WhileStmt"; "DoStmt"] in
+  let rec recover scope key =
+    match Hashtbl.find_opt recovered key with
+    | Some native when not (Hashtbl.mem resolved key) ->
+        Hashtbl.add resolved key native;
+        let native_fields = List.map (fun field ->
+          { field with native_type = resolve_spelling scope Tags.empty (ref Tags.empty) field.native_type }
+        ) native.native_fields in
+        Hashtbl.replace resolved key { native with native_fields }
+    | _ -> ()
+  and resolve_spelling scope extra used raw =
+    let raw = if contains raw "(unnamed" || contains raw "(anonymous" then
+      List.fold_left (fun raw (spelling, pattern, key) ->
+        if contains raw spelling then begin recover scope key; Str.global_replace pattern key raw end else raw)
+        raw anon_spellings
+      else raw in
+    Str.global_substitute named (fun s ->
+      let raw = Str.matched_string s in
+      match Tags.find_opt raw extra, Tags.find_opt raw scope with
+      | Some key, _ | None, Some key -> used := Tags.add raw key !used; key
+      | _ -> raw) raw
+  in
   let rec rewrite scope node =
     match node with
     | Json.Object fields ->
@@ -324,20 +395,12 @@ let resolve_records source content layouts tree =
               let alias_id = text metadata "typeAliasDeclId" in
               let alias = Hashtbl.find_opt aliases alias_id in
               let extra = Tags.union (fun _ typedef _ -> Some typedef) (refer alias_id) extra in
-              let rescope spelling =
-                let spelling = Str.global_substitute named (fun s ->
-                  let raw = Str.matched_string s in
-                  match Tags.find_opt raw extra, Tags.find_opt raw scope with
-                  | Some key, _ | None, Some key -> used := Tags.add raw key !used; key
-                  | _ -> raw) spelling in
-                spelling
-              in
               Json.Object (List.map (function
                 | ("qualType" | "desugaredQualType" as field_name), Json.String raw ->
-                    let raw = List.fold_left (fun raw (pattern, key) -> Str.global_replace pattern key raw) raw anon_spellings in
+                    let raw = resolve_spelling scope extra used raw in
                     let value = match alias with
                       | Some (spelling, key) -> Str.global_replace spelling key raw
-                      | None -> rescope raw
+                      | None -> raw
                     in
                     field_name, Json.String value
                 | part -> part) parts)
@@ -553,27 +616,35 @@ let rec layout context original =
       begin match Hashtbl.find_opt context.layouts t with
       | Some result -> result
       | None ->
-          let record = match Hashtbl.find_opt context.records t with Some r -> r | None -> raise (Error ("incomplete or external record " ^ t)) in
-          let members = List.filter (fun node -> kind node = "FieldDecl") (children record) in
-          let size, alignment, offsets = match Hashtbl.find_opt context.frontend_layouts t with
-            | Some (size, alignment, offsets) when size mod 8 = 0 && alignment mod 8 = 0 &&
-                  List.length members = List.length offsets -> size / 8, alignment / 8, offsets
-            | _ -> fail context record ("missing or invalid frontend layout for " ^ t)
+          let native = match Hashtbl.find_opt context.frontend_layouts t with
+            | Some native -> native
+            | None -> raise (Error ("missing frontend layout for " ^ t))
           in
-          let fields = List.filter_map (fun (node, offset) ->
-            let bitfield = Json.bool (field node "isBitfield") in
-            if bitfield && text node "name" = "" then None else
-            let bits = if bitfield then match children node with
-              | width :: _ ->
-                  let width = match int_of_string_opt (text width "value") with
-                    | Some width when width > 0 && width <= fst (scalar context (ty node)) -> width
-                    | _ -> fail context node "invalid bit-field width"
-                  in Some (offset mod 8, width)
-              | _ -> fail context node "missing bit-field width"
-            else if offset mod 8 = 0 then None else fail context node "unaligned record field metadata" in
-            Some { id = text node "id"; displacement = offset / 8; field_type = ty node; bits }
-          ) (List.combine members offsets) in
-          let result = { size; alignment; fields } in
+          let member id name field_type field =
+            if name = "" && field.native_width <> None then None else
+            let offset = field.native_offset in
+            let bits = match field.native_width with
+              | Some width when width > 0 && width <= fst (scalar context field_type) -> Some (offset mod 8, width)
+              | Some _ -> raise (Error "invalid frontend bit-field width")
+              | None when offset mod 8 = 0 -> None
+              | None -> raise (Error "unaligned record field metadata")
+            in
+            Some { id; name; displacement = offset / 8; field_type; bits }
+          in
+          let fields = match Hashtbl.find_opt context.records t with
+            | Some record ->
+                let members = List.filter (fun node -> kind node = "FieldDecl") (children record) in
+                if List.length members <> List.length native.native_fields then fail context record "record layout field count mismatch";
+                List.filter_map (fun (node, entry) ->
+                  if Json.bool (field node "isBitfield") <> (entry.native_width <> None) then
+                    fail context node "record layout bit-field mismatch";
+                  member (text node "id") (text node "name") (ty node) entry
+                ) (List.combine members native.native_fields)
+            | None when native.native_alignment <= 16 ->
+                List.filter_map (fun field -> member "" field.native_name field.native_type field) native.native_fields
+            | None -> raise (Error ("unsupported explicit alignment for inline record " ^ t))
+          in
+          let result = { size = native.native_size; alignment = native.native_alignment; fields } in
           Hashtbl.add context.layouts t result; result
       end
   | None ->
@@ -686,9 +757,13 @@ let rec callee_name node =
 
 let record_member context node base =
   let t = if Json.bool (field node "isArrow") then element context (ty base) else ty base in
-  match List.find_opt (fun member -> member.id = text node "referencedMemberDecl") (layout context t).fields with
-  | Some member -> member
-  | None -> fail context node "unknown struct member"
+  let name = text node "name" and id = text node "referencedMemberDecl" in
+  match List.filter (fun member ->
+    if member.id <> "" then member.id = id else
+    member.name = name && (name <> "" || clean context member.field_type = clean context (ty node))
+  ) (layout context t).fields with
+  | [member] -> member
+  | _ -> fail context node "unknown struct member"
 
 let member_type context member =
   match member.bits with
@@ -1069,7 +1144,9 @@ and initialise context node t destination =
         let fields = (layout context t).fields in
         let selected = text (field node "field") "id" in
         let member = if selected = "" then List.hd fields else
-          match List.find_opt (fun member -> member.id = selected) fields with Some f -> f | None -> fail context node "unknown union initialiser" in
+          let name = text (field node "field") "name" in
+          match List.find_opt (fun member -> if member.id = "" then member.name = name else member.id = selected) fields with
+          | Some field -> field | None -> fail context node "unknown union initialiser" in
         begin match children node with
         | [] -> []
         | [value] -> member_initialiser member value
@@ -1940,7 +2017,7 @@ let main () =
   let dump extra = capture frontend (extra @ ["-x"; "c"; "-std=c11"; "-Werror";
     "-Wno-return-stack-address"; "-Wno-pointer-arith"; "-Wno-atomic-alignment"; "-Wno-unevaluated-expression";
     "-ferror-limit=20"; "-fno-color-diagnostics";
-    "-Xclang"; "-fdump-record-layouts-complete"; "-Xclang"; "-fdump-record-layouts-simple";
+    "-Xclang"; "-fdump-record-layouts-complete";
     "-Xclang"; "-ast-dump=json"; "-fsyntax-only"; source]) in
   let content, frontend_layouts, bounds, aliases, inherited, adjusted, tree = prepare_frontend source (read source) dump in
   let context = context source content frontend_layouts bounds aliases inherited adjusted tree in

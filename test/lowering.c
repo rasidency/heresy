@@ -1,3 +1,4 @@
+#include <complex.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdfil.h>
@@ -112,6 +113,11 @@ int main(int argc, char **argv) {
     subtotal;
   }), default:99);
   printf("generic %d %d %d\n", effects, selected, evaluated);
+  int inline_field = ((struct {char c; int value;}){1, 8}).value;
+  unsigned int inline_bits = ((struct {unsigned :1; unsigned :0; unsigned value:3;}){.value=5}).value;
+  int inline_member = ((struct {struct {int member;};}){.member=22}).member;
+  printf("inline records %d %u %d %d %lu\n", inline_field, inline_bits, inline_member,
+         (int)cimag(CMPLX(4.0, 2.0)), sizeof(struct {char c; long value;}));
   switch (1) {
     int skipped = 99;
     case 0: skipped = 71;

@@ -237,6 +237,8 @@ let () =
     check "compound declarators preserve object constness" (contains lowered "readonly 1 0 1 5");
     check "generic selections retain lvalues without evaluating the controlling expression"
       (contains lowered "generic 0 12 33\n");
+    check "inline record types retain layout for compound literals and type operands"
+      (contains lowered "inline records 8 5 22 2 16\n");
     check "enum representation and implicit enumerators" (contains lowered "enum -2 0 -6 1 3 4294967297 16");
     check "unicode identifiers, literals and filesystem paths" (contains lowered "unicode 42 capacité λ");
     check "allocations above the former 64 MiB bound" (contains lowered "allocation 7 9 67108880");
