@@ -118,6 +118,17 @@ int main(int argc, char **argv) {
   int inline_member = ((struct {struct {int member;};}){.member=22}).member;
   printf("inline records %d %u %d %d %lu\n", inline_field, inline_bits, inline_member,
          (int)cimag(CMPLX(4.0, 2.0)), sizeof(struct {char c; long value;}));
+  typedef struct { long value; } Cell;
+  Cell outside = {71};
+  Cell *outer = &outside;
+  {
+    typedef struct { unsigned char byte; } Cell;
+    Cell values[2] = {{21}, {39}};
+    typedef Cell (*Row)[2];
+    Row row = &values;
+    printf("scoped typedefs %lu %lu %ld %u\n",
+           sizeof(*outer), sizeof(*row), outer->value, (unsigned)(*row)[1].byte);
+  }
   switch (1) {
     int skipped = 99;
     case 0: skipped = 71;

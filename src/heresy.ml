@@ -233,6 +233,7 @@ let resolve_records source content layouts tree =
   let records_by_spelling = Hashtbl.create 32 in
   let anonymous = Hashtbl.create 16 and aliases = Hashtbl.create 16 in
   let recovered = Hashtbl.create 8 in
+  let typedefs = Hashtbl.create 32 in
   let named = Str.regexp "\\b\\(struct\\|union\\) [A-Za-z_][A-Za-z_0-9]*\\b" in
   let position node =
     let location = field node "loc" in
@@ -323,6 +324,41 @@ let resolve_records source content layouts tree =
     | None -> List.find_map tag_reference (children node)
   in
   let scoped kind = List.mem kind ["FunctionDecl"; "CompoundStmt"; "ForStmt"; "IfStmt"; "SwitchStmt"; "WhileStmt"; "DoStmt"] in
+  let rewrite_typedefs scope extra used spelling =
+    let start = function 'a' .. 'z' | 'A' .. 'Z' | '_' -> true | c -> Char.code c >= 128 in
+    let follow = function '0' .. '9' -> true | c -> start c in
+    let length = String.length spelling and output = Buffer.create (String.length spelling) in
+    let rec token_end index =
+      if index < length && follow spelling.[index] then token_end (index + 1) else index in
+    let rec scan index dimensions tag =
+      if index < length then match spelling.[index] with
+      | '[' -> Buffer.add_char output '['; scan (index + 1) (dimensions + 1) false
+      | ']' -> Buffer.add_char output ']'; scan (index + 1) (max 0 (dimensions - 1)) false
+      | '@' when dimensions = 0 ->
+          let finish = token_end (index + 1) in
+          Buffer.add_substring output spelling index (finish - index);
+          scan finish dimensions false
+      | '(' when dimensions = 0 && tag ->
+          let finish = match String.index_from_opt spelling index ')' with Some at -> at + 1 | None -> length in
+          Buffer.add_substring output spelling index (finish - index);
+          scan finish dimensions false
+      | c when dimensions = 0 && start c ->
+          let finish = token_end (index + 1) in
+          let word = String.sub spelling index (finish - index) in
+          let next_tag = List.mem word ["struct"; "union"; "enum"] in
+          let word = if tag || next_tag then word else
+            let binding = "typedef " ^ word in
+            match Tags.find_opt binding extra, Tags.find_opt binding scope with
+            | Some key, _ | None, Some key -> used := Tags.add binding key !used; key
+            | _ -> word
+          in
+          Buffer.add_string output word;
+          scan finish dimensions next_tag
+      | c -> Buffer.add_char output c; scan (index + 1) dimensions tag
+    in
+    scan 0 0 false;
+    Buffer.contents output
+  in
   let rec recover scope key =
     match Hashtbl.find_opt recovered key with
     | Some native when not (Hashtbl.mem resolved key) ->
@@ -338,11 +374,12 @@ let resolve_records source content layouts tree =
         if contains raw spelling then begin recover scope key; Str.global_replace pattern key raw end else raw)
         raw anon_spellings
       else raw in
-    Str.global_substitute named (fun s ->
+    let raw = Str.global_substitute named (fun s ->
       let raw = Str.matched_string s in
       match Tags.find_opt raw extra, Tags.find_opt raw scope with
       | Some key, _ | None, Some key -> used := Tags.add raw key !used; key
-      | _ -> raw) raw
+      | _ -> raw) raw in
+    rewrite_typedefs scope extra used raw
   in
   let rec rewrite scope node =
     match node with
@@ -383,7 +420,8 @@ let resolve_records source content layouts tree =
           | "MemberExpr", _ -> refer (text node "referencedMemberDecl")
           | "ConditionalOperator", _ :: yes :: _ -> refer (text yes "id")
           | ("CallExpr" | "ParenExpr" | "ImplicitCastExpr" | "UnaryOperator" | "ArraySubscriptExpr" |
-             "BinaryOperator" | "CompoundAssignOperator" | "ConstantExpr"), first :: rest ->
+             "BinaryOperator" | "CompoundAssignOperator" | "ConstantExpr" | "TypedefDecl" |
+             "TypeOfExprType" | "ParenType"), first :: rest ->
               List.fold_left (fun tags child -> Tags.union (fun _ a _ -> Some a) tags (refer (text child "id")))
                 (refer (text first "id")) rest
           | _ -> Tags.empty
@@ -395,14 +433,22 @@ let resolve_records source content layouts tree =
               let alias_id = text metadata "typeAliasDeclId" in
               let alias = Hashtbl.find_opt aliases alias_id in
               let extra = Tags.union (fun _ typedef _ -> Some typedef) (refer alias_id) extra in
+              let extra = match Hashtbl.find_opt typedefs alias_id with
+                | Some (name, key) -> Tags.add ("typedef " ^ name) key extra
+                | None -> extra
+              in
               Json.Object (List.map (function
                 | ("qualType" | "desugaredQualType" as field_name), Json.String raw ->
-                    let raw = resolve_spelling scope extra used raw in
                     let value = match alias with
                       | Some (spelling, key) -> Str.global_replace spelling key raw
                       | None -> raw
                     in
-                    field_name, Json.String value
+                    let declared = text metadata "qualType" in
+                    let value = if node_kind = "TypedefDecl" && field_name = "desugaredQualType" &&
+                      raw = text node "name" &&
+                      List.exists (fun tag -> String.starts_with ~prefix:tag declared) ["struct "; "union "; "enum "]
+                      then declared else value in
+                    field_name, Json.String (resolve_spelling scope extra used value)
                 | part -> part) parts)
           | other -> other
         in
@@ -420,6 +466,12 @@ let resolve_records source content layouts tree =
           Json.Object fields, after
         end else begin
           if id <> "" then Hashtbl.replace types id !used;
+          let fields, after = if node_kind = "TypedefDecl" then
+            let name = text node "name" in
+            let key = "@type" ^ string_of_int (Hashtbl.length typedefs) in
+            Hashtbl.replace typedefs id (name, key);
+            ("heresyAlias", Json.String key) :: fields, Tags.add ("typedef " ^ name) key after
+            else fields, after in
           Json.Object fields, if scoped node_kind then enclosing else after
         end
     | other -> other, scope
@@ -1484,10 +1536,11 @@ let context source content frontend_layouts vla_bounds vla_aliases vla_inherited
       if not (Hashtbl.mem context.label_names id) then
         Hashtbl.add context.label_names id ("label:" ^ text function_node "name" ^ ":" ^ string_of_int (Hashtbl.length context.label_names))
     end) function_node) functions;
-  List.iter (fun n -> if kind n = "TypedefDecl" then
+  walk (fun n -> if kind n = "TypedefDecl" then
     let target = ty n in
     let target = if target = text n "name" then text (field n "type") "qualType" else target in
-    Hashtbl.replace context.aliases (text n "name") target) (children tree);
+    let alias = text n "heresyAlias" in
+    if alias <> "" then Hashtbl.replace context.aliases alias target) tree;
   let enum_types = Hashtbl.create 16 and anonymous = ref [] in
   let enum_alias name underlying =
     match Hashtbl.find_opt context.aliases name with
