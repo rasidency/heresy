@@ -158,6 +158,49 @@ void aggregate_atomics(void) {
          (unsigned)cleared, (unsigned)bytes[3], won, (unsigned)expected.bytes[0]);
 }
 
+struct Synchronised {
+  pthread_mutex_t mutex;
+  pthread_cond_t ready;
+  pthread_cond_t gate;
+  int arrived;
+  int open;
+  int total;
+};
+
+void *synchronised_worker(void *argument) {
+  struct Synchronised *state = argument;
+  pthread_mutex_lock(&state->mutex);
+  ++state->arrived;
+  pthread_cond_signal(&state->ready);
+  while (!state->open) pthread_cond_wait(&state->gate, &state->mutex);
+  state->total += 7;
+  pthread_mutex_unlock(&state->mutex);
+  return argument;
+}
+
+void synchronised_values(void) {
+  struct Synchronised state = {
+    .mutex = PTHREAD_MUTEX_INITIALIZER,
+    .ready = PTHREAD_COND_INITIALIZER,
+    .gate = PTHREAD_COND_INITIALIZER
+  };
+  pthread_t first, second;
+  pthread_mutex_lock(&state.mutex);
+  int busy = pthread_mutex_trylock(&state.mutex);
+  pthread_create(&first, 0, synchronised_worker, &state);
+  pthread_create(&second, 0, synchronised_worker, &state);
+  while (state.arrived < 2) pthread_cond_wait(&state.ready, &state.mutex);
+  state.open = 1;
+  pthread_cond_broadcast(&state.gate);
+  pthread_mutex_unlock(&state.mutex);
+  pthread_join(first, 0);
+  pthread_join(second, 0);
+  int ready = pthread_cond_destroy(&state.ready);
+  int gate = pthread_cond_destroy(&state.gate);
+  int mutex = pthread_mutex_destroy(&state.mutex);
+  printf("pthread sync %d %d %d %d %d %d\n", state.arrived, state.total, busy, ready, gate, mutex);
+}
+
 void atomic_values(void) {
   _Atomic int wrap = INT_MAX;
   int before = atomic_fetch_add(&wrap, 1);
@@ -465,6 +508,7 @@ int main(int argc, char **argv) {
   atomic_values();
   aggregate_atomics();
   concurrent_values();
+  synchronised_values();
   extended_values();
   wide_values();
   complex_values(zero);

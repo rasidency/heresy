@@ -24,6 +24,7 @@ import qualified Data.ByteString.Char8 as B
 import Data.Char
 import Data.IORef
 import Data.List (intercalate)
+import qualified Data.Sequence as Q
 import Data.Ratio (numerator, denominator, (%))
 import GHC.Environment (getFullArgs)
 import GHC.Exts (Int(I#))
@@ -53,10 +54,14 @@ data AtomicMode = AtomicBytes | AtomicCapability | AtomicCopy deriving (Eq, Show
 data Flow = Next | Return !Value | Break | Continue | Jump !Int deriving (Eq, Show)
 data Fault = Panic !String | Finish !Int | Transfer !Flow deriving (Eq, Show)
 instance E.Exception Fault
+data Synchronisation
+  = Mutex !(Maybe Integer) !(Q.Seq (Integer, MVar ()))
+  | Condition !(Q.Seq (MVar ()))
+  | Destroyed
 data Object = Object
   { base :: !Integer, extent :: !Int, live :: !Bool, storage :: !String
   , bytes :: !(M.IntMap Integer), shadow :: !(M.IntMap Value), atomicSlots :: !I.IntSet
-  , arraySpans :: ![Integer], origin :: !String }
+  , synchronisation :: !(M.IntMap Synchronisation), arraySpans :: ![Integer], origin :: !String }
 data World = World
   { allocationCounter :: !(IORef (Int, Integer))
   , frames :: ![S.Map String Value], globals :: !(S.Map String Value)
@@ -287,7 +292,7 @@ allocate kind size = do
     if ident == maxBound || start + toInteger rounded >= 4611686018427387904 then (old, Nothing)
     else ((ident + 1, start + toInteger (max rounded 1) + 16), Just (ident, start))
   (ident, start) <- maybe (panic "virtual address space exhausted") pure entry
-  let object = Object start rounded True kind M.empty M.empty I.empty [] loc
+  let object = Object start rounded True kind M.empty M.empty I.empty M.empty [] loc
   reference <- liftIO (newIORef object)
   event ("allocate #" ++ show ident ++ " " ++ show rounded ++ " bytes (" ++ kind ++ ")")
   pure (Pointer (Capability ident reference) start)
@@ -452,7 +457,7 @@ releaseCell (Pointer NoCapability 0) = pure ()
 releaseCell pointer@(Pointer ident _) = do
   (_, object, displacement) <- checked 0 pointer
   unless (storage object == "heap" && displacement == 0) (panic "free requires the start of a heap allocation")
-  writeObject ident (object { live = False, bytes = M.empty, shadow = M.empty, atomicSlots = I.empty })
+  writeObject ident (object { live = False, bytes = M.empty, shadow = M.empty, atomicSlots = I.empty, synchronisation = M.empty })
   event ("free #" ++ show ident ++ "; all aliases invalidated")
 releaseCell _ = panic "free requires a data pointer"
 
@@ -1201,6 +1206,15 @@ function name = do
   ident <- gets (S.lookup name . symbols)
   maybe (panic ("unknown function " ++ name)) (\code -> pure (Function code name)) ident
 
+pthreadArities :: [(String, Int)]
+pthreadArities =
+  [ ("pthread_create", 4), ("pthread_join", 2), ("pthread_self", 0), ("pthread_equal", 2)
+  , ("pthread_mutex_init", 2), ("pthread_mutex_destroy", 1), ("pthread_mutex_lock", 1)
+  , ("pthread_mutex_trylock", 1), ("pthread_mutex_unlock", 1)
+  , ("pthread_cond_init", 2), ("pthread_cond_destroy", 1), ("pthread_cond_wait", 2)
+  , ("pthread_cond_signal", 1), ("pthread_cond_broadcast", 1)
+  ]
+
 invoke :: Maybe CType -> R Value -> [R Value] -> R Value
 invoke expected callee arguments = do
   target <- callee
@@ -1215,8 +1229,7 @@ invoke expected callee arguments = do
         Nothing -> do
           let arities = [("malloc",1),("calloc",2),("free",1),("memcpy",3),("memmove",3),("memset",3),("strlen",1),("strcmp",2),
                 ("puts",1),("putchar",1),("vprintf",2),("exit",1),("fopen",2),("fclose",1),("fread",4),("fwrite",4),
-                ("zhasvalidcap",1),("zis_readonly",1),("zgetlower",1),("zgetupper",1),
-                ("pthread_create",4),("pthread_join",2),("pthread_self",0),("pthread_equal",2)]
+                ("zhasvalidcap",1),("zis_readonly",1),("zgetlower",1),("zgetupper",1)] ++ pthreadArities
               accepted = maybe values (`take` values) (lookup name arities)
           value <- builtin name accepted
           let resultType
@@ -1482,8 +1495,119 @@ builtin "pthread_join" [thread, result] = do
         pure (Number 0)
 builtin "pthread_self" [] = gets currentThread
 builtin "pthread_equal" [a, b] = pure (boolean (number a == number b))
+builtin "pthread_mutex_init" [pointer, attributes] = initialiseSync mutexWidth pointer attributes emptyMutex
+builtin "pthread_mutex_destroy" [pointer] = destroySync mutexWidth pointer emptyMutex
+builtin "pthread_mutex_lock" [pointer] = acquireMutex False pointer
+builtin "pthread_mutex_trylock" [pointer] = acquireMutex True pointer
+builtin "pthread_mutex_unlock" [pointer] = do
+  result <- locked (releaseMutex pointer)
+  finishRelease result
+builtin "pthread_cond_init" [pointer, attributes] = initialiseSync conditionWidth pointer attributes emptyCondition
+builtin "pthread_cond_destroy" [pointer] = destroySync conditionWidth pointer emptyCondition
+builtin "pthread_cond_wait" [condition, mutex] = waitCondition condition mutex
+builtin "pthread_cond_signal" [pointer] = notifyCondition False pointer
+builtin "pthread_cond_broadcast" [pointer] = notifyCondition True pointer
 builtin "exit" [code] = throwError (Finish (fromInteger (number code `mod` 256)))
 builtin name _ = panic ("unsupported external call " ++ name)
+
+mutexWidth, conditionWidth :: Int
+mutexWidth = 32
+conditionWidth = 48
+
+emptyMutex, emptyCondition :: Synchronisation
+emptyMutex = Mutex Nothing Q.empty
+emptyCondition = Condition Q.empty
+
+changeSync :: Int -> Value -> Synchronisation -> (Synchronisation -> R (Synchronisation, a)) -> R a
+changeSync width pointer initial change = do
+  (ident, object, displacement) <- checked width pointer
+  when (number pointer `mod` 8 /= 0) (panic "unaligned pthread object")
+  when (readOnly object) (panic "pthread operation on read-only memory")
+  let cell = M.findWithDefault initial displacement (synchronisation object)
+  (updated, value) <- change cell
+  current <- readObject ident
+  writeObject ident (current { synchronisation = M.insert displacement updated (synchronisation current) })
+  pure value
+
+initialiseSync :: Int -> Value -> Value -> Synchronisation -> R Value
+initialiseSync width pointer attributes initial = do
+  when (truth attributes) (panic "unsupported pthread synchronisation attributes")
+  locked (changeSync width pointer initial (\_ -> pure (initial, Number 0)))
+
+destroySync :: Int -> Value -> Synchronisation -> R Value
+destroySync width pointer initial = locked $ changeSync width pointer initial $ \cell ->
+  case cell of
+    Mutex Nothing waiters | Q.null waiters -> pure (Destroyed, Number 0)
+    Condition waiters | Q.null waiters -> pure (Destroyed, Number 0)
+    Destroyed -> pure (cell, Number 22)
+    _ -> pure (cell, Number 16)
+
+acquireMutex :: Bool -> Value -> R Value
+acquireMutex tryOnly pointer = do
+  caller <- gets (number . currentThread)
+  waiter <- liftIO newEmptyMVar
+  result <- locked $ changeSync mutexWidth pointer emptyMutex $ \cell ->
+    case cell of
+      Mutex Nothing waiting -> pure (Mutex (Just caller) waiting, Left 0)
+      Mutex (Just _) _ | tryOnly -> pure (cell, Left 16)
+      Mutex (Just owner) waiting
+        | owner == caller -> pure (cell, Left 35)
+        | otherwise -> pure (Mutex (Just owner) (waiting Q.|> (caller, waiter)), Right waiter)
+      _ -> pure (cell, Left 22)
+  case result of
+    Left status -> pure (Number status)
+    Right signal -> liftIO (takeMVar signal) >> pure (Number 0)
+
+releaseMutex :: Value -> R (Either Integer (Maybe (MVar ())))
+releaseMutex pointer = do
+  caller <- gets (number . currentThread)
+  changeSync mutexWidth pointer emptyMutex $ \cell ->
+    case cell of
+      Mutex (Just owner) waiting | owner == caller ->
+        case Q.viewl waiting of
+          Q.EmptyL -> pure (emptyMutex, Right Nothing)
+          (next, waiter) Q.:< remaining -> pure (Mutex (Just next) remaining, Right (Just waiter))
+      Mutex _ _ -> pure (cell, Left 1)
+      _ -> pure (cell, Left 22)
+
+finishRelease :: Either Integer (Maybe (MVar ())) -> R Value
+finishRelease result = case result of
+  Left status -> pure (Number status)
+  Right signal -> liftIO (mapM_ (\waiter -> putMVar waiter ()) signal) >> pure (Number 0)
+
+waitCondition :: Value -> Value -> R Value
+waitCondition condition mutex
+  | number condition == number mutex = pure (Number 22)
+  | otherwise = do
+      waiter <- liftIO newEmptyMVar
+      released <- locked $ changeSync conditionWidth condition emptyCondition $ \cell ->
+        case cell of
+          Condition waiting -> do
+            result <- releaseMutex mutex
+            case result of
+              Left _ -> pure (cell, result)
+              Right _ -> pure (Condition (waiting Q.|> waiter), result)
+          _ -> pure (cell, Left 22)
+      case released of
+        Left status -> pure (Number status)
+        Right _ -> do
+          void (finishRelease released)
+          liftIO (takeMVar waiter)
+          acquireMutex False mutex
+
+notifyCondition :: Bool -> Value -> R Value
+notifyCondition allWaiters pointer = do
+  result <- locked $ changeSync conditionWidth pointer emptyCondition $ \cell ->
+    case cell of
+      Condition waiting
+        | allWaiters -> pure (emptyCondition, Just waiting)
+        | otherwise -> case Q.viewl waiting of
+            Q.EmptyL -> pure (cell, Just Q.empty)
+            waiter Q.:< remaining -> pure (Condition remaining, Just (Q.singleton waiter))
+      _ -> pure (cell, Nothing)
+  case result of
+    Nothing -> pure (Number 22)
+    Just signals -> liftIO (mapM_ (\waiter -> putMVar waiter ()) signals) >> pure (Number 0)
 
 worker :: World -> MVar Value -> Value -> Value -> IO ()
 worker child cell callable argumentValue = do
@@ -1509,7 +1633,8 @@ execute entries labels parallel initialiser initThread = do
   gate <- if parallel then Just <$> newMVar () else pure Nothing
   threads <- newMVar S.empty
   owner <- myThreadId
-  let names = map fst entries ++ labels ++ ["malloc", "calloc", "free", "memcpy", "memmove", "memset", "strlen", "strcmp", "puts", "putchar", "printf", "vprintf", "exit", "zhasvalidcap", "zis_readonly", "zgetlower", "zgetupper", "fopen", "fread", "fwrite", "fclose", "pthread_create", "pthread_join", "pthread_self", "pthread_equal"]
+  let names = map fst entries ++ labels ++ map fst pthreadArities ++
+        ["malloc", "calloc", "free", "memcpy", "memmove", "memset", "strlen", "strcmp", "puts", "putchar", "printf", "vprintf", "exit", "zhasvalidcap", "zis_readonly", "zgetlower", "zgetupper", "fopen", "fread", "fwrite", "fclose"]
       codes = S.fromList (zip names [9223372036854775808..])
       initial = World counter [] S.empty S.empty (S.fromList entries) codes "startup" 0 [] False False table gate threads owner nullPointer initThread
       action = do

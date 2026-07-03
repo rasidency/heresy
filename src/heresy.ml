@@ -128,7 +128,9 @@ let rec walk f node =
   List.iter (walk f) inner
 let read path = let channel = open_in_bin path in Fun.protect ~finally:(fun () -> close_in channel) (fun () -> really_input_string channel (in_channel_length channel))
 let write path content = let channel = open_out_bin path in Fun.protect ~finally:(fun () -> close_out channel) (fun () -> output_string channel content)
-let thread_functions = ["pthread_create"; "pthread_join"; "pthread_self"; "pthread_equal"]
+let thread_functions = ["pthread_create"; "pthread_join"; "pthread_self"; "pthread_equal";
+  "pthread_mutex_init"; "pthread_mutex_destroy"; "pthread_mutex_lock"; "pthread_mutex_trylock"; "pthread_mutex_unlock";
+  "pthread_cond_init"; "pthread_cond_destroy"; "pthread_cond_wait"; "pthread_cond_signal"; "pthread_cond_broadcast"]
 let builtins = ["malloc"; "calloc"; "free"; "memcpy"; "memmove"; "memset"; "strlen"; "strcmp"; "puts"; "putchar"; "printf"; "vprintf"; "exit"; "zhasvalidcap"; "zgetlower"; "zgetupper"; "zis_readonly"; "fopen"; "fread"; "fwrite"; "fclose"] @ thread_functions
 
 type member = { id : string; name : string; displacement : int; field_type : string; bits : (int * int) option }
@@ -234,30 +236,67 @@ let resolve_records source content layouts tree =
   let anonymous = Hashtbl.create 16 and aliases = Hashtbl.create 16 in
   let recovered = Hashtbl.create 8 in
   let typedefs = Hashtbl.create 32 in
+  let headers = Hashtbl.create 8 in
   let named = Str.regexp "\\b\\(struct\\|union\\) [A-Za-z_][A-Za-z_0-9]*\\b" in
-  let position node =
+  let record_location node =
     let location = field node "loc" in
     let expansion = field location "expansionLoc" in
-    let location = if expansion = Json.Null then location else expansion in
+    if expansion = Json.Null then location else expansion
+  in
+  let coordinates text offset =
+    let line = ref 1 and beginning = ref 0 in
+    for i = 0 to offset - 1 do
+      if text.[i] = '\n' then begin incr line; beginning := i + 1 end
+    done;
+    !line, offset - !beginning + 1
+  in
+  let position node =
+    let location = record_location node in
     let file = text location "file" in
     if (file <> "" && file <> source) || field location "includedFrom" <> Json.Null then None else
     match int_of_string_opt (text location "offset") with
     | Some offset when offset >= 0 && offset <= String.length content ->
-        let line = ref 1 and beginning = ref 0 in
-        for i = 0 to offset - 1 do
-          if content.[i] = '\n' then begin incr line; beginning := i + 1 end
-        done;
-        Some (Printf.sprintf "%s:%d:%d)" source !line (offset - !beginning + 1))
+        let line, column = coordinates content offset in
+        Some (Printf.sprintf "%s:%d:%d)" source line column)
     | _ -> None
   in
   let anonymous_layout node =
     let tag = text node "tagUsed" in
+    let names = Hashtbl.to_seq_keys layouts |> Seq.filter (fun name ->
+      String.starts_with ~prefix:(tag ^ " ") name && contains name "(unnamed at ") in
     match position node with
-    | None -> None
-    | Some suffix ->
-        Hashtbl.to_seq_keys layouts |> Seq.find (fun name ->
-          String.starts_with ~prefix:(tag ^ " ") name && String.ends_with ~suffix name &&
-          contains name "(unnamed at ")
+    | Some suffix -> Seq.find (fun name -> String.ends_with ~suffix name) names
+    | None ->
+        let location = record_location node in
+        let file = text location "file" in
+        let fields = List.filter_map (fun n -> if kind n = "FieldDecl" then Some (text n "name") else None) (children node) in
+        let candidates = Seq.filter (fun name ->
+          let marker = "(unnamed at " in
+          let start = Str.search_forward (Str.regexp_string marker) name 0 + String.length marker in
+          let column = String.rindex name ':' and ending = String.length name - 1 in
+          let line = String.rindex_from name (column - 1) ':' in
+          let path = String.sub name start (line - start) in
+          let stated_line = String.sub name (line + 1) (column - line - 1) |> int_of_string in
+          let stated_column = String.sub name (column + 1) (ending - column - 1) |> int_of_string in
+          (file = "" || file = path) &&
+          text location "col" = string_of_int stated_column &&
+          (text location "line" = "" || text location "line" = string_of_int stated_line) &&
+          List.map (fun field -> field.native_name) (Hashtbl.find layouts name).native_fields = fields &&
+          match int_of_string_opt (text location "offset") with
+          | None -> false
+          | Some offset ->
+              let contents = match Hashtbl.find_opt headers path with
+                | Some contents -> contents
+                | None ->
+                    let contents = try Some (read path) with Sys_error _ -> None in
+                    Hashtbl.replace headers path contents; contents
+              in
+              match contents with
+              | Some source when offset >= 0 && offset < String.length source ->
+                  coordinates source offset = (stated_line, stated_column)
+              | _ -> false
+        ) names |> List.of_seq |> List.sort_uniq String.compare in
+        begin match candidates with [name] -> Some name | _ -> None end
   in
   let identity node =
     let id = text node "id" in

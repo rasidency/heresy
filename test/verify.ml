@@ -216,6 +216,8 @@ let () =
       (contains values "atomic cap 7 9\natomic word 1 0 1 0 2\natomic wide 9 5 6 0\natomic tiny 4 4 0 171 0 9\n");
     check "threads share atomic objects and have independent thread-local storage"
       (contains values "threads 8000 6 6 5 1 0\n" && success "build/values" ["+RTS"; "-N2"; "-RTS"] = values);
+    check "condition waits release and reacquire mutexes without losing wakeups"
+      (contains values "pthread sync 2 14 16 0 0 0\n");
     check "extended precision survives calls, variadic alignment and IEEE boundary cases"
       (contains values "extended layout 16 16 48 7\nextended 1.0000000000000000001084 1 1 1 1 1 -0.0\n");
     check "wide integers preserve fixed and variadic calls and the frontend cursor layout"
