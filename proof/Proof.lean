@@ -466,6 +466,62 @@ theorem promoted_atomic_compares_payload (width : Nat) (observed expected : Int)
   rw [unsigned_preserves_bits width observed nonnegative unpadded]
   simp [promoted_atomic_compare]
 
+structure PointerWord where
+  address : Int
+  capability : Option Nat
+  deriving DecidableEq
+
+inductive ShadowWord where
+  | ordinary (capability : Option Nat)
+  | atomic (value : PointerWord)
+  deriving DecidableEq
+
+structure AtomicWord where
+  payload : Int
+  shadow : ShadowWord
+  deriving DecidableEq
+
+def ordinary_pointer_read (word : AtomicWord) : PointerWord :=
+  let capability := match word.shadow with
+    | .ordinary capability => capability
+    | .atomic value => value.capability
+  ⟨word.payload, capability⟩
+
+def atomic_pointer_read (word : AtomicWord) : PointerWord :=
+  match word.shadow with
+  | .ordinary capability => ⟨word.payload, capability⟩
+  | .atomic value => value
+
+def atomic_pointer_write (value : PointerWord) : AtomicWord :=
+  ⟨value.address, .atomic value⟩
+
+def atomic_payload_write (word : AtomicWord) (payload : Int) : AtomicWord :=
+  { word with payload }
+
+def atomic_pointer_compare (word : AtomicWord) (expected desired : PointerWord) :
+    Bool × PointerWord × AtomicWord :=
+  let observed := atomic_pointer_read word
+  if observed.address = expected.address then (true, observed, atomic_pointer_write desired)
+  else (false, observed, word)
+
+theorem atomic_pointer_snapshot (value : PointerWord) (payload : Int) :
+    atomic_pointer_read (atomic_payload_write (atomic_pointer_write value) payload) = value ∧
+      ordinary_pointer_read (atomic_payload_write (atomic_pointer_write value) payload) =
+        ⟨payload, value.capability⟩ := by
+  exact ⟨rfl, rfl⟩
+
+theorem atomic_pointer_compare_accepts (word : AtomicWord) (expected desired : PointerWord)
+    (address : (atomic_pointer_read word).address = expected.address) :
+    atomic_pointer_compare word expected desired =
+      (true, atomic_pointer_read word, atomic_pointer_write desired) := by
+  simp [atomic_pointer_compare, address]
+
+theorem atomic_pointer_compare_rejects (word : AtomicWord) (expected desired : PointerWord)
+    (address : (atomic_pointer_read word).address ≠ expected.address) :
+    atomic_pointer_compare word expected desired =
+      (false, atomic_pointer_read word, word) := by
+  simp [atomic_pointer_compare, address]
+
 end Heresy
 
 #print axioms Heresy.lower_correct
@@ -487,3 +543,5 @@ end Heresy
 #print axioms Heresy.array_index_in_bounds
 #print axioms Heresy.field_store_bit
 #print axioms Heresy.promoted_atomic_rejects_nonzero_padding
+#print axioms Heresy.atomic_pointer_snapshot
+#print axioms Heresy.atomic_pointer_compare_rejects
