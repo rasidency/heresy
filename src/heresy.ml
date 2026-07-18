@@ -1725,7 +1725,6 @@ let emit context =
   let global_literals = Hashtbl.create 16 in
   List.iter (walk (fun node -> if kind node = "CompoundLiteralExpr" then
     Hashtbl.replace global_literals (text node "id") ())) context.globals;
-  add Runtime.source;
   List.iter (fun f ->
     let name = text f "name" in
     let params = List.filter (fun p -> kind p = "ParmVarDecl") (children f) in
@@ -1828,7 +1827,11 @@ let explain context =
   print_endline "Checks: bounds, lifetime, pointer alignment, arithmetic faults"
 
 let rec mkdir path =
-  if path <> "." && not (Sys.file_exists path) then (mkdir (Filename.dirname path); Unix.mkdir path 0o755)
+  if path <> "." && not (Sys.file_exists path) then begin
+    mkdir (Filename.dirname path);
+    try Unix.mkdir path 0o755 with
+    | Unix.Unix_error (Unix.EEXIST, _, _) when Sys.is_directory path -> ()
+  end
 
 let rec remove path =
   match (Unix.lstat path).Unix.st_kind with
@@ -1859,6 +1862,39 @@ let temporary_directory parent =
   Unix.unlink path;
   Unix.mkdir path 0o700;
   path
+
+let compiled_support compiler directory options run =
+  let paths = Option.value (Sys.getenv_opt "PATH") ~default:"" |> String.split_on_char ':' in
+  let compiler_path =
+    if String.contains compiler '/' then Unix.realpath compiler else
+    match List.find_map (fun path ->
+      let candidate = Filename.concat path compiler in
+      try Unix.access candidate [Unix.X_OK]; Some (Unix.realpath candidate)
+      with Unix.Unix_error _ -> None) paths with
+    | Some path -> path
+    | None -> raise (Error ("cannot locate compiler " ^ compiler))
+  in
+  let cache_root = match Sys.getenv_opt "XDG_CACHE_HOME" with
+    | Some path when path <> "" && not (Filename.is_relative path) -> path
+    | _ -> Filename.concat (Sys.getenv "HOME") ".cache"
+  in
+  let cache = Filename.concat cache_root "heresy/runtime" in
+  mkdir cache;
+  let key = String.concat "\000" (Runtime.support :: compiler_path :: Digest.to_hex (Digest.file compiler_path) :: directory :: options) in
+  let entry = Filename.concat cache (Digest.to_hex (Digest.string key)) in
+  let outputs = ["Heap.hi"; "Heap.o"] in
+  let complete path = List.for_all (fun name -> Sys.file_exists (Filename.concat path name)) outputs in
+  if not (complete entry) then begin
+    let staging = temporary_directory cache in
+    Fun.protect ~finally:(fun () -> if Sys.file_exists staging then remove staging) (fun () ->
+      let source = Filename.concat staging "Heap.hs" in
+      write source Runtime.support;
+      run (options @ ["-i"; "-outputdir"; staging; "-c"; source]);
+      if not (complete staging) then raise (Error "GHC did not produce the runtime objects");
+      try Unix.rename staging entry with
+      | Unix.Unix_error ((Unix.EEXIST | Unix.ENOTEMPTY), _, _) when complete entry -> ())
+  end;
+  entry
 
 let atomic_write path content =
   let temporary, channel = Filename.open_temp_file ~temp_dir:(Filename.dirname path) ".heresy" ".hs" in
@@ -2113,7 +2149,8 @@ let main () =
     "-Xclang"; "-ast-dump=json"; "-fsyntax-only"; source]) in
   let content, frontend_layouts, bounds, aliases, inherited, adjusted, tree = prepare_frontend source (read source) dump in
   let context = context source content frontend_layouts bounds aliases inherited adjusted tree in
-  let generated = emit context in
+  let definitions = emit context in
+  let generated = Runtime.source ^ "\n" ^ definitions in
   if !check then begin
     Printf.printf "Checked %s\n" (Filename.basename source);
     if !report then explain context
@@ -2128,11 +2165,17 @@ let main () =
     let workspace = temporary_directory (Filename.dirname executable) in
     Fun.protect ~finally:(fun () -> remove workspace) (fun () ->
       let main = Filename.concat workspace "Main.hs" and target = Filename.concat workspace "heresy" in
-      write main generated;
-      let code = Process.run ~timeout:!timeout !ghc ["-O1"; "-v0"; "-rtsopts"; "-threaded"; "-package-env"; "-"; "-hide-all-packages";
-        "-package"; "base"; "-package"; "bytestring"; "-package"; "containers"; "-package"; "mtl";
-        "-i"; "-i" ^ workspace; "-outputdir"; workspace; main; "-o"; target] in
-      if code <> 0 then raise (Error ("GHC exited with status " ^ string_of_int code));
+      let options = ["-O1"; "-v0"; "-rtsopts"; "-threaded"; "-package-env"; "-"; "-hide-all-packages";
+        "-package"; "base"; "-package"; "bytestring"; "-package"; "containers"; "-package"; "mtl"] in
+      let run args =
+        let code = Process.run ~timeout:!timeout !ghc args in
+        if code <> 0 then raise (Error ("GHC exited with status " ^ string_of_int code))
+      in
+      let support = compiled_support !ghc (String.trim (capture !ghc ["--print-libdir"])) options run in
+      List.iter (fun name -> Unix.symlink (Filename.concat support name) (Filename.concat workspace name)) ["Heap.hi"; "Heap.o"];
+      write main ("module Main where\n\nimport Control.Monad (void)\nimport Data.Bits\nimport Heap\n\n" ^ definitions);
+      run (options @ ["-i"; "-i" ^ workspace; "-outputdir"; workspace; "-c"; main]);
+      run (options @ [Filename.concat workspace "Main.o"; Filename.concat workspace "Heap.o"; "-o"; target]);
       atomic_write output generated;
       Unix.rename target executable)
   in
