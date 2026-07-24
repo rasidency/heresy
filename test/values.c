@@ -6,6 +6,7 @@
 #include <stdatomic.h>
 #include <limits.h>
 #include <complex.h>
+#include <string.h>
 
 struct Packet {
   long sequence;
@@ -107,6 +108,32 @@ void scoped_values(struct Scoped *outer) {
 }
 
 #define KEEP_REGISTER(value) __asm__("" : "+r"(value))
+
+unsigned int capability_mask(int **slots) {
+  return (unsigned int)zhasvalidcap(slots[0]) | (unsigned int)zhasvalidcap(slots[1]) << 1 |
+    (unsigned int)zhasvalidcap(slots[2]) << 2;
+}
+
+void copy_phases(void) {
+  int items[3] = {7, 9, 15};
+  int *source[3] = {&items[0], &items[1], 0};
+  int *destination[3] = {&items[2], 0, &items[2]};
+  int *overlap[3] = {items, items + 1, 0};
+  printf("copy phases");
+  for (unsigned int phase = 0; phase < 8; ++phase) {
+    memmove((char*)destination + phase, (char*)source + phase, sizeof source - phase);
+    memmove((char*)overlap + 8 + phase, (char*)overlap + phase, 16 - phase);
+    printf(" %u/%u", capability_mask(destination), capability_mask(overlap));
+    destination[0] = &items[2];
+    destination[1] = 0;
+    destination[2] = &items[2];
+    overlap[0] = items;
+    overlap[1] = items + 1;
+    overlap[2] = 0;
+  }
+  memmove((char*)destination + 1, source, 15);
+  printf(" %u\n", capability_mask(destination));
+}
 
 void assembly_values(void) {
   int values[2] = {41, 8};
@@ -505,6 +532,7 @@ int main(int argc, char **argv) {
   struct Scoped scoped = {0, 0, 8};
   scoped_values(&scoped);
   assembly_values();
+  copy_phases();
   atomic_values();
   aggregate_atomics();
   concurrent_values();

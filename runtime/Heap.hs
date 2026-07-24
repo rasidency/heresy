@@ -1340,13 +1340,15 @@ copyMemory destination source count = locked $ do
   (_, src, srcOffset) <- checked count source
   (ident, dst, dstOffset) <- checked count destination
   when (readOnly dst) (panic "write to read-only memory")
-  let payload = [M.findWithDefault 0 (srcOffset + i) (bytes src) | i <- [0 .. count - 1]]
-      copied = foldl (\m (i, v) -> M.insert (dstOffset + i) v m) (bytes dst) (zip [0..] payload)
-      sourceCaps = [(i, v) | (i, v) <- M.toList (shadow src), i < srcOffset + count, i + 8 > srcOffset]
+  let end = dstOffset + count
+      payload = M.mapKeysMonotonic (+ dstOffset) (aggregateBytes srcOffset count (bytes src))
+      untouchedBytes = M.union (M.takeWhileAntitone (< dstOffset) (bytes dst)) (M.dropWhileAntitone (< end) (bytes dst))
       aligned = srcOffset `mod` 8 == dstOffset `mod` 8
-      caps = [(dstOffset + i, M.findWithDefault nullPointer (srcOffset + i) (shadow src)) | i <- [0 .. count - 8], (srcOffset + i) `mod` 8 == 0, (dstOffset + i) `mod` 8 == 0]
-  when (not aligned && not (null sourceCaps)) (panic "unaligned pointer-bearing memory copy")
-  writeObject ident (dst { bytes = copied, shadow = foldl (\m (i,v) -> M.insert i v m) (shadow dst) caps })
+      caps = if aligned then M.mapKeysMonotonic (+ dstOffset) (aggregateShadow srcOffset count (shadow src)) else M.empty
+      outside slot = slot <= dstOffset - 8 || slot >= end
+  writeObject ident (dst { bytes = M.union payload untouchedBytes
+                         , shadow = M.union caps (M.filterWithKey (\slot _ -> outside slot) (shadow dst))
+                         , atomicSlots = I.filter outside (atomicSlots dst) })
   event ("copy " ++ show count ++ " bytes to #" ++ show ident ++ "+" ++ show dstOffset)
   pure destination
 

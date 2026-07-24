@@ -210,6 +210,8 @@ let () =
       (contains values "scopes 24 16 16 257 12 21 5 21 1\ninner 3 6\n");
     check "inline barriers preserve capabilities and evaluate register operands once"
       (contains values "asm 1 1 41 fffffff9\n");
+    check "pointer copies preserve whole slots and clear partial shadow across every alignment phase"
+      (contains values "copy phases 3/7 2/5 2/5 2/5 2/5 2/5 2/5 2/5 4\n");
     check "pointer atomics keep the atomic value separate from the integer payload"
       (contains values "atomics 2147483647 -2147483648 0 1 23 40 0 4 40 71\n");
     check "aggregate atomics preserve native padding, coercions and fallback copies"
