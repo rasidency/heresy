@@ -145,6 +145,13 @@ void assembly_values(void) {
   unsigned int word = 0xffffffffU;
   __asm__("addl $5, %0\n\txorl $3, %0\n\tnegl %0" : "+r"(word) : : "cc");
   printf("asm %d %d %d %x\n", index, zhasvalidcap(pointer), values[0], word);
+  unsigned int a = 8, b = 21, c = 4, result, copied;
+  __asm__("addl %[rhs], %[result]" : [result] "=r"(result) : "0"(a), [rhs] "r"(c) : "cc");
+  __asm__("movl %[from], %[to]" : [to] "=r"(copied) : [from] "r"(result));
+  __asm__("addl %2, %0\n\tsubl %0, %1" : "+&r"(a), "+r"(b) : "r"(c) : "cc");
+  int *alias;
+  __asm__("" : "=r"(alias) : "0"(pointer));
+  printf("registers %u %u %u %u %d\n", result, copied, a, b, zhasvalidcap(alias));
 }
 
 struct AtomicCap { int *p; };

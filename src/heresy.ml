@@ -1353,11 +1353,6 @@ and inline_assembly context node =
     | Assembly ("memory" | "cc") :: Token "," :: rest -> clobbers rest
     | _ -> false
   in
-  let suffix = function
-    | [Token ")"] | [Token ":"; Token ")"] | [Token ":"; Token ":"; Token ")"] -> true
-    | Token ":" :: Token ":" :: Token ":" :: rest -> clobbers rest
-    | _ -> false
-  in
   let rec after_operand depth = function
     | Token ")" :: rest when depth = 0 -> rest
     | Token ")" :: rest -> after_operand (depth - 1) rest
@@ -1371,49 +1366,113 @@ and inline_assembly context node =
   in
   let instructions = Str.split (Str.regexp "[\r\n;]+") instructions |> List.map String.trim in
   let neutral instruction = List.mem instruction [""; "nop"; "pause"; "lfence"; "sfence"; "mfence"] in
-  match operands, rest with
-  | [], rest when suffix rest && List.for_all neutral instructions -> "asmBarrier"
-  | [operand], Token ":" :: Assembly "+r" :: Token "(" :: rest
-      when suffix (Token ":" :: after_operand 0 rest) ->
-        let active = List.filter (fun instruction -> not (neutral instruction)) instructions in
-        let operations = match active with
-          | [] -> []
-          | _ ->
-              let t = ty operand in
-              if clean context t = "_Bool" || pointer context t ||
-                floating context t <> None || complex context t <> None || aggregate context t then
-                reject ();
-              let width, _ = scalar context t in
-              let suffix = match width with 8 -> "b" | 16 -> "w" | 32 -> "l" | 64 -> "q" | _ -> reject () in
-              let arithmetic = Str.regexp "^\\([a-z]+\\)[ \t]+[$]\\([-+0-9a-fA-FxX]+\\),[ \t]*%0$" in
-              let unary = Str.regexp "^\\([a-z]+\\)[ \t]+%0$" in
-              let signed_bits = min width 32 in
+  let rec section acc tokens =
+    let name, tokens = match tokens with
+      | Token "[" :: Token name :: Token "]" :: rest -> Some name, rest
+      | _ -> None, tokens in
+    match tokens with
+    | Assembly constraint_ :: Token "(" :: rest ->
+        begin match after_operand 0 rest with
+        | Token "," :: remain -> section ((name, constraint_) :: acc) remain
+        | remain -> List.rev ((name, constraint_) :: acc), remain
+        end
+    | (Token (":" | ")") :: _) when name = None && acc = [] -> [], tokens
+    | _ -> reject ()
+  in
+  let outputs, rest = match rest with Token ":" :: rest -> section [] rest | _ -> [], rest in
+  let inputs, rest = match rest with Token ":" :: rest -> section [] rest | _ -> [], rest in
+  let clobbers = match rest with Token ":" :: rest -> clobbers rest | [Token ")"] -> true | _ -> false in
+  if not clobbers || List.length outputs + List.length inputs <> List.length operands then reject ();
+  let count = List.length outputs in
+  let constraints = Array.of_list (List.map snd (outputs @ inputs)) in
+  let operands = Array.of_list operands in
+  let names = List.filter_map Fun.id (List.mapi (fun i (name, _) -> Option.map (fun name -> name, i) name) (outputs @ inputs)) in
+  let operand reference =
+    let length = String.length reference in
+    let index =
+      if length >= 3 && reference.[0] = '[' && reference.[length - 1] = ']' then
+        List.assoc_opt (String.sub reference 1 (length - 2)) names else
+      int_of_string_opt reference
+    in
+    match index with Some i when i >= 0 && i < Array.length operands -> i | _ -> reject ()
+  in
+  let output_code = List.mapi (fun i (_, constraint_) ->
+    let read = match constraint_ with
+      | "+r" | "+&r" -> true
+      | "=r" | "=&r" -> false
+      | _ -> reject ()
+    in
+    let node = operands.(i) in
+    "(" ^ access_type context node ^ ", " ^ bool read ^ ", " ^ par (lvalue context node) ^ ")"
+  ) outputs in
+  let registers = Array.init (Array.length operands) Fun.id in
+  let input_code = List.mapi (fun i (_, constraint_) ->
+    let index = count + i in
+    let register =
+      if List.mem constraint_ ["r"; "i"; "n"] then index
+      else let tied = operand constraint_ in
+        if tied >= count then reject ();
+        tied in
+    registers.(index) <- register;
+    "(" ^ string_of_int register ^ ", " ^ par (expression context operands.(index)) ^ ")"
+  ) inputs in
+  let width index =
+    let t = ty operands.(index) in
+    if clean context t = "_Bool" || pointer context t ||
+      floating context t <> None || complex context t <> None || aggregate context t then reject ();
+    fst (scalar context t)
+  in
+  let register text =
+    if not (String.starts_with ~prefix:"%" text) then reject ();
+    operand (String.sub text 1 (String.length text - 1))
+  in
+  let operations = List.filter_map (fun instruction ->
+    if neutral instruction then None else
+    let at = List.filter_map (String.index_opt instruction) [' '; '\t'] in
+    let at = match at with [] -> reject () | first :: rest -> List.fold_left min first rest in
+    let mnemonic = String.sub instruction 0 at in
+    let end_ = String.length mnemonic - 1 in
+    if end_ < 1 then reject ();
+    let bits = match mnemonic.[end_] with 'b' -> 8 | 'w' -> 16 | 'l' -> 32 | 'q' -> 64 | _ -> reject () in
+    let mnemonic = String.sub mnemonic 0 end_ in
+    let destination, op, source =
+      match String.split_on_char ',' (String.sub instruction at (String.length instruction - at)) |> List.map String.trim with
+      | [source; destination] ->
+          let op = match List.assoc_opt mnemonic ["mov","mov"; "add","+"; "sub","-"; "and","&"; "or","|"; "xor","^"] with
+            | Some op -> op | None -> reject () in
+          let source =
+            if String.starts_with ~prefix:"$%" source then begin
+              let index = register (String.sub source 1 (String.length source - 1)) in
+              if index < count || not (List.mem constraints.(index) ["i"; "n"]) then reject ();
+              "Left " ^ string_of_int registers.(index)
+            end else if String.starts_with ~prefix:"$" source then begin
+              let value = int_of_string_opt (String.sub source 1 (String.length source - 1)) in
+              let signed_bits = min bits 32 in
               let lower = -(1 lsl (signed_bits - 1)) in
-              let upper = (1 lsl (if width = 64 then signed_bits - 1 else signed_bits)) - 1 in
-              List.map (fun instruction ->
-                let op, value =
-                  if Str.string_match arithmetic instruction 0 then
-                    let mnemonic = Str.matched_group 1 instruction and immediate = Str.matched_group 2 instruction in
-                    let op = match List.assoc_opt mnemonic (List.map (fun (name, op) -> name ^ suffix, op)
-                      ["add", "+"; "sub", "-"; "and", "&"; "or", "|"; "xor", "^"]) with
-                      | Some op -> op | None -> reject () in
-                    let value = match int_of_string_opt immediate with
-                      | Some value when lower <= value && value <= upper -> value
-                      | _ -> reject () in
-                    op, value
-                  else if Str.string_match unary instruction 0 then
-                    match Str.matched_group 1 instruction with
-                    | op when op = "inc" ^ suffix -> "+", 1
-                    | op when op = "dec" ^ suffix -> "-", 1
-                    | op when op = "not" ^ suffix -> "^", -1
-                    | op when op = "neg" ^ suffix -> "neg", 0
-                    | _ -> reject ()
-                  else reject ()
-                in "(" ^ quote op ^ ", " ^ string_of_int width ^ ", " ^ par (string_of_int value) ^ ")"
-              ) active
-        in
-        "asmRegister " ^ access_type context operand ^ " [" ^ join operations ^ "] " ^ par (lvalue context operand)
-  | _ -> reject ()
+              let upper = (1 lsl (if bits = 64 then signed_bits - 1 else signed_bits)) - 1 in
+              match value with
+              | Some value when lower <= value && value <= upper -> "Right " ^ par (string_of_int value)
+              | _ -> reject ()
+            end else begin
+              let index = register source in
+              if width index <> bits || List.mem constraints.(index) ["i"; "n"] then reject ();
+              "Left " ^ string_of_int registers.(index)
+            end
+          in
+          register destination, op, source
+      | [destination] ->
+          let op, value = match mnemonic with
+            | "inc" -> "+", 1 | "dec" -> "-", 1 | "not" -> "^", -1 | "neg" -> "neg", 0
+            | _ -> reject ()
+          in register destination, op, "Right " ^ par (string_of_int value)
+      | _ -> reject ()
+    in
+    let output = registers.(destination) in
+    if output >= count || width destination <> bits then reject ();
+    Some ("(" ^ quote op ^ ", " ^ string_of_int bits ^ ", " ^ string_of_int output ^ ", " ^ source ^ ")")
+  ) instructions in
+  if operands = [||] then "asmBarrier"
+  else "asmRegisters [" ^ join output_code ^ "] [" ^ join input_code ^ "] [" ^ join operations ^ "]"
 
 and statement context node =
   let st = statement context in

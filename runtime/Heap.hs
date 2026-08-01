@@ -7,7 +7,7 @@ module Heap
   , freeze
   , chain, discard, statementValue, redirectFlow, branch, loop, postloop, selection, dispatch, indirectJump, logic, boolean, binary, unary
   , assign, update, realBinary, realUpdate, function, invoke, execute
-  , asmBarrier, asmRegister
+  , asmBarrier, asmRegisters
   , imaginary, makeComplex, complexPart, complexBinary, complexUpdate
   , argumentArea, vaStart, vaCopy, vaArg, vaAvailable
   , AtomicMode(..), atomicAccess, atomicTransfer, atomicModify, atomicCompare, atomicPointerStep
@@ -1159,16 +1159,31 @@ atomicPointerStep op stride oldResult target ordering expression = do
 asmBarrier :: R Flow
 asmBarrier = locked (pure Next)
 
-asmRegister :: CType -> [(String, Int, Integer)] -> R Value -> R Flow
-asmRegister ty instructions destination = do
-  pointer <- destination
+asmRegisters :: [(CType, Bool, R Value)] -> [(Int, R Value)] ->
+  [(String, Int, Int, Either Int Integer)] -> R Flow
+asmRegisters outputs inputs instructions = do
+  destinations <- mapM (\(ty, readWrite, action) -> (,,) ty readWrite <$> action) outputs
+  arguments <- mapM (\(reg, action) -> (,) reg <$> action) inputs
   locked $ do
-    let evaluate value (op, width, immediate) =
-          either panic pure $ if op == "neg" then calculate "-" width False 1 (Number 0) value
-          else calculate op width False 1 value (Number immediate)
-    value <- loadCell ty pointer
-    result <- foldM evaluate value instructions
-    void (storeCell ty pointer result)
+    initial <- forM (zip [0..] destinations) $ \(reg, (ty, readWrite, destination)) -> do
+      value <- if readWrite then loadCell ty destination else pure NoValue
+      pure (reg, value)
+    let getRegister registers reg =
+          case M.lookup reg registers of
+            Just value | value /= NoValue -> pure value
+            _ -> panic "assembly reads an uninitialised register"
+        evaluate registers (op, width, destination, source) = do
+          operand <- either (getRegister registers) (pure . Number) source
+          result <- case op of
+            "mov" -> pure (cast (IntegerType width False) operand)
+            "neg" -> getRegister registers destination >>= either panic pure . calculate "-" width False 1 (Number 0)
+            _ -> do
+              left <- getRegister registers destination
+              either panic pure (calculate op width False 1 left operand)
+          pure (M.insert destination result registers)
+    result <- foldM evaluate (M.fromList (initial ++ arguments)) instructions
+    forM_ (zip [0..] destinations) $ \(reg, (ty, _, destination)) ->
+      getRegister result reg >>= void . storeCell ty destination
     pure Next
 
 atomicCompare :: Bool -> CType -> R Value -> R Value -> R Value -> R Value -> R Value -> R Value
