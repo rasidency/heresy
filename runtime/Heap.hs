@@ -1159,6 +1159,39 @@ atomicPointerStep op stride oldResult target ordering expression = do
 asmBarrier :: R Flow
 asmBarrier = locked (pure Next)
 
+carryBit :: Maybe Bool -> R Integer
+carryBit Nothing = panic "assembly reads an undefined carry flag"
+carryBit (Just carry) = pure (if carry then 1 else 0)
+
+asmArithmetic :: String -> Int -> Integer -> Integer -> Maybe Bool -> R (Integer, Maybe Bool)
+asmArithmetic op width left right carry =
+  let addition amount = let result = left + right + amount in (result, Just (result >= bit width))
+      subtraction amount = let result = left - right - amount in (result, Just (result < 0))
+      count = fromInteger (right .&. if width == 64 then 63 else 31)
+      rotation = count `mod` width
+      shifted result bitIndex defined =
+        if count == 0 then (left, carry) else (result, if defined then Just (testBit left bitIndex) else Nothing)
+      rotated result bitIndex = if count == 0 then (left, carry) else (result, Just (testBit result bitIndex))
+  in case op of
+    "+" -> pure (addition 0)
+    "-" -> pure (subtraction 0)
+    "adc" -> addition <$> carryBit carry
+    "sbb" -> subtraction <$> carryBit carry
+    "cmp" -> pure (left, Just (left < right))
+    "inc" -> pure (left + 1, carry)
+    "dec" -> pure (left - 1, carry)
+    "neg" -> pure (negate left, Just (left /= 0))
+    "not" -> pure (complement left, carry)
+    "&" -> pure (left .&. right, Just False)
+    "|" -> pure (left .|. right, Just False)
+    "^" -> pure (xor left right, Just False)
+    "shl" -> pure (shifted (shiftL left count) (width - count) (count < width))
+    "shr" -> pure (shifted (shiftR left count) (count - 1) (count < width))
+    "sar" -> pure (shifted (shiftR (normalise width True left) count) (min (width - 1) (count - 1)) True)
+    "rol" -> pure (rotated (shiftL left rotation .|. shiftR left (width - rotation)) 0)
+    "ror" -> pure (rotated (shiftR left rotation .|. shiftL left (width - rotation)) (width - 1))
+    _ -> panic ("unknown assembly operation " ++ op)
+
 asmRegisters :: [(CType, Bool, R Value)] -> [(Int, R Value)] ->
   [(String, Int, Int, Either Int Integer)] -> R Flow
 asmRegisters outputs inputs instructions = do
@@ -1172,16 +1205,24 @@ asmRegisters outputs inputs instructions = do
           case M.lookup reg registers of
             Just value | value /= NoValue -> pure value
             _ -> panic "assembly reads an uninitialised register"
-        evaluate registers (op, width, destination, source) = do
-          operand <- either (getRegister registers) (pure . Number) source
-          result <- case op of
-            "mov" -> pure (cast (IntegerType width False) operand)
-            "neg" -> getRegister registers destination >>= either panic pure . calculate "-" width False 1 (Number 0)
+        evaluate (registers, carry) (op, width, destination, source) =
+          case op of
+            "clc" -> pure (registers, Just False)
+            "stc" -> pure (registers, Just True)
+            "cmc" -> do
+              old <- carryBit carry
+              pure (registers, Just (old == 0))
             _ -> do
-              left <- getRegister registers destination
-              either panic pure (calculate op width False 1 left operand)
-          pure (M.insert destination result registers)
-    result <- foldM evaluate (M.fromList (initial ++ arguments)) instructions
+              let word = normalise width False . number
+              operand <- either (getRegister registers) (pure . Number) source
+              (result, flag) <- case op of
+                "mov" -> pure (word operand, carry)
+                "setc" -> (\value -> (value, carry)) <$> carryBit carry
+                _ -> do
+                  left <- word <$> getRegister registers destination
+                  asmArithmetic op width left (word operand) carry
+              pure (M.insert destination (Number (normalise width False result)) registers, flag)
+    (result, _) <- foldM evaluate (M.fromList (initial ++ arguments), Nothing) instructions
     forM_ (zip [0..] destinations) $ \(reg, (ty, _, destination)) ->
       getRegister result reg >>= void . storeCell ty destination
     pure Next

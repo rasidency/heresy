@@ -152,6 +152,14 @@ void assembly_values(void) {
   int *alias;
   __asm__("" : "=r"(alias) : "0"(pointer));
   printf("registers %u %u %u %u %d\n", result, copied, a, b, zhasvalidcap(alias));
+  unsigned int low = 0xffffffffU, high = 9, rotated = 0x80000001U, mask = 0;
+  int negative = -8;
+  unsigned char carry;
+  __asm__("addl $1, %0\n\tadcl $0, %1" : "+r"(low), "+r"(high) : : "cc");
+  __asm__("roll $1, %0\n\tsetc %1" : "+r"(rotated), "=r"(carry) : : "cc");
+  __asm__("stc\n\troll $32, %0\n\tsbbl $0, %1" : "+r"(rotated), "+r"(mask) : : "cc");
+  __asm__("sarl $2, %0" : "+r"(negative) : : "cc");
+  printf("flags %u %u %u %x %d %u\n", low, high, rotated, mask, negative, (unsigned)carry);
 }
 
 struct AtomicCap { int *p; };

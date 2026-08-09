@@ -1428,18 +1428,27 @@ and inline_assembly context node =
   in
   let operations = List.filter_map (fun instruction ->
     if neutral instruction then None else
+    if List.mem instruction ["clc"; "stc"; "cmc"] then
+      Some ("(" ^ quote instruction ^ ", 0, 0, Right 0)") else
     let at = List.filter_map (String.index_opt instruction) [' '; '\t'] in
     let at = match at with [] -> reject () | first :: rest -> List.fold_left min first rest in
     let mnemonic = String.sub instruction 0 at in
-    let end_ = String.length mnemonic - 1 in
-    if end_ < 1 then reject ();
-    let bits = match mnemonic.[end_] with 'b' -> 8 | 'w' -> 16 | 'l' -> 32 | 'q' -> 64 | _ -> reject () in
-    let mnemonic = String.sub mnemonic 0 end_ in
+    let bits, mnemonic =
+      if List.mem mnemonic ["setc"; "setb"; "setnae"] then 8, "setc" else
+      let end_ = String.length mnemonic - 1 in
+      if end_ < 1 then reject ();
+      let bits = match mnemonic.[end_] with 'b' -> 8 | 'w' -> 16 | 'l' -> 32 | 'q' -> 64 | _ -> reject () in
+      bits, String.sub mnemonic 0 end_
+    in
     let destination, op, source =
       match String.split_on_char ',' (String.sub instruction at (String.length instruction - at)) |> List.map String.trim with
       | [source; destination] ->
-          let op = match List.assoc_opt mnemonic ["mov","mov"; "add","+"; "sub","-"; "and","&"; "or","|"; "xor","^"] with
-            | Some op -> op | None -> reject () in
+          let op = match mnemonic with
+            | "mov" | "adc" | "sbb" | "cmp" | "shl" | "shr" | "sar" | "rol" | "ror" -> mnemonic
+            | "sal" -> "shl"
+            | "add" -> "+" | "sub" -> "-" | "and" -> "&" | "or" -> "|" | "xor" -> "^"
+            | _ -> reject () in
+          let counted = List.mem op ["shl"; "shr"; "sar"; "rol"; "ror"] in
           let source =
             if String.starts_with ~prefix:"$%" source then begin
               let index = register (String.sub source 1 (String.length source - 1)) in
@@ -1448,12 +1457,13 @@ and inline_assembly context node =
             end else if String.starts_with ~prefix:"$" source then begin
               let value = int_of_string_opt (String.sub source 1 (String.length source - 1)) in
               let signed_bits = min bits 32 in
-              let lower = -(1 lsl (signed_bits - 1)) in
-              let upper = (1 lsl (if bits = 64 then signed_bits - 1 else signed_bits)) - 1 in
+              let lower = if counted then -128 else -(1 lsl (signed_bits - 1)) in
+              let upper = if counted then 255 else (1 lsl (if bits = 64 then signed_bits - 1 else signed_bits)) - 1 in
               match value with
               | Some value when lower <= value && value <= upper -> "Right " ^ par (string_of_int value)
               | _ -> reject ()
             end else begin
+              if counted then reject ();
               let index = register source in
               if width index <> bits || List.mem constraints.(index) ["i"; "n"] then reject ();
               "Left " ^ string_of_int registers.(index)
@@ -1462,16 +1472,16 @@ and inline_assembly context node =
           register destination, op, source
       | [destination] ->
           let op, value = match mnemonic with
-            | "inc" -> "+", 1 | "dec" -> "-", 1 | "not" -> "^", -1 | "neg" -> "neg", 0
+            | "inc" | "dec" | "not" | "neg" | "setc" -> mnemonic, 0
             | _ -> reject ()
           in register destination, op, "Right " ^ par (string_of_int value)
       | _ -> reject ()
     in
     let output = registers.(destination) in
-    if output >= count || width destination <> bits then reject ();
+    if (output >= count && op <> "cmp") || width destination <> bits then reject ();
     Some ("(" ^ quote op ^ ", " ^ string_of_int bits ^ ", " ^ string_of_int output ^ ", " ^ source ^ ")")
   ) instructions in
-  if operands = [||] then "asmBarrier"
+  if operands = [||] && operations = [] then "asmBarrier"
   else "asmRegisters [" ^ join output_code ^ "] [" ^ join input_code ^ "] [" ^ join operations ^ "]"
 
 and statement context node =

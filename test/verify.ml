@@ -210,6 +210,8 @@ let () =
       (contains values "scopes 24 16 16 257 12 21 5 21 1\ninner 3 6\n");
     check "assembly preserves named and tied registers and evaluates output addresses once"
       (contains values "asm 1 1 41 fffffff9\nregisters 12 12 12 9 1\n");
+    check "assembly threads carry across instructions and preserves it across a masked zero rotate"
+      (contains values "flags 0 10 3 ffffffff -2 1\n");
     check "pointer copies preserve whole slots and clear partial shadow across every alignment phase"
       (contains values "copy phases 3/7 2/5 2/5 2/5 2/5 2/5 2/5 2/5 4\n");
     check "pointer atomics keep the atomic value separate from the integer payload"
