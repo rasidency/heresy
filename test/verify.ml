@@ -194,6 +194,15 @@ let () =
     check "calling convention slots and integer formats" (contains calls "4294967295 4294967295 3" && contains calls "-007 -1 255 17 FF" && contains calls "\255 255");
     let lowered = fixture "lowering" (read "test/lowering.c") in
     let values = fixture "values" (read "test/values.c") in
+    let units = ["test/linkage/entry.c"; "test/linkage/worker.c"] in
+    ignore (success frontend (["-std=c11"; "-O1"] @ units @ ["-o"; "build/linkageref"]));
+    ignore (success compiler (units @ ["--build"; "build/linkage"]));
+    let linked = success "build/linkage" [] in
+    check "translation units share external storage and isolate internal symbols"
+      (linked = "linkage 4 18 42 18 9\n" && linked = success "build/linkageref" []);
+    write "build/duplicate.c" "int shared = 1;";
+    let code, _, errors = run compiler (units @ ["build/duplicate.c"; "--check"]) in
+    check "linking rejects duplicate external definitions" (code <> 0 && contains errors "multiple definitions of shared");
     check "value copies preserve ownership and IEEE scalar behaviour"
       (contains values "copies 11 12 1 42 1 10\nmembers 28 42 -3\nieee 4b800000 1 8000000000000000 1 1 1 0 -3\n" &&
        contains values "decimal -00003.50 2.67 2 4 -0.000000       inf\nliveness 0 0\n");

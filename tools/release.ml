@@ -21,6 +21,7 @@ let files = [
   "src/dune"; "src/heresy.ml"; "src/process.ml"; "src/process.mli";
   "runtime/Heap.hs"; "tools/dune"; "tools/embed.ml"; "tools/release.ml";
   "test/dune"; "test/verify.ml"; "test/fault.ml"; "test/lowering.c"; "test/values.c"; "proof/Proof.lean"; "proof/Certificate.lean";
+  "test/linkage/entry.c"; "test/linkage/worker.c";
   "assets/pipeline.svg"; "assets/capability.svg"; "assets/pipeline.dot"; "assets/capability.dot";
   "lean-toolchain"; "lakefile.toml"; "lake-manifest.json";
   "examples/alias.c"; "examples/bounds.c"; "examples/codec.c";

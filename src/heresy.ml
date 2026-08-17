@@ -140,6 +140,9 @@ type native_layout = { native_size : int; native_alignment : int; native_fields 
 type context = {
   source : string;
   content : string;
+  namespace : string;
+  symbols : (string, string) Hashtbl.t;
+  internal_functions : (string, unit) Hashtbl.t;
   aliases : (string, string) Hashtbl.t;
   records : (string, Json.t) Hashtbl.t;
   layouts : (string, layout) Hashtbl.t;
@@ -168,6 +171,11 @@ let loc context node =
 
 let fail context node message = raise (Error (loc context node ^ ": " ^ message))
 let contains s fragment = try ignore (Str.search_forward (Str.regexp_string fragment) s 0); true with Not_found -> false
+
+let function_symbol context name =
+  if Hashtbl.mem context.internal_functions name then context.namespace ^ name else name
+
+let public_object name = "extern:" ^ name
 
 let frontend_dump dump =
   let layouts = Hashtbl.create 32 in
@@ -1008,8 +1016,10 @@ and expression context node =
         | None -> fail context node "unresolved enumerator"
       end else if kind reference = "FunctionDecl" then begin
         let name = text reference "name" in
-        if not (List.exists (fun f -> text f "name" = name) context.functions || List.mem name builtins) then fail context node ("unsupported external call " ^ name);
-        "function " ^ quote name
+        if not (List.exists (fun f -> text f "name" = name) context.functions ||
+          (Hashtbl.find_opt context.symbols name = Some "FunctionDecl" && not (Hashtbl.mem context.internal_functions name)) ||
+          List.mem name builtins) then fail context node ("unsupported external call " ^ name);
+        "function " ^ quote (function_symbol context name)
       end else par (lv node ^ " >>= load " ^ ctype context t)
   | ("ImplicitCastExpr" | "CStyleCastExpr"), [child] ->
       begin match text node "castKind" with
@@ -1619,14 +1629,47 @@ let next_integer value =
   let magnitude = String.sub magnitude !start (String.length magnitude - !start) in
   (if negative && magnitude <> "0" then "-" else "") ^ magnitude
 
-let context source content frontend_layouts vla_bounds vla_aliases vla_inherited vla_adjusted tree =
-  let nodes = List.filter (fun n ->
+let source_nodes tree =
+  List.filter (fun n ->
     let origin = field n "loc" in
     let l = if field origin "expansionLoc" = Json.Null then origin else field origin "expansionLoc" in
-    l <> Json.Null && text l "offset" <> "" && field l "includedFrom" = Json.Null) (children tree) in
-  let functions = List.filter (fun n -> kind n = "FunctionDecl" && List.exists (fun b -> kind b = "CompoundStmt") (children n)) nodes in
+    l <> Json.Null && text l "offset" <> "" && field l "includedFrom" = Json.Null) (children tree)
+
+let function_definition node =
+  kind node = "FunctionDecl" && List.exists (fun body -> kind body = "CompoundStmt") (children node)
+
+let object_definition node =
+  kind node = "VarDecl" && (text node "storageClass" <> "extern" || text node "init" <> "")
+
+let internal_symbols nodes kind_ =
+  let names = Hashtbl.create 8 in
+  List.iter (fun node -> if kind node = kind_ && text node "storageClass" = "static" then
+    Hashtbl.replace names (text node "name") ()) nodes;
+  names
+
+let link_symbols trees =
+  let definitions = Hashtbl.create 32 in
+  List.iter (fun tree ->
+    let nodes = source_nodes tree in
+    let local_functions = internal_symbols nodes "FunctionDecl" and local_objects = internal_symbols nodes "VarDecl" in
+    let unit_symbols = Hashtbl.create 16 in
+    List.iter (fun node ->
+      let name = text node "name" in
+      if (function_definition node && not (Hashtbl.mem local_functions name)) ||
+         (object_definition node && not (Hashtbl.mem local_objects name)) then
+        Hashtbl.replace unit_symbols name (kind node)) nodes;
+    Hashtbl.to_seq unit_symbols |> List.of_seq |> List.sort compare |> List.iter (fun (name, kind_) ->
+      if Hashtbl.mem definitions name then raise (Error ("multiple definitions of " ^ name));
+      Hashtbl.add definitions name kind_)
+  ) trees;
+  definitions
+
+let context namespace symbols source content frontend_layouts vla_bounds vla_aliases vla_inherited vla_adjusted tree =
+  let nodes = source_nodes tree in
+  let functions = List.filter function_definition nodes in
+  let internal_functions = internal_symbols nodes "FunctionDecl" and internal_objects = internal_symbols nodes "VarDecl" in
   let definitions = Hashtbl.create 16 and order = ref [] in
-  List.iter (fun node -> if kind node = "VarDecl" && text node "storageClass" <> "extern" then begin
+  List.iter (fun node -> if object_definition node then begin
     let name = text node "name" in
     if not (Hashtbl.mem definitions name) then order := name :: !order;
     match Hashtbl.find_opt definitions name with
@@ -1637,12 +1680,12 @@ let context source content frontend_layouts vla_bounds vla_aliases vla_inherited
   let statics = ref [] in
   List.iter (walk (fun node -> if kind node = "VarDecl" && text node "storageClass" = "static" then statics := node :: !statics)) functions;
   let globals = file_globals @ List.rev !statics in
-  let context = { source; content; aliases = Hashtbl.create 32; records = Hashtbl.create 8; layouts = Hashtbl.create 8; frontend_layouts; names = Hashtbl.create 64; functions; globals; pure = Hashtbl.create 8; constants = Hashtbl.create 32; label_names = Hashtbl.create 16; vla_bounds; vla_aliases; vla_inherited; vla_adjusted } in
+  let context = { source; content; namespace; symbols; internal_functions; aliases = Hashtbl.create 32; records = Hashtbl.create 8; layouts = Hashtbl.create 8; frontend_layouts; names = Hashtbl.create 64; functions; globals; pure = Hashtbl.create 8; constants = Hashtbl.create 32; label_names = Hashtbl.create 16; vla_bounds; vla_aliases; vla_inherited; vla_adjusted } in
   List.iter (fun function_node ->
     walk (fun node -> if kind node = "AddrLabelExpr" then begin
       let id = text node "labelDeclId" in
       if not (Hashtbl.mem context.label_names id) then
-        Hashtbl.add context.label_names id ("label:" ^ text function_node "name" ^ ":" ^ string_of_int (Hashtbl.length context.label_names))
+        Hashtbl.add context.label_names id ("label:" ^ namespace ^ text function_node "name" ^ ":" ^ string_of_int (Hashtbl.length context.label_names))
     end) function_node) functions;
   walk (fun n -> if kind n = "TypedefDecl" then
     let target = ty n in
@@ -1716,12 +1759,25 @@ let context source content frontend_layouts vla_bounds vla_aliases vla_inherited
     Hashtbl.replace context.records (text n "tagUsed" ^ " " ^ text n "name") n) tree;
   let assign node =
     if not (Hashtbl.mem context.names (text node "id")) then
-      Hashtbl.add context.names (text node "id") (text node "name" ^ "." ^ string_of_int (Hashtbl.length context.names))
+      Hashtbl.add context.names (text node "id") (namespace ^ text node "name" ^ "." ^ string_of_int (Hashtbl.length context.names))
   in
   List.iter assign globals;
-  List.iter (fun node -> if kind node = "VarDecl" then match Hashtbl.find_opt definitions (text node "name") with
-    | None -> ()
-    | Some definition -> Hashtbl.replace context.names (text node "id") (Hashtbl.find context.names (text definition "id"))) (children tree);
+  List.iter (fun node ->
+    let name = text node "name" in
+    if not (Hashtbl.mem internal_objects name) then
+      Hashtbl.replace context.names (text node "id") (public_object name)
+  ) file_globals;
+  let bind_external node =
+    let name = text node "name" in
+    let storage = match Hashtbl.find_opt definitions name with
+      | Some definition -> Hashtbl.find_opt context.names (text definition "id")
+      | None when Hashtbl.find_opt symbols name = Some "VarDecl" && not (Hashtbl.mem internal_objects name) ->
+          Some (public_object name)
+      | None -> None
+    in
+    Option.iter (fun key -> Hashtbl.replace context.names (text node "id") key) storage
+  in
+  List.iter (fun node -> if kind node = "VarDecl" then bind_external node) (children tree);
   let referenced = Hashtbl.create 32 in
   List.iter (walk (fun n -> if kind n = "DeclRefExpr" then Hashtbl.replace referenced (text (field n "referencedDecl") "name") ())) nodes;
   List.iter (fun declaration ->
@@ -1741,11 +1797,7 @@ let context source content frontend_layouts vla_bounds vla_aliases vla_inherited
       if kind d = "CompoundLiteralExpr" then assign d;
       if kind d = "TypedefDecl" && Hashtbl.mem context.vla_aliases (text d "id") then assign d;
       if List.mem (kind d) ["VarDecl"; "ParmVarDecl"] then begin
-        if text d "storageClass" = "extern" then begin
-          match Hashtbl.find_opt definitions (text d "name") with
-          | None -> ()
-          | Some definition -> Hashtbl.replace context.names (text d "id") (Hashtbl.find context.names (text definition "id"))
-        end else assign d;
+        if text d "storageClass" = "extern" then bind_external d else assign d;
         if not (Hashtbl.mem vla_bounds (text d "id")) then begin
           let _, modifiers = declarator context (ty d) in
           if List.exists (function Dimension bound -> bound <> "" && int_of_string_opt bound = None | _ -> false) modifiers then
@@ -1784,10 +1836,10 @@ let constant_storage context original =
 let binding prefix name =
   prefix ^ "_" ^ String.concat "" (List.init (String.length name) (fun i -> Printf.sprintf "%02x" (Char.code name.[i])))
 
-let emit context =
-  if not (List.exists (fun f -> text f "name" = "main") context.functions) then raise (Error "input must define main");
-  let lines = Buffer.create 16384 in
-  let add s = Buffer.add_string lines (s ^ "\n") in
+let initialiser context phase =
+  phase ^ if context.namespace = "" then "" else "_" ^ binding "unit" context.namespace
+
+let emit_unit add context =
   let allocate symbol node =
     symbol ^ " " ^ key context node ^ " " ^ string_of_int (layout context (ty node)).size
   in
@@ -1795,7 +1847,8 @@ let emit context =
   List.iter (walk (fun node -> if kind node = "CompoundLiteralExpr" then
     Hashtbl.replace global_literals (text node "id") ())) context.globals;
   List.iter (fun f ->
-    let name = text f "name" in
+    let source_name = text f "name" in
+    let name = function_symbol context source_name in
     let params = List.filter (fun p -> kind p = "ParmVarDecl") (children f) in
     let body = List.find (fun n -> kind n = "CompoundStmt") (children f) in
     let introspects = ref false in
@@ -1812,7 +1865,7 @@ let emit context =
       | base, Parameters _ :: rest -> Some (ctype context (render_type base rest))
       | _ -> fail context f "unsupported function signature"
     in
-    let implementation = match Hashtbl.find_opt context.pure name with
+    let implementation = match Hashtbl.find_opt context.pure source_name with
       | Some (_, expression) ->
           add (binding "k" name ^ " :: " ^ String.concat " -> " (List.init (List.length params + 1) (fun _ -> "Integer")));
           add (binding "k" name ^ " " ^ String.concat " " (List.mapi (fun i _ -> "x" ^ string_of_int i) params) ^ " = " ^ expression ^ "\n");
@@ -1852,7 +1905,8 @@ let emit context =
     if pattern <> "_" then add (binding "f" name ^ " _ = panic " ^ quote ("wrong argument count for " ^ name));
     add ""
   ) context.functions;
-  let initialise_globals label globals =
+  let initialise_globals phase globals =
+    let label = initialiser context ("allocate" ^ phase) in
     add (label ^ " :: R ()\n" ^ label ^ " = do");
     let compound_literals = ref [] in
     List.iter (fun g ->
@@ -1862,6 +1916,9 @@ let emit context =
       add ("  void (" ^ allocate "global" node ^ ")")
     end) g
     ) globals;
+    add "  pure ()\n";
+    let label = initialiser context ("initialise" ^ phase) in
+    add (label ^ " :: R ()\n" ^ label ^ " = do");
     List.iter (fun g -> match List.rev (children g) with
     | [] -> ()
     | value :: _ ->
@@ -1873,15 +1930,29 @@ let emit context =
     add "  pure ()\n"
   in
   let shared, local = List.partition (fun g -> text g "tls" = "") context.globals in
-  initialise_globals "initialise" shared;
-  initialise_globals "initialiseThread" local;
+  initialise_globals "Globals" shared;
+  initialise_globals "Thread" local
+
+let emit contexts =
+  let functions = List.concat_map (fun context ->
+    List.map (fun f -> function_symbol context (text f "name")) context.functions) contexts in
+  if not (List.mem "main" functions) then raise (Error "input must define main");
+  let lines = Buffer.create 16384 in
+  let add s = Buffer.add_string lines (s ^ "\n") in
+  List.iter (emit_unit add) contexts;
   let parallel = ref false in
-  List.iter (walk (fun node -> if kind node = "DeclRefExpr" && List.mem (callee_name node) thread_functions then
-    parallel := true)) context.functions;
+  List.iter (fun context ->
+    List.iter (walk (fun node -> if kind node = "DeclRefExpr" && List.mem (callee_name node) thread_functions then
+      parallel := true)) context.functions) contexts;
   add "main :: IO ()";
-  let labels = Hashtbl.to_seq_values context.label_names |> List.of_seq |> List.sort String.compare in
-  add ("main = execute [" ^ join (List.map (fun f -> "(" ^ quote (text f "name") ^ ", " ^ binding "f" (text f "name") ^ ")") context.functions) ^
-       "] [" ^ join (List.map quote labels) ^ "] " ^ bool !parallel ^ " initialise initialiseThread");
+  let labels = List.concat_map (fun context -> Hashtbl.to_seq_values context.label_names |> List.of_seq) contexts |> List.sort String.compare in
+  let phase name =
+    let actions = List.map (fun context -> initialiser context ("allocate" ^ name)) contexts @
+      List.map (fun context -> initialiser context ("initialise" ^ name)) contexts in
+    "(do { " ^ String.concat "; " actions ^ " })"
+  in
+  add ("main = execute [" ^ join (List.map (fun name -> "(" ^ quote name ^ ", " ^ binding "f" name ^ ")") functions) ^
+       "] [" ^ join (List.map quote labels) ^ "] " ^ bool !parallel ^ " " ^ phase "Globals" ^ " " ^ phase "Thread");
   Buffer.contents lines
 
 let explain context =
@@ -2186,7 +2257,7 @@ let prepare_frontend source content dump =
   content, layouts, bounds, aliases, inherited, adjusted, tree
 
 let main () =
-  let source = ref "" and output = ref "" and executable = ref "" and report = ref false in
+  let sources = ref [] and output = ref "" and executable = ref "" and report = ref false in
   let check = ref false and timeout = ref 0. and ghc = ref "ghc" in
   let specs = [
     "-o", Arg.Set_string output, "FILE standalone generated Haskell";
@@ -2197,39 +2268,47 @@ let main () =
     "--ghc", Arg.Set_string ghc, "PROGRAM select GHC 9.6.7";
     "--version", Arg.Unit (fun () -> Printf.printf "Heresy %s (Fil-C 0.687 -> Haskell)\n" Runtime.version; exit 0), " show compiler version"
   ] in
-  Arg.parse specs (fun path -> if !source <> "" then raise (Error "exactly one input is supported") else source := path) "heresy input.c [-o Main.hs] [--build executable] [--check] [--explain]";
-  if !source = "" then raise (Error "a Fil-C input file is required");
+  Arg.parse specs (fun path -> sources := path :: !sources) "heresy input.c [other.c ...] [-o Main.hs] [--build executable] [--check] [--explain]";
+  if !sources = [] then raise (Error "a Fil-C input file is required");
   if not (Float.is_finite !timeout) || !timeout < 0. then raise (Error "timeout must be finite and nonnegative");
   if !check && (!output <> "" || !executable <> "") then raise (Error "--check cannot be combined with -o or --build");
-  let source = Unix.realpath !source in
-  if not (String.ends_with ~suffix:".c" source) then raise (Error "Fil-C input must have the .c extension");
-  let metadata = Unix.stat source in
-  if metadata.Unix.st_kind <> Unix.S_REG then raise (Error "input must be a regular file");
+  let sources = List.rev_map Unix.realpath !sources in
+  if List.length (List.sort_uniq String.compare sources) <> List.length sources then raise (Error "duplicate input file");
+  List.iter (fun source ->
+    if not (String.ends_with ~suffix:".c" source) then raise (Error "Fil-C input must have the .c extension");
+    if (Unix.stat source).Unix.st_kind <> Unix.S_REG then raise (Error "input must be a regular file")
+  ) sources;
   let frontend = find_frontend () in
   let capture ?(limit=Sys.max_string_length) program args = Process.capture ~timeout:!timeout ~limit program args in
   let version = capture frontend ["--version"] in
   if not (contains version "Fil-C 0.687") then raise (Error "FILCC must select Fil-C 0.687; ordinary Clang is not accepted");
   let machine = String.trim (capture frontend ["-dumpmachine"]) in
   if machine <> "x86_64-unknown-linux-gnu" then raise (Error ("unsupported frontend target " ^ machine));
-  let dump extra = capture frontend (extra @ ["-x"; "c"; "-std=c11"; "-Werror";
+  let dump source extra = capture frontend (extra @ ["-x"; "c"; "-std=c11"; "-Werror";
     "-Wno-return-stack-address"; "-Wno-pointer-arith"; "-Wno-atomic-alignment"; "-Wno-unevaluated-expression";
-    "-ferror-limit=20"; "-fno-color-diagnostics";
+    "-Wno-extern-initializer"; "-ferror-limit=20"; "-fno-color-diagnostics";
     "-Xclang"; "-fdump-record-layouts-complete";
     "-Xclang"; "-ast-dump=json"; "-fsyntax-only"; source]) in
-  let content, frontend_layouts, bounds, aliases, inherited, adjusted, tree = prepare_frontend source (read source) dump in
-  let context = context source content frontend_layouts bounds aliases inherited adjusted tree in
-  let definitions = emit context in
+  let prepared = List.map (fun source -> source, prepare_frontend source (read source) (dump source)) sources in
+  let symbols = link_symbols (List.map (fun (_, (_, _, _, _, _, _, tree)) -> tree) prepared) in
+  let plural = List.length sources > 1 in
+  let contexts = List.mapi (fun index (source, (content, frontend_layouts, bounds, aliases, inherited, adjusted, tree)) ->
+    let namespace = if plural then "unit:" ^ string_of_int index ^ ":" else "" in
+    context namespace symbols source content frontend_layouts bounds aliases inherited adjusted tree) prepared in
+  let definitions = emit contexts in
   let generated = Runtime.source ^ "\n" ^ definitions in
+  let listed = String.concat ", " (List.map Filename.basename sources) in
   if !check then begin
-    Printf.printf "Checked %s\n" (Filename.basename source);
-    if !report then explain context
+    Printf.printf "Checked %s\n" listed;
+    if !report then List.iter explain contexts
   end else begin
+  let source = List.hd sources in
   if !output = "" then output := Filename.concat "build" (String.capitalize_ascii (Filename.remove_extension (Filename.basename source)) ^ ".hs");
   let output = output_path !output in
-  if same_file output source then raise (Error "output would overwrite the input source");
+  if List.exists (same_file output) sources then raise (Error "output would overwrite an input source");
   let build executable =
     let executable = output_path executable in
-    if same_file executable source || same_file executable output then raise (Error "executable would overwrite a source file");
+    if List.exists (same_file executable) sources || same_file executable output then raise (Error "executable would overwrite a source file");
     if String.trim (capture !ghc ["--numeric-version"]) <> "9.6.7" then raise (Error "GHC 9.6.7 is required");
     let workspace = temporary_directory (Filename.dirname executable) in
     Fun.protect ~finally:(fun () -> remove workspace) (fun () ->
@@ -2249,9 +2328,9 @@ let main () =
       Unix.rename target executable)
   in
   if !executable = "" then atomic_write output generated else build !executable;
-  Printf.printf "Compiled %s -> %s\n" (Filename.basename source) (Filename.basename output);
+  Printf.printf "Compiled %s -> %s\n" listed (Filename.basename output);
   if !executable <> "" then Printf.printf "Built %s with GHC\n" (Filename.basename !executable);
-  if !report then explain context
+  if !report then List.iter explain contexts
   end
 
 let () =
