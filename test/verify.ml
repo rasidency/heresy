@@ -252,6 +252,8 @@ let () =
     check "compound declarators preserve object constness" (contains lowered "readonly 1 0 1 5");
     check "generic selections retain lvalues without evaluating the controlling expression"
       (contains lowered "generic 0 12 33\n");
+    check "a statement expression can jump to its result label"
+      (contains lowered "nested label 3\n");
     check "inline record types retain layout for compound literals and type operands"
       (contains lowered "inline records 8 5 22 2 16\n");
     check "scoped typedefs retain their identity through array and pointer declarators"

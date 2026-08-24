@@ -697,16 +697,19 @@ selection condition entries = do
   result <- maybe (pure Next) (chain . map snd) selected
   pure (if result == Break then Next else result)
 
-dispatch :: Int -> [(Int, R Flow)] -> R Flow
-dispatch entry blocks = go entry
+dispatch :: (Int, [[Int]]) -> [R Flow] -> R Flow
+dispatch (entry, edges) actions
+  | length edges /= length actions = panic "incomplete control-flow graph"
+  | otherwise = go entry
   where
-    table = M.fromList blocks
+    table = M.fromDistinctAscList (zip [0 ..] (zip (map I.fromList edges) actions))
     go index = case M.lookup index table of
       Nothing -> panic "invalid control-flow target"
-      Just action -> do
+      Just (targets, action) -> do
         result <- action
         case result of
-          Jump next -> go next
+          Jump next | I.member next targets -> go next
+                    | otherwise -> panic "unlisted control-flow target"
           _ -> pure result
 
 indirectJump :: [(String, Int)] -> R Value -> R Flow

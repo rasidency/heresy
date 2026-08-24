@@ -113,6 +113,8 @@ int main(int argc, char **argv) {
     subtotal;
   }), default:99);
   printf("generic %d %d %d\n", effects, selected, evaluated);
+  int nested = ({ int value = 2; goto finish; value = 100; finish: value + 1; });
+  printf("nested label %d\n", nested);
   int inline_field = ((struct {char c; int value;}){1, 8}).value;
   unsigned int inline_bits = ((struct {unsigned :1; unsigned :0; unsigned value:3;}){.value=5}).value;
   int inline_member = ((struct {struct {int member;};}){.member=22}).member;

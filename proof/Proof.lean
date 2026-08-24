@@ -522,6 +522,28 @@ theorem atomic_pointer_compare_rejects (word : AtomicWord) (expected desired : P
       (false, atomic_pointer_read word, word) := by
   simp [atomic_pointer_compare, address]
 
+structure DispatchGraph where
+  entry : Nat
+  successors : List (List Nat)
+
+def valid_dispatch (graph : DispatchGraph) : Bool :=
+  decide (graph.entry < graph.successors.length) &&
+    graph.successors.all (fun row => row.all (fun target => decide (target < graph.successors.length)))
+
+inductive Reaches (graph : DispatchGraph) : Nat → Prop where
+  | entry : Reaches graph graph.entry
+  | jump {block target : Nat} {row : List Nat} :
+      Reaches graph block → graph.successors[block]? = some row → target ∈ row → Reaches graph target
+
+theorem dispatch_targets_exist (graph : DispatchGraph) (accepted : valid_dispatch graph = true)
+    (target : Nat) (reachable : Reaches graph target) :
+    target < graph.successors.length := by
+  simp [valid_dispatch, List.all_eq_true] at accepted
+  cases reachable with
+  | entry => exact accepted.1
+  | jump _ row_at member =>
+    exact accepted.2 _ (List.mem_of_getElem? row_at) _ member
+
 end Heresy
 
 #print axioms Heresy.lower_correct
@@ -545,3 +567,4 @@ end Heresy
 #print axioms Heresy.promoted_atomic_rejects_nonzero_padding
 #print axioms Heresy.atomic_pointer_snapshot
 #print axioms Heresy.atomic_pointer_compare_rejects
+#print axioms Heresy.dispatch_targets_exist

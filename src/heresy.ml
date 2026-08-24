@@ -118,14 +118,23 @@ let quote s =
   Buffer.add_char buffer '"'; Buffer.contents buffer
 let par s = "(" ^ s ^ ")"
 let join = String.concat ", "
-let rec walk f node =
-  f node;
-  let inner = match kind node, children node with
-    | "GenericSelectionExpr", inner -> List.filter (fun child -> Json.bool (field child "selected")) inner
-    | _, [] -> (match Json.list (field node "array_filler") with _ :: values -> values | [] -> [])
-    | _, inner -> inner
-  in
-  List.iter (walk f) inner
+let rec walk ?(through = fun _ -> true) f node =
+  if through node then begin
+    f node;
+    let inner = match kind node, children node with
+      | "GenericSelectionExpr", inner -> List.filter (fun child -> Json.bool (field child "selected")) inner
+      | _, [] -> (match Json.list (field node "array_filler") with _ :: values -> values | [] -> [])
+      | _, inner -> inner
+    in
+    List.iter (walk ~through f) inner
+  end
+
+let walk_flow f = walk ~through:(fun node -> kind node <> "StmtExpr") f
+
+let needs_dispatch body =
+  let graph = ref false in
+  walk_flow (fun node -> if List.mem (kind node) ["SwitchStmt"; "LabelStmt"; "GotoStmt"; "IndirectGotoStmt"] then graph := true) body;
+  !graph
 let read path = let channel = open_in_bin path in Fun.protect ~finally:(fun () -> close_in channel) (fun () -> really_input_string channel (in_channel_length channel))
 let write path content = let channel = open_out_bin path in Fun.protect ~finally:(fun () -> close_out channel) (fun () -> output_string channel content)
 let thread_functions = ["pthread_create"; "pthread_join"; "pthread_self"; "pthread_equal";
@@ -150,6 +159,7 @@ type context = {
   names : (string, string) Hashtbl.t;
   functions : Json.t list;
   globals : Json.t list;
+  graphs : (string * int * int list list) Queue.t;
   pure : (string, Json.t list * string) Hashtbl.t;
   constants : (string, string) Hashtbl.t;
   label_names : (string, string) Hashtbl.t;
@@ -996,17 +1006,22 @@ and expression context node =
   | ("ParenExpr" | "ConstantExpr"), [child] -> ex child
   | "GenericSelectionExpr", _ -> ex (selected_expression context node)
   | "StmtExpr", [block] when kind block = "CompoundStmt" ->
+      let rec trailing node = match node, children node with
+        | Json.Object fields, [child] when kind node = "LabelStmt" ->
+            let label, value = trailing child in
+            let child = Option.value label ~default:(Json.Object ["kind", Json.String "NullStmt"]) in
+            Some (Json.Object (("inner", Json.Array [child]) :: List.remove_assoc "inner" fields)), value
+        | _ -> None, node in
       let statements, result =
         if clean context t = "void" then children block, "pure noValue"
         else match List.rev (children block) with
-          | last :: prefix -> List.rev prefix, ex last
+          | last :: prefix ->
+              let label, value = trailing last in
+              List.rev_append prefix (Option.to_list label), ex value
           | [] -> fail context node "missing statement expression result"
       in
       let block = Json.Object ["kind", Json.String "CompoundStmt"; "inner", Json.Array statements] in
-      let graph = ref false in
-      walk (fun child ->
-        if List.mem (kind child) ["SwitchStmt"; "LabelStmt"; "GotoStmt"; "IndirectGotoStmt"] then graph := true) block;
-      let body = if !graph then control_flow context block else statement context block in
+      let body = if needs_dispatch block then control_flow context block else statement context block in
       "statementValue " ^ par body ^ " " ^ par result
   | "DeclRefExpr", _ ->
       let reference = field node "referencedDecl" in
@@ -1519,82 +1534,97 @@ and control_flow context body =
   let labels = Hashtbl.create 16 in
   let next_id = ref 0 and blocks = ref [] in
   let reserve () = let id = !next_id in incr next_id; id in
-  let define id action = blocks := (id, action) :: !blocks in
-  let block action = let id = reserve () in define id action; id in
+  let define id targets action = blocks := (id, targets, action) :: !blocks in
+  let block targets action = let id = reserve () in define id targets action; id in
   let jump id = "(pure (Jump " ^ string_of_int id ^ "))" in
   let located node action = "atFlow " ^ quote (loc context node) ^ " " ^ par action in
   let choose condition yes no =
     "branch " ^ par (expression context condition) ^ " " ^ jump yes ^ " " ^ jump no
   in
-  walk (fun node -> if kind node = "LabelStmt" then Hashtbl.add labels (text node "declId") (reserve ())) body;
+  walk_flow (fun node -> if kind node = "LabelStmt" then Hashtbl.add labels (text node "declId") (reserve ())) body;
   let target node key = match Hashtbl.find_opt labels (text node key) with
     | Some id -> id
     | None -> fail context node "unknown jump target"
   in
   let destinations = Hashtbl.to_seq labels |> List.of_seq |> List.sort (fun (_, a) (_, b) -> compare a b) in
   let destinations = List.filter_map (fun (id, block) ->
-    Option.map (fun name -> "(" ^ quote name ^ ", " ^ string_of_int block ^ ")") (Hashtbl.find_opt context.label_names id)
+    Option.map (fun name -> name, block) (Hashtbl.find_opt context.label_names id)
   ) destinations in
   let rec lower cases break continue next node =
     let descend = lower cases break continue in
     let redirect action =
       "redirectFlow " ^ string_of_int break ^ " " ^ string_of_int continue ^ " " ^ par action in
-    let edge action = block (redirect (located node action)) in
+    let define_edge id targets action =
+      define id (List.sort_uniq compare (break :: continue :: targets)) (redirect (located node action)) in
+    let edge targets action = let id = reserve () in define_edge id targets action; id in
     match kind node, children node with
     | "CompoundStmt", statements ->
         List.fold_left descend next (List.rev statements)
-    | "IfStmt", [condition; yes] -> edge (choose condition (descend next yes) next)
-    | "IfStmt", [condition; yes; no] -> edge (choose condition (descend next yes) (descend next no))
+    | "IfStmt", [condition; yes] ->
+        let yes = descend next yes in
+        edge [yes; next] (choose condition yes next)
+    | "IfStmt", [condition; yes; no] ->
+        let yes = descend next yes and no = descend next no in
+        edge [yes; no] (choose condition yes no)
     | "WhileStmt", [condition; loop] ->
         let test = reserve () in
         let first = lower cases next test test loop in
-        define test (redirect (located node (choose condition first next)));
+        define_edge test [first; next] (choose condition first next);
         test
     | "DoStmt", [loop; condition] ->
         let test = reserve () in
         let first = lower cases next test test loop in
-        define test (redirect (located node (choose condition first next)));
+        define_edge test [first; next] (choose condition first next);
         first
     | "ForStmt", [init; variable; condition; advance; loop] when kind variable = "" ->
         let test = reserve () in
         let advance = descend test advance in
         let first = lower cases next advance advance loop in
-        let condition = if kind condition = "" then jump first else choose condition first next in
-        define test (redirect (located node condition));
+        let targets, condition = if kind condition = "" then [first], jump first else [first; next], choose condition first next in
+        define_edge test targets condition;
         descend test init
     | "BreakStmt", _ -> break
     | "ContinueStmt", _ -> continue
     | "GotoStmt", _ -> target node "targetLabelDeclId"
     | "IndirectGotoStmt", [address] ->
-        edge ("indirectJump [" ^ join destinations ^ "] " ^ par (expression context address))
+        let entries = List.map (fun (name, target) -> "(" ^ quote name ^ ", " ^ string_of_int target ^ ")") destinations in
+        edge (List.map snd destinations) ("indirectJump [" ^ join entries ^ "] " ^ par (expression context address))
     | "LabelStmt", [child] ->
         let id = target node "declId" in
-        define id (jump (descend next child));
+        let next = descend next child in
+        define id [next] (jump next);
         id
     | "SwitchStmt", [condition; body] ->
         let entries = ref [] in
         ignore (lower (Some entries) next continue next body);
-        let default = if List.exists (fun (label, _) -> label = "Nothing") !entries then []
-          else ["(Nothing, " ^ jump next ^ ")"] in
-        let entries = List.map (fun (label, start) -> "(" ^ label ^ ", " ^ jump start ^ ")") !entries in
-        edge ("selection " ^ par (expression context condition) ^ " [" ^ join (entries @ default) ^ "]")
+        let entries = if List.exists (fun (label, _) -> label = "Nothing") !entries then !entries
+          else !entries @ ["Nothing", next] in
+        let actions = List.map (fun (label, start) -> "(" ^ label ^ ", " ^ jump start ^ ")") entries in
+        edge (List.map snd entries) ("selection " ^ par (expression context condition) ^ " [" ^ join actions ^ "]")
     | "CaseStmt", ([lo; child] | [lo; _; child]) ->
         let hi = match children node with [_; hi; _] -> hi | _ -> lo in
         let label = "Just (" ^ par (expression context lo) ^ ", " ^ par (expression context hi) ^ ")" in
         case_target cases node label (descend next child)
     | "DefaultStmt", [child] -> case_target cases node "Nothing" (descend next child)
     | ("NullStmt" | ""), _ -> next
-    | _, _ -> block (redirect ("chain [" ^ par (statement context node) ^ ", " ^ jump next ^ "]"))
+    | _, _ -> edge [next] ("chain [" ^ par (statement context node) ^ ", " ^ jump next ^ "]")
   and case_target cases node label start =
     match cases with
     | None -> fail context node "case outside a switch"
     | Some entries -> entries := (label, start) :: !entries; start
   in
-  let finish = block "pure Next" in
-  let escape flow = block ("pure " ^ flow) in
+  let finish = block [] "pure Next" in
+  let escape flow = block [] ("pure " ^ flow) in
   let entry = lower None (escape "Break") (escape "Continue") finish body in
-  let blocks = List.rev_map (fun (id, action) -> "(" ^ string_of_int id ^ ", " ^ par action ^ ")") !blocks in
-  "dispatch " ^ string_of_int entry ^ " [" ^ join blocks ^ "]"
+  let blocks = List.sort (fun (left, _, _) (right, _, _) -> compare left right) !blocks in
+  let targets = List.mapi (fun index (id, targets, _) ->
+    if index <> id || List.exists (fun target -> target < 0 || target >= !next_id) targets then
+      fail context body "invalid lowered control-flow graph";
+    targets) blocks in
+  if List.length blocks <> !next_id then fail context body "incomplete lowered control-flow graph";
+  let graph = "g_" ^ String.map (function ':' -> '_' | ch -> ch) context.namespace ^ string_of_int (Queue.length context.graphs) in
+  Queue.add (graph, entry, targets) context.graphs;
+  "dispatch " ^ graph ^ " [" ^ join (List.map (fun (_, _, action) -> par action) blocks) ^ "]"
 
 let rec pure_expression context params node =
   if contains (ty node) "volatile" || contains (ty node) "_Atomic" then raise (Error "effectful scalar access");
@@ -1680,7 +1710,7 @@ let context namespace symbols source content frontend_layouts vla_bounds vla_ali
   let statics = ref [] in
   List.iter (walk (fun node -> if kind node = "VarDecl" && text node "storageClass" = "static" then statics := node :: !statics)) functions;
   let globals = file_globals @ List.rev !statics in
-  let context = { source; content; namespace; symbols; internal_functions; aliases = Hashtbl.create 32; records = Hashtbl.create 8; layouts = Hashtbl.create 8; frontend_layouts; names = Hashtbl.create 64; functions; globals; pure = Hashtbl.create 8; constants = Hashtbl.create 32; label_names = Hashtbl.create 16; vla_bounds; vla_aliases; vla_inherited; vla_adjusted } in
+  let context = { source; content; namespace; symbols; internal_functions; aliases = Hashtbl.create 32; records = Hashtbl.create 8; layouts = Hashtbl.create 8; frontend_layouts; names = Hashtbl.create 64; functions; globals; graphs = Queue.create (); pure = Hashtbl.create 8; constants = Hashtbl.create 32; label_names = Hashtbl.create 16; vla_bounds; vla_aliases; vla_inherited; vla_adjusted } in
   List.iter (fun function_node ->
     walk (fun node -> if kind node = "AddrLabelExpr" then begin
       let id = text node "labelDeclId" in
@@ -1885,15 +1915,14 @@ let emit_unit add context =
             ("callArea <- argumentArea callArguments") ::
             ("let { namedTypes = [" ^ join (List.map (fun p -> ctype context (ty p)) params) ^ "] }") :: bindings
             else bindings in
-          let locals = ref [] and graph = ref false in
+          let locals = ref [] in
           walk (fun node ->
             if (kind node = "CompoundLiteralExpr" && not (Hashtbl.mem global_literals (text node "id"))) ||
               (kind node = "VarDecl" &&
                 (match Hashtbl.find_opt context.vla_bounds (text node "id") with Some (_, _, false) -> false | _ -> true) &&
                 not (List.mem (text node "storageClass") ["static"; "extern"])) then
-              locals := ("at " ^ quote (loc context node) ^ " (void (" ^ allocate "declare" node ^ "))") :: !locals;
-            if List.mem (kind node) ["SwitchStmt"; "GotoStmt"; "IndirectGotoStmt"; "LabelStmt"] then graph := true) body;
-          let body = if !graph then control_flow context body else statement context body in
+              locals := ("at " ^ quote (loc context node) ^ " (void (" ^ allocate "declare" node ^ "))") :: !locals) body;
+          let body = if needs_dispatch body then control_flow context body else statement context body in
           "frame (do { " ^ String.concat "; " (bindings @ List.rev !locals @ [body]) ^ " })"
     in
     let body = match result with
@@ -1931,7 +1960,12 @@ let emit_unit add context =
   in
   let shared, local = List.partition (fun g -> text g "tls" = "") context.globals in
   initialise_globals "Globals" shared;
-  initialise_globals "Thread" local
+  initialise_globals "Thread" local;
+  Queue.iter (fun (name, entry, targets) ->
+    let row targets = "[" ^ join (List.map string_of_int targets) ^ "]" in
+    add (name ^ " :: (Int, [[Int]])");
+    add (name ^ " = (" ^ string_of_int entry ^ ", [" ^ join (List.map row targets) ^ "])")
+  ) context.graphs
 
 let emit contexts =
   let functions = List.concat_map (fun context ->

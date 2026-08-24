@@ -150,16 +150,52 @@ def validate_kernels (frontend generated : String) : Except String Nat := do
     throw "unaccounted or missing kernel declarations"
   else pure checked
 
+private def read_dispatch (row : String) : Except String DispatchGraph := do
+  unless row.endsWith ")" do
+    throw "invalid dispatch equation"
+  let tree ← Json.parse ("[" ++ row.take (row.length - 1) ++ "]")
+  match (← tree.getArr?).toList with
+  | [entry, successors] =>
+    let entry ← entry.getNat?
+    let rows ← (← successors.getArr?).toList.mapM fun targets => do
+      (← targets.getArr?).toList.mapM Json.getNat?
+    pure ⟨entry, rows⟩
+  | _ => throw "invalid dispatch graph"
+
+def validate_dispatches (generated : String) : Except String Nat := do
+  let lines := (generated.splitOn "\n").filter (·.startsWith "g_")
+  let mut names : List String := []
+  let mut signatures : List String := []
+  for line in lines do
+    let signature := " :: (Int, [[Int]])"
+    if line.endsWith signature then
+      signatures := line.take (line.length - signature.length) :: signatures
+    else
+      match line.splitOn " = (" with
+      | [name, row] =>
+        let graph ← read_dispatch row
+        unless valid_dispatch graph do
+          throw ("dispatch target outside its graph: " ++ name)
+        names := name :: names
+      | _ => throw "invalid dispatch declaration"
+  if names.isEmpty || !decide names.Nodup || names != signatures then
+    throw "unaccounted or missing dispatch declarations"
+  else pure names.length
+
 end Heresy
 
 #print axioms Heresy.kernel_certificate_sound
 
 def main (arguments : List String) : IO UInt32 := do
   match arguments with
+  | ["dispatch", haskell] =>
+    match Heresy.validate_dispatches (← IO.FS.readFile haskell) with
+    | .ok count => IO.println s!"checked {count} emitted control-flow graph(s)"; pure 0
+    | .error message => IO.eprintln message; pure 1
   | [ast, haskell] =>
     let frontend ← IO.FS.readFile ast
     let generated ← IO.FS.readFile haskell
     match Heresy.validate_kernels frontend generated with
     | .ok count => IO.println s!"checked {count} emitted integer kernel(s)"; pure 0
     | .error message => IO.eprintln message; pure 1
-  | _ => IO.eprintln "usage: certificate AST.json Module.hs"; pure 2
+  | _ => IO.eprintln "usage: certificate AST.json Module.hs | certificate dispatch Module.hs"; pure 2
