@@ -182,6 +182,36 @@ def validate_dispatches (generated : String) : Except String Nat := do
     throw "unaccounted or missing dispatch declarations"
   else pure names.length
 
+def validates_shadow_copy (generated : String) : Bool :=
+  let sections := generated.splitOn "\n\n"
+  let range := String.intercalate "\n" [
+    "aggregateBytes :: Int -> Int -> M.IntMap a -> M.IntMap a",
+    "aggregateBytes start count values =",
+    "  M.mapKeysMonotonic (subtract start) (M.takeWhileAntitone (< start + count) (M.dropWhileAntitone (< start) values))"]
+  let shadow := String.intercalate "\n" [
+    "aggregateShadow :: Int -> Int -> M.IntMap Value -> M.IntMap Value",
+    "aggregateShadow start count = aggregateBytes start (max 0 (count - 7))"]
+  let copy := String.intercalate "\n" [
+    "copyMemory :: Value -> Value -> Int -> R Value",
+    "copyMemory destination _ 0 = pure destination",
+    "copyMemory destination source count = locked $ do",
+    "  when (count < 0) (panic \"invalid memory copy length\")",
+    "  (_, src, srcOffset) <- checked count source",
+    "  (ident, dst, dstOffset) <- checked count destination",
+    "  when (readOnly dst) (panic \"write to read-only memory\")",
+    "  let end = dstOffset + count",
+    "      payload = M.mapKeysMonotonic (+ dstOffset) (aggregateBytes srcOffset count (bytes src))",
+    "      untouchedBytes = M.union (M.takeWhileAntitone (< dstOffset) (bytes dst)) (M.dropWhileAntitone (< end) (bytes dst))",
+    "      aligned = srcOffset `mod` 8 == dstOffset `mod` 8",
+    "      caps = if aligned then M.mapKeysMonotonic (+ dstOffset) (aggregateShadow srcOffset count (shadow src)) else M.empty",
+    "      outside slot = slot <= dstOffset - 8 || slot >= end",
+    "  writeObject ident (dst { bytes = M.union payload untouchedBytes",
+    "                         , shadow = M.union caps (M.filterWithKey (\\slot _ -> outside slot) (shadow dst))",
+    "                         , atomicSlots = I.filter outside (atomicSlots dst) })",
+    "  event (\"copy \" ++ show count ++ \" bytes to #\" ++ show ident ++ \"+\" ++ show dstOffset)",
+    "  pure destination"]
+  [range, shadow, copy].all sections.contains
+
 end Heresy
 
 #print axioms Heresy.kernel_certificate_sound
@@ -192,10 +222,14 @@ def main (arguments : List String) : IO UInt32 := do
     match Heresy.validate_dispatches (← IO.FS.readFile haskell) with
     | .ok count => IO.println s!"checked {count} emitted control-flow graph(s)"; pure 0
     | .error message => IO.eprintln message; pure 1
+  | ["memory", haskell] =>
+    if Heresy.validates_shadow_copy (← IO.FS.readFile haskell) then
+      IO.println "checked shadow copy equations"; pure 0
+    else IO.eprintln "shadow copy differs from the model"; pure 1
   | [ast, haskell] =>
     let frontend ← IO.FS.readFile ast
     let generated ← IO.FS.readFile haskell
     match Heresy.validate_kernels frontend generated with
     | .ok count => IO.println s!"checked {count} emitted integer kernel(s)"; pure 0
     | .error message => IO.eprintln message; pure 1
-  | _ => IO.eprintln "usage: certificate AST.json Module.hs | certificate dispatch Module.hs"; pure 2
+  | _ => IO.eprintln "usage: certificate AST.json Module.hs | certificate (dispatch|memory) Module.hs"; pure 2

@@ -544,6 +544,46 @@ theorem dispatch_targets_exist (graph : DispatchGraph) (accepted : valid_dispatc
   | jump _ row_at member =>
     exact accepted.2 _ (List.mem_of_getElem? row_at) _ member
 
+def intmap_shadow_copy (source destination : Int → Option α)
+    (source_offset destination_offset count slot : Int) : Option α :=
+  if count = 0 then destination slot
+  else
+    let copied :=
+      if (destination_offset ≤ slot ∧ slot < destination_offset + max 0 (count - 7)) ∧
+          source_offset % 8 = destination_offset % 8 then
+        source (source_offset + (slot - destination_offset))
+      else none
+    copied.or (if slot ≤ destination_offset - 8 ∨ destination_offset + count ≤ slot then
+      destination slot else none)
+
+def capability_shadow_copy (source destination : Int → Option α)
+    (source_offset destination_offset count slot : Int) : Option α :=
+  if count = 0 ∨ slot + 8 ≤ destination_offset ∨ destination_offset + count ≤ slot then
+    destination slot
+  else if (destination_offset ≤ slot ∧ slot + 8 ≤ destination_offset + count) ∧
+      source_offset % 8 = destination_offset % 8 then
+    source (source_offset + (slot - destination_offset))
+  else none
+
+theorem shadow_copy_refines (source destination : Int → Option α)
+    (source_offset destination_offset count slot : Int) (nonnegative : 0 ≤ count) :
+    intmap_shadow_copy source destination source_offset destination_offset count slot =
+      capability_shadow_copy source destination source_offset destination_offset count slot := by
+  by_cases empty : count = 0
+  · simp [intmap_shadow_copy, capability_shadow_copy, empty]
+  have outside : (slot ≤ destination_offset - 8 ∨ destination_offset + count ≤ slot) ↔
+      (slot + 8 ≤ destination_offset ∨ destination_offset + count ≤ slot) := by omega
+  have contained : (destination_offset ≤ slot ∧ slot < destination_offset + max 0 (count - 7)) ↔
+      (destination_offset ≤ slot ∧ slot + 8 ≤ destination_offset + count) := by omega
+  simp only [intmap_shadow_copy, capability_shadow_copy, empty, false_or, ↓reduceIte, outside, contained]
+  by_cases copied : (destination_offset ≤ slot ∧ slot + 8 ≤ destination_offset + count) ∧
+      source_offset % 8 = destination_offset % 8
+  · have span := copied.1
+    have intersects : ¬ (slot + 8 ≤ destination_offset ∨ destination_offset + count ≤ slot) := by
+      omega
+    simp [copied, intersects]
+  · simp [copied]
+
 end Heresy
 
 #print axioms Heresy.lower_correct
@@ -568,3 +608,4 @@ end Heresy
 #print axioms Heresy.atomic_pointer_snapshot
 #print axioms Heresy.atomic_pointer_compare_rejects
 #print axioms Heresy.dispatch_targets_exist
+#print axioms Heresy.shadow_copy_refines
