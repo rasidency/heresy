@@ -22,6 +22,8 @@ def render_target : Target → String
     "(" ++ render_target left ++ ") " ++ operator_text operator ++ " (" ++ render_target right ++ ")"
   | .wrap width expression =>
     "normalise " ++ toString width ++ " False (" ++ render_target expression ++ ")"
+  | .conditional condition yes no =>
+    "if (" ++ render_target condition ++ ") == 0 then (" ++ render_target no ++ ") else (" ++ render_target yes ++ ")"
 
 def validates_kernel (expression : Source) (body : String) : Bool :=
   body == render_target (lower expression)
@@ -83,6 +85,9 @@ private def read_expression (parameters : List String) : Nat → Json → Except
       .binary <$> read_operator (field_text node "opcode")
               <*> read_expression parameters depth left
               <*> read_expression parameters depth right
+    | "ConditionalOperator", [condition, yes, no] =>
+      .conditional <$> read_expression parameters depth condition
+                   <*> read_expression parameters depth yes <*> read_expression parameters depth no
     | _, _ => throw "unsupported kernel expression"
 
 private def kernel_symbol (name : String) : String :=
@@ -212,9 +217,55 @@ def validates_shadow_copy (generated : String) : Bool :=
     "  pure destination"]
   [range, shadow, copy].all sections.contains
 
+private def closed_source (frontend : String) : Except String Source := do
+  let tree ← Json.parse frontend
+  unless field_text tree "kind" == "TranslationUnitDecl" do
+    throw "expected a translation unit"
+  let declarations := (child_nodes tree).filter fun node =>
+    field_text node "kind" != "EmptyDecl" &&
+      !(field_text node "kind" == "TypedefDecl" && json_field node "isImplicit" == .bool true)
+  let [main] := declarations | throw "closed program must define only main"
+  unless field_text main "kind" == "FunctionDecl" && field_text main "name" == "main" &&
+      type_spelling main == "int (void)" do
+    throw "closed program must define int main(void)"
+  let [body] := child_nodes main | throw "invalid closed main definition"
+  let [statement] := child_nodes body | throw "closed main must contain one return"
+  let [cast] := child_nodes statement | throw "closed main must return one value"
+  let [expression] := child_nodes cast | throw "closed main must cast its return value to int"
+  unless field_text body "kind" == "CompoundStmt" && field_text statement "kind" == "ReturnStmt" &&
+      field_text cast "kind" == "CStyleCastExpr" && field_text cast "castKind" == "IntegralCast" &&
+      type_spelling cast == "int" do
+    throw "closed main must return an unsigned long expression cast to int"
+  read_expression [] frontend.length expression
+
+def render_program (body : Target) : String := String.intercalate "\n" [
+  "module Main where", "",
+  "import Data.Bits", "import System.Exit", "",
+  "normalise :: Int -> Bool -> Integer -> Integer",
+  "normalise width _ value = value `mod` (2 ^ width)", "",
+  "exitStatus :: Integer -> ExitCode",
+  "exitStatus value = case fromInteger (value `mod` 256) of",
+  "  0 -> ExitSuccess", "  code -> ExitFailure code", "",
+  "main :: IO ()", "main = exitWith (exitStatus (" ++ render_target body ++ "))", ""]
+
+def validates_program (body : Source) (generated : String) : Bool :=
+  generated == render_program (lower body)
+
+theorem program_certificate_sound (body : Source) (generated : String)
+    (accepted : validates_program body generated = true) :
+    ∃ target : Target, generated = render_program target ∧ target_status target = source_status body := by
+  refine ⟨lower body, ?_, lower_program_correct body⟩
+  simpa [validates_program] using accepted
+
+def validate_program (frontend generated : String) : Except String Unit := do
+  let body ← closed_source frontend
+  unless validates_program body generated do
+    throw "emitted program differs from verified lowering"
+
 end Heresy
 
 #print axioms Heresy.kernel_certificate_sound
+#print axioms Heresy.program_certificate_sound
 
 def main (arguments : List String) : IO UInt32 := do
   match arguments with
@@ -226,10 +277,16 @@ def main (arguments : List String) : IO UInt32 := do
     if Heresy.validates_shadow_copy (← IO.FS.readFile haskell) then
       IO.println "checked shadow copy equations"; pure 0
     else IO.eprintln "shadow copy differs from the model"; pure 1
+  | ["program", ast, haskell] =>
+    match Heresy.validate_program (← IO.FS.readFile ast) (← IO.FS.readFile haskell) with
+    | .ok () => IO.println "checked emitted closed program and exit status"; pure 0
+    | .error message => IO.eprintln message; pure 1
   | [ast, haskell] =>
     let frontend ← IO.FS.readFile ast
     let generated ← IO.FS.readFile haskell
     match Heresy.validate_kernels frontend generated with
     | .ok count => IO.println s!"checked {count} emitted integer kernel(s)"; pure 0
     | .error message => IO.eprintln message; pure 1
-  | _ => IO.eprintln "usage: certificate AST.json Module.hs | certificate (dispatch|memory) Module.hs"; pure 2
+  | _ =>
+    IO.eprintln "usage: certificate [program] AST.json Module.hs | certificate (dispatch|memory) Module.hs"
+    pure 2

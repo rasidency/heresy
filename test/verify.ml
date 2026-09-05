@@ -203,6 +203,11 @@ let () =
     write "build/duplicate.c" "int shared = 1;";
     let code, _, errors = run compiler (units @ ["build/duplicate.c"; "--check"]) in
     check "linking rejects duplicate external definitions" (code <> 0 && contains errors "multiple definitions of shared");
+    ignore (success compiler ["test/closed.c"; "--closed"; "--build"; "build/exitstatus"]);
+    ignore (success frontend ["-std=c11"; "-O1"; "test/closed.c"; "-o"; "build/exitstatusref"]);
+    let status, output, errors = run "build/exitstatus" [] in
+    check "closed integer program preserves native process status"
+      (status = 37 && output = "" && errors = "" && (status, output, errors) = run "build/exitstatusref" []);
     check "value copies preserve ownership and IEEE scalar behaviour"
       (contains values "copies 11 12 1 42 1 10\nmembers 28 42 -3\nieee 4b800000 1 8000000000000000 1 1 1 0 -3\n" &&
        contains values "decimal -00003.50 2.67 2 4 -0.000000       inf\nliveness 0 0\n");

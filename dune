@@ -8,6 +8,6 @@
 
 (rule
  (alias runtest)
- (deps (source_tree examples) (source_tree test/linkage) test/lowering.c test/values.c)
+ (deps (source_tree examples) (source_tree test/linkage) test/closed.c test/lowering.c test/values.c)
  (action (run %{exe:test/verify.exe} %{exe:src/heresy.exe} %{exe:test/fault.exe})))
 

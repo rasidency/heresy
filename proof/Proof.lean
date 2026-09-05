@@ -70,43 +70,56 @@ inductive Source where
   | constant (value : Int)
   | parameter (index : Nat)
   | binary (operator : Operator) (left right : Source)
+  | conditional (condition yes no : Source)
 
 inductive Target where
   | constant (value : Int)
   | parameter (index : Nat)
   | binary (operator : Operator) (left right : Target)
   | wrap (width : Nat) (body : Target)
+  | conditional (condition yes no : Target)
 
 def source_eval (parameters : Nat → Int) : Source → Int
   | .constant value => value
   | .parameter index => parameters index
   | .binary operator left right =>
     unsigned 64 (operate operator (source_eval parameters left) (source_eval parameters right))
+  | .conditional condition yes no =>
+    if source_eval parameters condition = 0 then source_eval parameters no else source_eval parameters yes
 
 def target_eval (parameters : Nat → Int) : Target → Int
   | .constant value => value
   | .parameter index => parameters index
   | .binary operator left right => operate operator (target_eval parameters left) (target_eval parameters right)
   | .wrap width body => unsigned width (target_eval parameters body)
+  | .conditional condition yes no =>
+    if target_eval parameters condition = 0 then target_eval parameters no else target_eval parameters yes
 
 def lower : Source → Target
   | .constant value => .constant value
   | .parameter index => .parameter index
   | .binary operator left right => .wrap 64 (.binary operator (lower left) (lower right))
+  | .conditional condition yes no => .conditional (lower condition) (lower yes) (lower no)
 
 def admissible : Source → Prop
   | .constant value => 0 ≤ value ∧ value < modulus 64
   | .parameter _ => True
   | .binary _ left right => admissible left ∧ admissible right
+  | .conditional condition yes no => admissible condition ∧ admissible yes ∧ admissible no
 
 theorem source_eval_bounds (expression : Source) (parameters : Nat → Int)
     (valid : admissible expression)
     (bounded : ∀ index, 0 ≤ parameters index ∧ parameters index < modulus 64) :
     0 ≤ source_eval parameters expression ∧ source_eval parameters expression < modulus 64 := by
-  cases expression with
+  induction expression with
   | constant value => exact valid
   | parameter index => exact bounded index
-  | binary operator left right => exact unsigned_bounds 64 _
+  | binary _ _ _ _ _ => exact unsigned_bounds 64 _
+  | conditional _ _ _ _ yes_bounded no_bounded =>
+    simp only [source_eval]
+    split
+    · exact no_bounded valid.2.2
+    · exact yes_bounded valid.2.1
 
 theorem lower_correct (expression : Source) (parameters : Nat → Int) :
     target_eval parameters (lower expression) = source_eval parameters expression := by
@@ -115,6 +128,8 @@ theorem lower_correct (expression : Source) (parameters : Nat → Int) :
   | parameter index => rfl
   | binary operator left right left_correct right_correct =>
     simp only [lower, target_eval, source_eval, left_correct, right_correct]
+  | conditional condition yes no condition_correct yes_correct no_correct =>
+    simp only [lower, target_eval, source_eval, condition_correct, yes_correct, no_correct]
 
 theorem lowered_bounds (expression : Source) (parameters : Nat → Int)
     (valid : admissible expression)
@@ -123,6 +138,24 @@ theorem lowered_bounds (expression : Source) (parameters : Nat → Int)
       target_eval parameters (lower expression) < modulus 64 := by
   rw [lower_correct]
   exact source_eval_bounds expression parameters valid bounded
+
+def source_status (body : Source) : Int := unsigned 8 (signed 32 (source_eval (fun _ => 0) body))
+
+def target_status (body : Target) : Int := unsigned 8 (target_eval (fun _ => 0) body)
+
+private theorem exit_status_truncation (value : Int) : unsigned 8 (signed 32 value) = unsigned 8 value := by
+  have divides : modulus 8 ∣ modulus 32 := ⟨16777216, by decide⟩
+  have wrap : unsigned 8 (unsigned 32 value) = unsigned 8 value := Int.emod_emod_of_dvd value divides
+  unfold signed
+  dsimp only
+  split
+  · change (unsigned 32 value - modulus 32) % modulus 8 = value % modulus 8
+    rw [Int.sub_emod, Int.emod_eq_zero_of_dvd divides, Int.sub_zero, Int.emod_emod]
+    exact wrap
+  · exact wrap
+
+theorem lower_program_correct (body : Source) : target_status (lower body) = source_status body := by
+  simp only [target_status, lower_correct, source_status, exit_status_truncation]
 
 structure Object where
   base : Int
@@ -609,3 +642,4 @@ end Heresy
 #print axioms Heresy.atomic_pointer_compare_rejects
 #print axioms Heresy.dispatch_targets_exist
 #print axioms Heresy.shadow_copy_refines
+#print axioms Heresy.lower_program_correct

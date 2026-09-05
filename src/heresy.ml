@@ -1626,16 +1626,20 @@ and control_flow context body =
   Queue.add (graph, entry, targets) context.graphs;
   "dispatch " ^ graph ^ " [" ^ join (List.map (fun (_, _, action) -> par action) blocks) ^ "]"
 
-let rec pure_expression context params node =
+let rec pure_expression ?(closed = false) context params node =
   if contains (ty node) "volatile" || contains (ty node) "_Atomic" then raise (Error "effectful scalar access");
-  if scalar context (ty node) <> (64, false) then raise (Error "pure recovery requires unsigned long arithmetic");
-  let ex = pure_expression context params in
+  if (closed && ty node <> "unsigned long") || scalar context (ty node) <> (64, false) then
+    raise (Error "pure recovery requires unsigned long arithmetic");
+  let ex = pure_expression ~closed context params in
   match kind node, children node with
   | "IntegerLiteral", _ -> text node "value"
   | "DeclRefExpr", _ ->
       begin match List.assoc_opt (text (field node "referencedDecl") "id") params with
       | Some p -> p | None -> raise (Error "pure expression references external state") end
-  | ("ParenExpr" | "ImplicitCastExpr"), [child] -> ex child
+  | "ParenExpr", [child] -> ex child
+  | "ImplicitCastExpr", [child] when not closed || List.mem (text node "castKind") ["LValueToRValue"; "NoOp"] -> ex child
+  | "ConditionalOperator", [condition; yes; no] ->
+      "if " ^ par (ex condition) ^ " == 0 then " ^ par (ex no) ^ " else " ^ par (ex yes)
   | "BinaryOperator", [left; right] ->
       let operator = match text node "opcode" with
         | "+" -> "+" | "-" -> "-" | "*" -> "*" | "^" -> "`xor`" | "&" -> ".&." | "|" -> ".|."
@@ -2290,13 +2294,48 @@ let prepare_frontend source content dump =
     end) tree;
   content, layouts, bounds, aliases, inherited, adjusted, tree
 
+let emit_closed contexts trees =
+  let declarations tree = List.filter (fun node -> kind node <> "EmptyDecl" &&
+    not (kind node = "TypedefDecl" && Json.bool (field node "isImplicit"))) (children tree) in
+  match contexts, trees with
+  | [context], [tree] when kind tree = "TranslationUnitDecl" ->
+      let main = match declarations tree with
+        | [main] when kind main = "FunctionDecl" && text main "name" = "main" && ty main = "int (void)" -> main
+        | _ -> raise (Error "closed compilation requires only an int main(void) definition") in
+      let return = match children main with
+        | [body] when kind body = "CompoundStmt" -> children body
+        | _ -> [] in
+      let expression = match return with
+        | [node] when kind node = "ReturnStmt" ->
+            begin match children node with
+            | [cast] when kind cast = "CStyleCastExpr" && text cast "castKind" = "IntegralCast" && ty cast = "int" -> children cast
+            | _ -> [] end
+        | _ -> [] in
+      let body = match expression with
+        | [value] when ty value = "unsigned long" -> pure_expression ~closed:true context [] value
+        | _ -> fail context main "closed main must return an unsigned long expression cast to int" in
+      String.concat "\n" [
+        "module Main where"; "";
+        "import Data.Bits";
+        "import System.Exit"; "";
+        "normalise :: Int -> Bool -> Integer -> Integer";
+        "normalise width _ value = value `mod` (2 ^ width)"; "";
+        "exitStatus :: Integer -> ExitCode";
+        "exitStatus value = case fromInteger (value `mod` 256) of";
+        "  0 -> ExitSuccess";
+        "  code -> ExitFailure code"; "";
+        "main :: IO ()";
+        "main = exitWith (exitStatus " ^ par body ^ ")"; ""]
+  | _ -> raise (Error "closed compilation requires one translation unit")
+
 let main () =
   let sources = ref [] and output = ref "" and executable = ref "" and report = ref false in
-  let check = ref false and timeout = ref 0. and ghc = ref "ghc" in
+  let check = ref false and closed = ref false and timeout = ref 0. and ghc = ref "ghc" in
   let specs = [
     "-o", Arg.Set_string output, "FILE standalone generated Haskell";
     "--build", Arg.Set_string executable, "FILE executable output";
     "--check", Arg.Set check, " validate the supported language subset without writing output";
+    "--closed", Arg.Set closed, " lower a closed integer program for whole-program certification";
     "--explain", Arg.Set report, " report lowering decisions";
     "--timeout", Arg.Set_float timeout, "SECONDS optional tool deadline, zero disables it";
     "--ghc", Arg.Set_string ghc, "PROGRAM select GHC 9.6.7";
@@ -2324,13 +2363,14 @@ let main () =
     "-Xclang"; "-fdump-record-layouts-complete";
     "-Xclang"; "-ast-dump=json"; "-fsyntax-only"; source]) in
   let prepared = List.map (fun source -> source, prepare_frontend source (read source) (dump source)) sources in
-  let symbols = link_symbols (List.map (fun (_, (_, _, _, _, _, _, tree)) -> tree) prepared) in
+  let trees = List.map (fun (_, (_, _, _, _, _, _, tree)) -> tree) prepared in
+  let symbols = link_symbols trees in
   let plural = List.length sources > 1 in
   let contexts = List.mapi (fun index (source, (content, frontend_layouts, bounds, aliases, inherited, adjusted, tree)) ->
     let namespace = if plural then "unit:" ^ string_of_int index ^ ":" else "" in
     context namespace symbols source content frontend_layouts bounds aliases inherited adjusted tree) prepared in
-  let definitions = emit contexts in
-  let generated = Runtime.source ^ "\n" ^ definitions in
+  let definitions = if !closed then emit_closed contexts trees else emit contexts in
+  let generated = if !closed then definitions else Runtime.source ^ "\n" ^ definitions in
   let listed = String.concat ", " (List.map Filename.basename sources) in
   if !check then begin
     Printf.printf "Checked %s\n" listed;
@@ -2353,11 +2393,16 @@ let main () =
         let code = Process.run ~timeout:!timeout !ghc args in
         if code <> 0 then raise (Error ("GHC exited with status " ^ string_of_int code))
       in
-      let support = compiled_support !ghc (String.trim (capture !ghc ["--print-libdir"])) options run in
-      List.iter (fun name -> Unix.symlink (Filename.concat support name) (Filename.concat workspace name)) ["Heap.hi"; "Heap.o"];
-      write main ("module Main where\n\nimport Control.Monad (void)\nimport Data.Bits\nimport Heap\n\n" ^ definitions);
-      run (options @ ["-i"; "-i" ^ workspace; "-outputdir"; workspace; "-c"; main]);
-      run (options @ [Filename.concat workspace "Main.o"; Filename.concat workspace "Heap.o"; "-o"; target]);
+      if !closed then begin
+        write main generated;
+        run (options @ ["-outputdir"; workspace; main; "-o"; target])
+      end else begin
+        let support = compiled_support !ghc (String.trim (capture !ghc ["--print-libdir"])) options run in
+        List.iter (fun name -> Unix.symlink (Filename.concat support name) (Filename.concat workspace name)) ["Heap.hi"; "Heap.o"];
+        write main ("module Main where\n\nimport Control.Monad (void)\nimport Data.Bits\nimport Heap\n\n" ^ definitions);
+        run (options @ ["-i"; "-i" ^ workspace; "-outputdir"; workspace; "-c"; main]);
+        run (options @ [Filename.concat workspace "Main.o"; Filename.concat workspace "Heap.o"; "-o"; target])
+      end;
       atomic_write output generated;
       Unix.rename target executable)
   in
