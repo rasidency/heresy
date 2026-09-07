@@ -187,6 +187,24 @@ def validate_dispatches (generated : String) : Except String Nat := do
     throw "unaccounted or missing dispatch declarations"
   else pure names.length
 
+def validates_access (generated : String) : Bool :=
+  let sections := generated.splitOn "\n\n"
+  let lookup := String.intercalate "\n" [
+    "readObject :: Capability -> R Object",
+    "readObject NoCapability = panic \"access through a pointer with no allocation capability\"",
+    "readObject (Capability _ reference) = liftIO (readIORef reference)"]
+  let check := String.intercalate "\n" [
+    "checked :: Int -> Value -> R (Capability, Object, Int)",
+    "checked size (Pointer capability raw) = do",
+    "  object <- readObject capability",
+    "  unless (live object) (panic (\"use after free of allocation #\" ++ show capability ++ \"; allocated at \" ++ origin object))",
+    "  let displacement = raw - base object",
+    "  when (size < 0 || displacement < 0 || displacement > toInteger (extent object) || toInteger size > toInteger (extent object) - displacement)",
+    "    (panic (\"out of bounds in allocation #\" ++ show capability ++ \": offset \" ++ show displacement ++ \", access \" ++ show size ++ \", extent \" ++ show (extent object)))",
+    "  pure (capability, object, fromInteger displacement)",
+    "checked _ _ = panic \"memory access requires a data pointer\""]
+  [lookup, check].all sections.contains
+
 def validates_shadow_copy (generated : String) : Bool :=
   let sections := generated.splitOn "\n\n"
   let range := String.intercalate "\n" [
@@ -274,9 +292,12 @@ def main (arguments : List String) : IO UInt32 := do
     | .ok count => IO.println s!"checked {count} emitted control-flow graph(s)"; pure 0
     | .error message => IO.eprintln message; pure 1
   | ["memory", haskell] =>
-    if Heresy.validates_shadow_copy (← IO.FS.readFile haskell) then
-      IO.println "checked shadow copy equations"; pure 0
-    else IO.eprintln "shadow copy differs from the model"; pure 1
+    let generated ← IO.FS.readFile haskell
+    if !Heresy.validates_access generated then
+      IO.eprintln "memory access differs from the model"; pure 1
+    else if !Heresy.validates_shadow_copy generated then
+      IO.eprintln "shadow copy differs from the model"; pure 1
+    else IO.println "checked access and shadow copy equations"; pure 0
   | ["program", ast, haskell] =>
     match Heresy.validate_program (← IO.FS.readFile ast) (← IO.FS.readFile haskell) with
     | .ok () => IO.println "checked emitted closed program and exit status"; pure 0

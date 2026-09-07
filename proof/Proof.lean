@@ -204,6 +204,59 @@ theorem checked_span (memory : Memory) (pointer : Pointer) (count : Nat) (object
   unfold accessible at valid
   exact ⟨valid.1, valid.2.1, by omega⟩
 
+inductive AccessFault where
+  | notPointer | noCapability | dead | bounds
+  deriving DecidableEq
+
+def runtime_checked (memory : Memory) (address : Option Pointer) (count : Int) :
+    Except AccessFault (Object × Nat) :=
+  match address with
+  | none => .error .notPointer
+  | some pointer =>
+    match memory pointer.capability with
+    | none => .error .noCapability
+    | some object =>
+      if object.live = false then .error .dead
+      else
+        let offset := pointer.address - object.base
+        if count < 0 ∨ offset < 0 ∨ (object.size : Int) < offset ∨
+            (object.size : Int) - offset < count then .error .bounds
+        else .ok (object, offset.toNat)
+
+theorem checked_refines (memory : Memory) (pointer : Pointer) (count offset : Nat) (object : Object) :
+    runtime_checked memory (some pointer) (count : Int) = .ok (object, offset) ↔
+      checked memory pointer count = some object ∧ offset = (pointer.address - object.base).toNat := by
+  cases found : memory pointer.capability with
+  | none => simp [runtime_checked, checked, found]
+  | some entry =>
+    have accept : ¬ ((count : Int) < 0 ∨ pointer.address - entry.base < 0 ∨
+        (entry.size : Int) < pointer.address - entry.base ∨
+        (entry.size : Int) - (pointer.address - entry.base) < (count : Int)) ↔
+        entry.base ≤ pointer.address ∧ pointer.address ≤ entry.base + entry.size ∧
+          (count : Int) ≤ entry.base + entry.size - pointer.address := by omega
+    cases liveness : entry.live with
+    | false => simp [runtime_checked, checked, accessible, found, liveness]
+    | true =>
+      by_cases valid : entry.base ≤ pointer.address ∧ pointer.address ≤ entry.base + entry.size ∧
+          (count : Int) ≤ entry.base + entry.size - pointer.address
+      · simp [runtime_checked, checked, accessible, found, liveness, accept.mpr valid, valid, eq_comm]
+        rintro rfl
+        rfl
+      · have rejected : (count : Int) < 0 ∨ pointer.address - entry.base < 0 ∨
+            (entry.size : Int) < pointer.address - entry.base ∨
+            (entry.size : Int) - (pointer.address - entry.base) < (count : Int) := by
+          exact Classical.not_not.mp (fun admissible => valid (accept.mp admissible))
+        simp [runtime_checked, checked, accessible, found, liveness, rejected, valid]
+
+theorem checked_offset_fits (memory : Memory) (pointer : Pointer) (count offset host_max : Nat)
+    (object : Object) (extent_fits : object.size ≤ host_max)
+    (success : runtime_checked memory (some pointer) (count : Int) = .ok (object, offset)) :
+    (offset : Int) = pointer.address - object.base ∧ offset + count ≤ host_max := by
+  obtain ⟨checked_access, displacement⟩ := (checked_refines memory pointer count offset object).mp success
+  obtain ⟨_, lower, upper⟩ := checked_span memory pointer count object checked_access
+  rw [displacement, Int.toNat_of_nonneg (by omega)]
+  omega
+
 def invalidate (memory : Memory) (capability : Nat) : Memory := fun ident =>
   if ident = capability then
     (memory ident).map fun object => { object with live := false, bytes := fun _ => 0, shadow := fun _ => none }
@@ -621,6 +674,8 @@ end Heresy
 
 #print axioms Heresy.lower_correct
 #print axioms Heresy.checked_span
+#print axioms Heresy.checked_refines
+#print axioms Heresy.checked_offset_fits
 #print axioms Heresy.invalidation_rejects_aliases
 #print axioms Heresy.integer_store_preserves_shadow
 #print axioms Heresy.readonly_rejects_store
