@@ -205,6 +205,32 @@ def validates_access (generated : String) : Bool :=
     "checked _ _ = panic \"memory access requires a data pointer\""]
   [lookup, check].all sections.contains
 
+def validates_release (generated : String) : Bool :=
+  let sections := generated.splitOn "\n\n"
+  let publish := String.intercalate "\n" [
+    "writeObject :: Capability -> Object -> R ()",
+    "writeObject NoCapability _ = panic \"access through a pointer with no allocation capability\"",
+    "writeObject (Capability _ reference) object = liftIO (writeIORef reference object)"]
+  let lock := String.intercalate "\n" [
+    "locked :: R a -> R a",
+    "locked action = R $ ExceptT $ StateT $ \\world ->",
+    "  case memoryGate world of",
+    "    Nothing -> runWorld world action",
+    "    Just gate -> withMVar gate (\\_ -> runWorld world action)"]
+  let release := String.intercalate "\n" [
+    "release :: Value -> R ()",
+    "release pointer = locked (releaseCell pointer)"]
+  let transition := String.intercalate "\n" [
+    "releaseCell :: Value -> R ()",
+    "releaseCell (Pointer NoCapability 0) = pure ()",
+    "releaseCell pointer@(Pointer ident _) = do",
+    "  (_, object, displacement) <- checked 0 pointer",
+    "  unless (storage object == \"heap\" && displacement == 0) (panic \"free requires the start of a heap allocation\")",
+    "  writeObject ident (object { live = False, bytes = M.empty, shadow = M.empty, atomicSlots = I.empty, synchronisation = M.empty })",
+    "  event (\"free #\" ++ show ident ++ \"; all aliases invalidated\")",
+    "releaseCell _ = panic \"free requires a data pointer\""]
+  [publish, lock, release, transition].all sections.contains
+
 def validates_shadow_copy (generated : String) : Bool :=
   let sections := generated.splitOn "\n\n"
   let range := String.intercalate "\n" [
@@ -295,9 +321,11 @@ def main (arguments : List String) : IO UInt32 := do
     let generated ← IO.FS.readFile haskell
     if !Heresy.validates_access generated then
       IO.eprintln "memory access differs from the model"; pure 1
+    else if !Heresy.validates_release generated then
+      IO.eprintln "memory release differs from the model"; pure 1
     else if !Heresy.validates_shadow_copy generated then
       IO.eprintln "shadow copy differs from the model"; pure 1
-    else IO.println "checked access and shadow copy equations"; pure 0
+    else IO.println "checked access, release and shadow copy equations"; pure 0
   | ["program", ast, haskell] =>
     match Heresy.validate_program (← IO.FS.readFile ast) (← IO.FS.readFile haskell) with
     | .ok () => IO.println "checked emitted closed program and exit status"; pure 0

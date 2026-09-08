@@ -272,6 +272,64 @@ theorem invalidation_preserves_other (memory : Memory) (capability ident : Nat)
     (different : ident ≠ capability) : invalidate memory capability ident = memory ident := by
   simp only [invalidate, different, ↓reduceIte]
 
+inductive ReleaseAddress where
+  | null | data (pointer : Pointer) | other
+
+inductive ReleaseFault where
+  | access (fault : AccessFault) | notHeapBase | notPointer
+  deriving DecidableEq
+
+def runtime_release (memory : Memory) (heap : Nat → Bool) (address : ReleaseAddress) :
+    Except ReleaseFault Memory :=
+  match address with
+  | .null => .ok memory
+  | .other => .error .notPointer
+  | .data pointer =>
+    match runtime_checked memory (some pointer) 0 with
+    | .error fault => .error (.access fault)
+    | .ok (_, offset) =>
+      if heap pointer.capability = true ∧ offset = 0 then .ok (invalidate memory pointer.capability)
+      else .error .notHeapBase
+
+theorem release_data_sound (memory next : Memory) (heap : Nat → Bool) (pointer : Pointer)
+    (success : runtime_release memory heap (.data pointer) = .ok next) :
+    ∃ object, checked memory pointer 0 = some object ∧ heap pointer.capability = true ∧
+      pointer.address = object.base ∧ next = invalidate memory pointer.capability := by
+  cases access : runtime_checked memory (some pointer) 0 with
+  | error fault => simp [runtime_release, access] at success
+  | ok entry =>
+    obtain ⟨object, offset⟩ := entry
+    by_cases owner : heap pointer.capability = true ∧ offset = 0
+    · simp only [runtime_release, access, if_pos owner, Except.ok.injEq] at success
+      obtain ⟨valid, displacement⟩ := (checked_refines memory pointer 0 offset object).mp access
+      have lower := (checked_span memory pointer 0 object valid).2.1
+      have zero := owner.2
+      have base : pointer.address = object.base := by omega
+      exact ⟨object, valid, owner.1, base, success.symm⟩
+    · simp [runtime_release, access, owner] at success
+
+theorem release_data_complete (memory : Memory) (heap : Nat → Bool) (pointer : Pointer) (object : Object)
+    (valid : checked memory pointer 0 = some object) (owner : heap pointer.capability = true)
+    (base : pointer.address = object.base) :
+    runtime_release memory heap (.data pointer) = .ok (invalidate memory pointer.capability) := by
+  have access : runtime_checked memory (some pointer) 0 = .ok (object, 0) :=
+    (checked_refines memory pointer 0 0 object).mpr ⟨valid, by simp [base]⟩
+  simp [runtime_release, access, owner]
+
+theorem release_alias_fault (memory next : Memory) (heap : Nat → Bool) (pointer alias : Pointer)
+    (count : Int) (same_capability : alias.capability = pointer.capability)
+    (success : runtime_release memory heap (.data pointer) = .ok next) :
+    runtime_checked next (some alias) count = .error .dead := by
+  obtain ⟨object, accessed, _, _, rfl⟩ := release_data_sound memory next heap pointer success
+  have found := (checked_sound memory pointer 0 object accessed).1
+  simp [runtime_checked, invalidate, same_capability, found]
+
+theorem release_preserves_other (memory next : Memory) (heap : Nat → Bool) (pointer : Pointer)
+    (ident : Nat) (different : ident ≠ pointer.capability)
+    (success : runtime_release memory heap (.data pointer) = .ok next) : next ident = memory ident := by
+  obtain ⟨_, _, _, _, rfl⟩ := release_data_sound memory next heap pointer success
+  exact invalidation_preserves_other memory pointer.capability ident different
+
 def integer_store (object : Object) (offset width : Nat) (value : Int) : Object :=
   { object with bytes := fun index =>
       if offset ≤ index ∧ index < offset + width then
@@ -677,6 +735,10 @@ end Heresy
 #print axioms Heresy.checked_refines
 #print axioms Heresy.checked_offset_fits
 #print axioms Heresy.invalidation_rejects_aliases
+#print axioms Heresy.release_data_sound
+#print axioms Heresy.release_data_complete
+#print axioms Heresy.release_alias_fault
+#print axioms Heresy.release_preserves_other
 #print axioms Heresy.integer_store_preserves_shadow
 #print axioms Heresy.readonly_rejects_store
 #print axioms Heresy.signed_bounds
