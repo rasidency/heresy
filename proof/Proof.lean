@@ -519,6 +519,75 @@ theorem aligned_slot_valid (cursor width alignment : Nat) (positive : 0 < alignm
   rw [Nat.mul_comm alignment] at split
   exact ⟨by omega, by omega, aligned, Nat.add_le_add_left covers _⟩
 
+structure AllocationCounter where
+  ident : Nat
+  cursor : Nat
+
+structure AllocationPlan where
+  ident : Nat
+  address : Nat
+  extent : Nat
+  next : AllocationCounter
+
+def allocation_alignment (global : Bool) : Nat := if global then 8 else 16
+
+def allocation_candidate (counter : AllocationCounter) (global : Bool) (size : Nat) : AllocationPlan :=
+  let address := (aligned_slot counter.cursor 0 16).1
+  let extent := (aligned_slot size 0 (allocation_alignment global)).1
+  ⟨counter.ident, address, extent, ⟨counter.ident + 1, address + max extent 1 + 16⟩⟩
+
+def plan_allocation (counter : AllocationCounter) (global : Bool) (size : Int) (host_max : Nat) :
+    Option AllocationPlan :=
+  if size < 0 ∨ host_max < size.toNat + (allocation_alignment global - 1) then none
+  else
+    let candidate := allocation_candidate counter global size.toNat
+    if counter.ident = host_max ∨ 4611686018427387904 ≤ candidate.address + candidate.extent then none
+    else some candidate
+
+theorem allocation_plan_sound (counter : AllocationCounter) (global : Bool) (size : Int) (host_max : Nat)
+    (plan : AllocationPlan) (counter_fits : counter.ident ≤ host_max)
+    (success : plan_allocation counter global size host_max = some plan) :
+    let alignment := allocation_alignment global
+    0 ≤ size ∧ size.toNat + (alignment - 1) ≤ host_max ∧
+      size.toNat ≤ plan.extent ∧ plan.extent ≤ host_max ∧ plan.extent % alignment = 0 ∧
+      counter.cursor ≤ plan.address ∧ plan.address % 16 = 0 ∧
+      plan.address + plan.extent < 4611686018427387904 ∧
+      plan.ident = counter.ident ∧ plan.ident < plan.next.ident ∧ plan.next.ident ≤ host_max ∧
+      plan.address + plan.extent < plan.next.cursor := by
+  unfold plan_allocation at success
+  split at success
+  · contradiction
+  · rename_i admissible
+    dsimp only at success
+    split at success
+    · contradiction
+    · rename_i available
+      cases success
+      have align_positive : 0 < allocation_alignment global := by cases global <;> decide
+      have extent_valid := aligned_slot_valid size.toNat 0 _ align_positive
+      have padding : (aligned_slot size.toNat 0 (allocation_alignment global)).1 <
+          size.toNat + allocation_alignment global := extent_valid.2.1
+      obtain ⟨start, _, address_aligned, _⟩ := aligned_slot_valid counter.cursor 0 16 (by decide)
+      simp only [allocation_candidate] at available ⊢
+      have below_ceiling := Nat.lt_of_not_ge (fun exceeds => available (Or.inr exceeds))
+      have fresh := Nat.lt_of_le_of_ne counter_fits (fun exhausted => available (Or.inl exhausted))
+      refine ⟨by omega, by omega, extent_valid.1, ?_, extent_valid.2.2.1, start, address_aligned,
+        below_ceiling, True.intro, by omega, fresh, ?_⟩
+      · omega
+      · omega
+
+theorem allocation_plans_disjoint (counter : AllocationCounter) (first_global second_global : Bool)
+    (first_size second_size : Int) (host_max : Nat) (first second : AllocationPlan)
+    (counter_fits : counter.ident ≤ host_max)
+    (allocated_first : plan_allocation counter first_global first_size host_max = some first)
+    (allocated_second : plan_allocation first.next second_global second_size host_max = some second) :
+    first.ident < second.ident ∧ first.address + first.extent < second.address := by
+  obtain ⟨_, _, _, _, _, _, _, _, _, distinct, next_fits, separated⟩ :=
+    allocation_plan_sound counter first_global first_size host_max first counter_fits allocated_first
+  obtain ⟨_, _, _, _, _, beyond, _, _, new_ident, _, _, _⟩ :=
+    allocation_plan_sound first.next second_global second_size host_max second next_fits allocated_second
+  exact ⟨new_ident ▸ distinct, Nat.lt_of_lt_of_le separated beyond⟩
+
 def array_extent (width : Nat) : List Nat → Nat
   | [] => width
   | count :: rest => count * array_extent width rest
@@ -751,6 +820,8 @@ end Heresy
 #print axioms Heresy.next_variadic_span
 #print axioms Heresy.argument_extent_covers_slots
 #print axioms Heresy.aligned_slot_valid
+#print axioms Heresy.allocation_plan_sound
+#print axioms Heresy.allocation_plans_disjoint
 #print axioms Heresy.array_span_at
 #print axioms Heresy.array_index_in_bounds
 #print axioms Heresy.field_store_bit

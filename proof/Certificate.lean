@@ -231,6 +231,27 @@ def validates_release (generated : String) : Bool :=
     "releaseCell _ = panic \"free requires a data pointer\""]
   [publish, lock, release, transition].all sections.contains
 
+def validates_allocation (generated : String) : Bool :=
+  let sections := generated.splitOn "\n\n"
+  let transition := String.intercalate "\n" [
+    "allocate :: String -> Int -> R Value",
+    "allocate kind size = do",
+    "  let alignment = if kind == \"global\" then 8 else 16",
+    "  when (size < 0 || size > maxBound - (alignment - 1)) (panic \"allocation size exceeds the host representation\")",
+    "  counter <- gets allocationCounter",
+    "  loc <- gets location",
+    "  let rounded = ((size + (alignment - 1)) `div` alignment) * alignment",
+    "  entry <- liftIO $ atomicModifyIORef' counter $ \\old@(ident, address) ->",
+    "    let start = ((address + 15) `div` 16) * 16 in",
+    "    if ident == maxBound || start + toInteger rounded >= 4611686018427387904 then (old, Nothing)",
+    "    else ((ident + 1, start + toInteger (max rounded 1) + 16), Just (ident, start))",
+    "  (ident, start) <- maybe (panic \"virtual address space exhausted\") pure entry",
+    "  let object = Object start rounded True kind M.empty M.empty I.empty M.empty [] loc",
+    "  reference <- liftIO (newIORef object)",
+    "  event (\"allocate #\" ++ show ident ++ \" \" ++ show rounded ++ \" bytes (\" ++ kind ++ \")\")",
+    "  pure (Pointer (Capability ident reference) start)"]
+  sections.contains transition && (generated.splitOn "\n").contains "  counter <- newIORef (1, 4096)"
+
 def validates_shadow_copy (generated : String) : Bool :=
   let sections := generated.splitOn "\n\n"
   let range := String.intercalate "\n" [
@@ -323,9 +344,11 @@ def main (arguments : List String) : IO UInt32 := do
       IO.eprintln "memory access differs from the model"; pure 1
     else if !Heresy.validates_release generated then
       IO.eprintln "memory release differs from the model"; pure 1
+    else if !Heresy.validates_allocation generated then
+      IO.eprintln "memory allocation differs from the model"; pure 1
     else if !Heresy.validates_shadow_copy generated then
       IO.eprintln "shadow copy differs from the model"; pure 1
-    else IO.println "checked access, release and shadow copy equations"; pure 0
+    else IO.println "checked allocation, access, release and shadow copy equations"; pure 0
   | ["program", ast, haskell] =>
     match Heresy.validate_program (← IO.FS.readFile ast) (← IO.FS.readFile haskell) with
     | .ok () => IO.println "checked emitted closed program and exit status"; pure 0

@@ -283,10 +283,10 @@ event message = do
 allocate :: String -> Int -> R Value
 allocate kind size = do
   let alignment = if kind == "global" then 8 else 16
-  when (size < 0 || size > maxBound - alignment + 1) (panic "allocation size exceeds the host representation")
+  when (size < 0 || size > maxBound - (alignment - 1)) (panic "allocation size exceeds the host representation")
   counter <- gets allocationCounter
   loc <- gets location
-  let rounded = ((size + alignment - 1) `div` alignment) * alignment
+  let rounded = ((size + (alignment - 1)) `div` alignment) * alignment
   entry <- liftIO $ atomicModifyIORef' counter $ \old@(ident, address) ->
     let start = ((address + 15) `div` 16) * 16 in
     if ident == maxBound || start + toInteger rounded >= 4611686018427387904 then (old, Nothing)
