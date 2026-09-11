@@ -797,6 +797,117 @@ theorem shadow_copy_refines (source destination : Int → Option α)
     simp [copied, intersects]
   · simp [copied]
 
+def intmap_payload_copy (source destination : Int → Option α)
+    (source_offset destination_offset count index : Int) : Option α :=
+  let payload := if destination_offset ≤ index ∧ index < destination_offset + count then
+    source (source_offset + (index - destination_offset)) else none
+  let untouched := if index < destination_offset ∨ destination_offset + count ≤ index then
+    destination index else none
+  payload.or untouched
+
+theorem payload_copy_refines (source destination : Int → Option α)
+    (source_offset destination_offset count index : Int) :
+    intmap_payload_copy source destination source_offset destination_offset count index =
+      if destination_offset ≤ index ∧ index < destination_offset + count then
+        source (source_offset + (index - destination_offset)) else destination index := by
+  by_cases inside : destination_offset ≤ index ∧ index < destination_offset + count
+  · have untouched : ¬ (index < destination_offset ∨ destination_offset + count ≤ index) := by omega
+    simp [intmap_payload_copy, inside, untouched]
+  · have untouched : index < destination_offset ∨ destination_offset + count ≤ index := by omega
+    simp [intmap_payload_copy, inside, untouched]
+
+def intset_atomic_copy (destination : Int → Bool) (destination_offset count slot : Int) : Bool :=
+  if count = 0 then destination slot
+  else decide (slot ≤ destination_offset - 8 ∨ destination_offset + count ≤ slot) && destination slot
+
+theorem atomic_copy_refines (destination : Int → Bool) (destination_offset count slot : Int) :
+    intset_atomic_copy destination destination_offset count slot = true ↔
+      destination slot = true ∧ (count = 0 ∨ slot + 8 ≤ destination_offset ∨ destination_offset + count ≤ slot) := by
+  by_cases empty : count = 0
+  · simp [intset_atomic_copy, empty]
+  · have untouched : (slot ≤ destination_offset - 8 ∨ destination_offset + count ≤ slot) ↔
+        slot + 8 ≤ destination_offset ∨ destination_offset + count ≤ slot := by omega
+    simp only [intset_atomic_copy, empty, if_false, Bool.and_eq_true, decide_eq_true_eq, false_or,
+      untouched, and_comm]
+
+inductive CopyFault where
+  | source (fault : AccessFault) | destination (fault : AccessFault) | readonly
+  deriving DecidableEq
+
+def runtime_copy_offsets (memory : Memory) (source destination : Pointer) (count : Nat) :
+    Except CopyFault (Option (Nat × Nat)) :=
+  if count = 0 then .ok none
+  else
+    match runtime_checked memory (some source) count with
+    | .error fault => .error (.source fault)
+    | .ok (_, source_offset) =>
+      match runtime_checked memory (some destination) count with
+      | .error fault => .error (.destination fault)
+      | .ok (object, destination_offset) =>
+        if object.readonly then .error .readonly else .ok (some (source_offset, destination_offset))
+
+theorem copy_offsets_sound (memory : Memory) (source destination : Pointer) (count s d : Nat)
+    (copied : runtime_copy_offsets memory source destination count = .ok (some (s, d))) :
+    ∃ src dst, memory source.capability = some src ∧ memory destination.capability = some dst ∧
+      accessible src source.address count ∧ accessible dst destination.address count ∧
+      dst.readonly = false ∧ s = (source.address - src.base).toNat ∧ d = (destination.address - dst.base).toNat := by
+  by_cases empty : count = 0
+  · simp [runtime_copy_offsets, empty] at copied
+  cases source_access : runtime_checked memory (some source) (count : Int) with
+  | error fault => simp [runtime_copy_offsets, empty, source_access] at copied
+  | ok source_entry =>
+    obtain ⟨src, s_offset⟩ := source_entry
+    cases dest_access : runtime_checked memory (some destination) (count : Int) with
+    | error fault => simp [runtime_copy_offsets, empty, source_access, dest_access] at copied
+    | ok dest_entry =>
+      obtain ⟨dst, d_offset⟩ := dest_entry
+      cases readonly : dst.readonly
+      · simp [runtime_copy_offsets, empty, source_access, dest_access, readonly] at copied
+        obtain ⟨rfl, rfl⟩ := copied
+        obtain ⟨source_checked, s_offset_eq⟩ := (checked_refines memory source count _ src).mp source_access
+        obtain ⟨dest_checked, d_offset_eq⟩ := (checked_refines memory destination count _ dst).mp dest_access
+        exact ⟨src, dst, (checked_sound memory source count src source_checked).1,
+          (checked_sound memory destination count dst dest_checked).1,
+          (checked_sound memory source count src source_checked).2,
+          (checked_sound memory destination count dst dest_checked).2, readonly, s_offset_eq, d_offset_eq⟩
+      · simp [runtime_copy_offsets, empty, source_access, dest_access, readonly] at copied
+
+structure CopyPlanes (α : Type) where
+  payload : Int → Option Int
+  shadow : Int → Option α
+  atomic : Int → Bool
+
+def copy_snapshot (source destination : CopyPlanes α) (source_offset destination_offset count : Int) : CopyPlanes α :=
+  ⟨intmap_payload_copy source.payload destination.payload source_offset destination_offset count,
+    intmap_shadow_copy source.shadow destination.shadow source_offset destination_offset count,
+    intset_atomic_copy destination.atomic destination_offset count⟩
+
+theorem copy_snapshot_refines (source destination : CopyPlanes α) (source_offset destination_offset : Int)
+    (count : Nat) (index : Int) :
+    let result := copy_snapshot source destination source_offset destination_offset count
+    result.payload index = (if destination_offset ≤ index ∧ index < destination_offset + count then
+      source.payload (source_offset + (index - destination_offset)) else destination.payload index) ∧
+    result.shadow index = capability_shadow_copy source.shadow destination.shadow source_offset destination_offset count index ∧
+    (result.atomic index = true ↔ destination.atomic index = true ∧
+      (count = 0 ∨ index + 8 ≤ destination_offset ∨ destination_offset + count ≤ index)) := by
+  refine ⟨payload_copy_refines _ _ _ _ _ _, shadow_copy_refines _ _ _ _ _ _ (by omega), ?_⟩
+  simpa using atomic_copy_refines destination.atomic destination_offset (count : Int) index
+
+def runtime_copy (memory : Memory) (planes : Nat → CopyPlanes α) (source destination : Pointer) (count : Nat) :
+    Except CopyFault (Nat → CopyPlanes α) :=
+  match runtime_copy_offsets memory source destination count with
+  | .error fault => .error fault
+  | .ok none => .ok planes
+  | .ok (some (s, d)) =>
+    .ok (fun key => if key = destination.capability then
+      copy_snapshot (planes source.capability) (planes destination.capability) s d count else planes key)
+
+theorem runtime_copy_snapshot (memory : Memory) (planes : Nat → CopyPlanes α) (source destination : Pointer)
+    (count s d : Nat) (offsets : runtime_copy_offsets memory source destination count = .ok (some (s, d))) :
+    runtime_copy memory planes source destination count = .ok (fun key => if key = destination.capability then
+      copy_snapshot (planes source.capability) (planes destination.capability) s d count else planes key) := by
+  simp [runtime_copy, offsets]
+
 end Heresy
 
 #print axioms Heresy.lower_correct
@@ -830,4 +941,9 @@ end Heresy
 #print axioms Heresy.atomic_pointer_compare_rejects
 #print axioms Heresy.dispatch_targets_exist
 #print axioms Heresy.shadow_copy_refines
+#print axioms Heresy.payload_copy_refines
+#print axioms Heresy.atomic_copy_refines
+#print axioms Heresy.copy_offsets_sound
+#print axioms Heresy.copy_snapshot_refines
+#print axioms Heresy.runtime_copy_snapshot
 #print axioms Heresy.lower_program_correct

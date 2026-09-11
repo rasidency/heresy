@@ -252,8 +252,11 @@ def validates_allocation (generated : String) : Bool :=
     "  pure (Pointer (Capability ident reference) start)"]
   sections.contains transition && (generated.splitOn "\n").contains "  counter <- newIORef (1, 4096)"
 
-def validates_shadow_copy (generated : String) : Bool :=
+def validates_copy (generated : String) : Bool :=
   let sections := generated.splitOn "\n\n"
+  let readonly := String.intercalate "\n" [
+    "readOnly :: Object -> Bool",
+    "readOnly object = storage object `elem` [\"literal\", \"constant\"]"]
   let range := String.intercalate "\n" [
     "aggregateBytes :: Int -> Int -> M.IntMap a -> M.IntMap a",
     "aggregateBytes start count values =",
@@ -280,7 +283,9 @@ def validates_shadow_copy (generated : String) : Bool :=
     "                         , atomicSlots = I.filter outside (atomicSlots dst) })",
     "  event (\"copy \" ++ show count ++ \" bytes to #\" ++ show ident ++ \"+\" ++ show dstOffset)",
     "  pure destination"]
-  [range, shadow, copy].all sections.contains
+  let builtin := ["memcpy", "memmove"].map fun name =>
+    "builtin \"" ++ name ++ "\" [destination, source, count] = hostSize (number count) >>= copyMemory destination source"
+  [readonly, range, shadow, copy].all sections.contains && builtin.all (generated.splitOn "\n").contains
 
 private def closed_source (frontend : String) : Except String Source := do
   let tree ← Json.parse frontend
@@ -346,9 +351,9 @@ def main (arguments : List String) : IO UInt32 := do
       IO.eprintln "memory release differs from the model"; pure 1
     else if !Heresy.validates_allocation generated then
       IO.eprintln "memory allocation differs from the model"; pure 1
-    else if !Heresy.validates_shadow_copy generated then
-      IO.eprintln "shadow copy differs from the model"; pure 1
-    else IO.println "checked allocation, access, release and shadow copy equations"; pure 0
+    else if !Heresy.validates_copy generated then
+      IO.eprintln "memory copy differs from the model"; pure 1
+    else IO.println "checked allocation, access, release and memory copy equations"; pure 0
   | ["program", ast, haskell] =>
     match Heresy.validate_program (← IO.FS.readFile ast) (← IO.FS.readFile haskell) with
     | .ok () => IO.println "checked emitted closed program and exit status"; pure 0
