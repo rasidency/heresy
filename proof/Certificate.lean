@@ -167,7 +167,39 @@ private def read_dispatch (row : String) : Except String DispatchGraph := do
     pure ⟨entry, rows⟩
   | _ => throw "invalid dispatch graph"
 
+private def validates_dispatch_runtime (generated : String) : Bool :=
+  let sections := generated.splitOn "\n\n"
+  let dispatch := String.intercalate "\n" [
+    "dispatch :: (Int, [[Int]]) -> [R Flow] -> R Flow",
+    "dispatch (entry, edges) actions",
+    "  | length edges /= length actions = panic \"incomplete control-flow graph\"",
+    "  | otherwise = go entry",
+    "  where",
+    "    table = M.fromDistinctAscList (zip [0 ..] (zip (map I.fromList edges) actions))",
+    "    go index = case M.lookup index table of",
+    "      Nothing -> panic \"invalid control-flow target\"",
+    "      Just (targets, action) -> do",
+    "        result <- action",
+    "        case result of",
+    "          Jump next | I.member next targets -> go next",
+    "                    | otherwise -> panic \"unlisted control-flow target\"",
+    "          _ -> pure result"]
+  let computed := String.intercalate "\n" [
+    "indirectJump :: [(String, Int)] -> R Value -> R Flow",
+    "indirectJump targets expression = do",
+    "  value <- expression",
+    "  case value of",
+    "    Function raw name -> do",
+    "      canonical <- gets (S.lookup name . symbols)",
+    "      case lookup name targets of",
+    "        Just target | canonical == Just raw -> pure (Jump target)",
+    "        _ -> panic \"invalid computed jump target\"",
+    "    _ -> panic \"invalid computed jump target\""]
+  [dispatch, computed].all sections.contains
+
 def validate_dispatches (generated : String) : Except String Nat := do
+  unless validates_dispatch_runtime generated do
+    throw "dispatch runtime differs from the model"
   let lines := (generated.splitOn "\n").filter (·.startsWith "g_")
   let mut names : List String := []
   let mut signatures : List String := []
@@ -341,7 +373,7 @@ def main (arguments : List String) : IO UInt32 := do
   match arguments with
   | ["dispatch", haskell] =>
     match Heresy.validate_dispatches (← IO.FS.readFile haskell) with
-    | .ok count => IO.println s!"checked {count} emitted control-flow graph(s)"; pure 0
+    | .ok count => IO.println s!"checked dispatch equations and {count} emitted control-flow graph(s)"; pure 0
     | .error message => IO.eprintln message; pure 1
   | ["memory", haskell] =>
     let generated ← IO.FS.readFile haskell

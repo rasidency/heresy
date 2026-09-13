@@ -757,6 +757,75 @@ theorem dispatch_targets_exist (graph : DispatchGraph) (accepted : valid_dispatc
   | jump _ row_at member =>
     exact accepted.2 _ (List.mem_of_getElem? row_at) _ member
 
+def guarded_blocks (graph : DispatchGraph) (actions : List (state → Option (Transfer state result))) :
+    Blocks state result := fun index initial =>
+  if graph.successors.length = actions.length then do
+    let (row, action) ← (graph.successors.zip actions)[index]?
+    let transfer ← action initial
+    match transfer with
+    | .jump next _ => if next ∈ row then some transfer else none
+    | .stop _ _ => some transfer
+  else none
+
+theorem guarded_jump_listed (graph : DispatchGraph) (actions : List (state → Option (Transfer state result)))
+    (index next : Nat) (initial after : state)
+    (jumped : guarded_blocks graph actions index initial = some (.jump next after)) :
+    ∃ row, graph.successors[index]? = some row ∧ next ∈ row := by
+  by_cases shape : graph.successors.length = actions.length
+  · cases table : (graph.successors.zip actions)[index]? with
+    | none => simp [guarded_blocks, shape, table] at jumped
+    | some entry =>
+      obtain ⟨row, action⟩ := entry
+      cases response : action initial with
+      | none => simp [guarded_blocks, shape, table, response] at jumped
+      | some transfer =>
+        cases transfer with
+        | stop value final => simp [guarded_blocks, shape, table, response] at jumped
+        | jump target updated =>
+          by_cases listed : target ∈ row
+          · simp [guarded_blocks, shape, table, response, listed] at jumped
+            obtain ⟨rfl, rfl⟩ := jumped
+            exact ⟨row, (List.getElem?_zip_eq_some.mp table).1, listed⟩
+          · simp [guarded_blocks, shape, table, response, listed] at jumped
+  · simp [guarded_blocks, shape] at jumped
+
+inductive DispatchVisits (blocks : Blocks state result) (entry : Nat) (initial : state) : Nat → state → Prop where
+  | entry : DispatchVisits blocks entry initial entry initial
+  | jump {index next : Nat} {before after : state} :
+    DispatchVisits blocks entry initial index before → blocks index before = some (.jump next after) →
+      DispatchVisits blocks entry initial next after
+
+theorem guarded_dispatch_reaches (graph : DispatchGraph) (actions : List (state → Option (Transfer state result)))
+    (initial final : state) (index : Nat)
+    (visited : DispatchVisits (guarded_blocks graph actions) graph.entry initial index final) : Reaches graph index := by
+  induction visited with
+  | entry => exact .entry
+  | jump _ transfer reached =>
+    obtain ⟨_, row, listed⟩ := guarded_jump_listed graph actions _ _ _ _ transfer
+    exact .jump reached row listed
+
+theorem guarded_dispatch_has_action (graph : DispatchGraph) (actions : List (state → Option (Transfer state result)))
+    (initial final : state) (index : Nat) (accepted : valid_dispatch graph = true)
+    (shape : graph.successors.length = actions.length)
+    (visited : DispatchVisits (guarded_blocks graph actions) graph.entry initial index final) :
+    ∃ action, actions[index]? = some action := by
+  have reached := guarded_dispatch_reaches graph actions initial final index visited
+  have within := dispatch_targets_exist graph accepted index reached
+  have valid : index < actions.length := shape ▸ within
+  exact ⟨actions[index], List.getElem?_eq_some_iff.mpr ⟨valid, rfl⟩⟩
+
+def computed_jump (symbols : String → Option Int) (targets : String → Option Nat)
+    (candidate : Option (Int × String)) : Option Nat :=
+  match candidate with
+  | none => none
+  | some (raw, name) => if symbols name = some raw then targets name else none
+
+theorem computed_jump_matches_symbol (symbols : String → Option Int) (targets : String → Option Nat)
+    (raw : Int) (name : String) (next : Nat) :
+    computed_jump symbols targets (some (raw, name)) = some next ↔
+      symbols name = some raw ∧ targets name = some next := by
+  by_cases authentic : symbols name = some raw <;> simp [computed_jump, authentic]
+
 def intmap_shadow_copy (source destination : Int → Option α)
     (source_offset destination_offset count slot : Int) : Option α :=
   if count = 0 then destination slot
@@ -940,6 +1009,9 @@ end Heresy
 #print axioms Heresy.atomic_pointer_snapshot
 #print axioms Heresy.atomic_pointer_compare_rejects
 #print axioms Heresy.dispatch_targets_exist
+#print axioms Heresy.guarded_dispatch_reaches
+#print axioms Heresy.guarded_dispatch_has_action
+#print axioms Heresy.computed_jump_matches_symbol
 #print axioms Heresy.shadow_copy_refines
 #print axioms Heresy.payload_copy_refines
 #print axioms Heresy.atomic_copy_refines
