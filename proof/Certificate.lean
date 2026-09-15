@@ -319,6 +319,22 @@ def validates_copy (generated : String) : Bool :=
     "builtin \"" ++ name ++ "\" [destination, source, count] = hostSize (number count) >>= copyMemory destination source"
   [readonly, range, shadow, copy].all sections.contains && builtin.all (generated.splitOn "\n").contains
 
+def validates_scalar_memory (generated : String) : Bool :=
+  let sections := generated.splitOn "\n\n"
+  let lines := generated.splitOn "\n"
+  let read := String.intercalate "\n" [
+    "readScalar :: Int -> Int -> M.IntMap Integer -> Integer",
+    "readScalar displacement width payload =",
+    "  sum [M.findWithDefault 0 (displacement + i) payload * 256 ^ i | i <- [0 .. width - 1]]"]
+  let write := String.intercalate "\n" [
+    "writeScalar :: Int -> Int -> Integer -> M.IntMap Integer -> M.IntMap Integer",
+    "writeScalar displacement width raw payload =",
+    "  foldl (\\m i -> M.insert (displacement + i) ((raw `div` (256 ^ i)) `mod` 256) m) payload [0 .. width - 1]"]
+  let uses := ["  let raw = readScalar displacement (widthOf ty) (bytes object)",
+    "        IntegerType width signed -> Number (normalise width signed raw)",
+    "      updated = writeScalar displacement (widthOf ty) raw (bytes object)"]
+  [read, write].all sections.contains && uses.all lines.contains && has_normalisation lines
+
 private def closed_source (frontend : String) : Except String Source := do
   let tree ← Json.parse frontend
   unless field_text tree "kind" == "TranslationUnitDecl" do
@@ -385,7 +401,9 @@ def main (arguments : List String) : IO UInt32 := do
       IO.eprintln "memory allocation differs from the model"; pure 1
     else if !Heresy.validates_copy generated then
       IO.eprintln "memory copy differs from the model"; pure 1
-    else IO.println "checked allocation, access, release and memory copy equations"; pure 0
+    else if !Heresy.validates_scalar_memory generated then
+      IO.eprintln "scalar memory differs from the model"; pure 1
+    else IO.println "checked allocation, access, release, memory copy and scalar equations"; pure 0
   | ["program", ast, haskell] =>
     match Heresy.validate_program (← IO.FS.readFile ast) (← IO.FS.readFile haskell) with
     | .ok () => IO.println "checked emitted closed program and exit status"; pure 0

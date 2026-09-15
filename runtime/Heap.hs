@@ -331,6 +331,14 @@ encodeBytes size raw = M.fromDistinctAscList [(i, shiftR raw (8 * i) .&. 255) | 
 decodeBytes :: M.IntMap Integer -> Integer
 decodeBytes = M.foldlWithKey' (\raw index byte -> raw .|. shiftL byte (8 * index)) 0
 
+readScalar :: Int -> Int -> M.IntMap Integer -> Integer
+readScalar displacement width payload =
+  sum [M.findWithDefault 0 (displacement + i) payload * 256 ^ i | i <- [0 .. width - 1]]
+
+writeScalar :: Int -> Int -> Integer -> M.IntMap Integer -> M.IntMap Integer
+writeScalar displacement width raw payload =
+  foldl (\m i -> M.insert (displacement + i) ((raw `div` (256 ^ i)) `mod` 256) m) payload [0 .. width - 1]
+
 load :: CType -> Value -> R Value
 load ty pointer = locked (loadCell ty pointer)
 
@@ -348,7 +356,7 @@ loadCell declared pointer = do
   let ty = case declared of AtomicType inner -> inner; other -> other
   (ident, object, displacement) <- checked (widthOf declared) pointer
   when (ty == PointerType && number pointer `mod` 8 /= 0) (panic "unaligned pointer load")
-  let raw = sum [M.findWithDefault 0 (displacement + i) (bytes object) * 256 ^ i | i <- [0 .. widthOf ty - 1]]
+  let raw = readScalar displacement (widthOf ty) (bytes object)
       value = case ty of
         IntegerType width signed -> Number (normalise width signed raw)
         BitField bitOffset width signed -> Number (normalise width signed (shiftR raw bitOffset))
@@ -410,11 +418,11 @@ storeCell declared pointer value = do
   let converted = cast ty value
       raw = case ty of
         BitField bitOffset width _ ->
-          let word = sum [M.findWithDefault 0 (displacement + i) (bytes object) * 256 ^ i | i <- [0 .. widthOf ty - 1]]
+          let word = readScalar displacement (widthOf ty) (bytes object)
               mask = shiftL (2 ^ width - 1) bitOffset
           in (word .&. complement mask) .|. (shiftL (normalise width False (number converted)) bitOffset)
         _ -> number converted
-      updated = foldl (\m i -> M.insert (displacement + i) ((raw `div` (256 ^ i)) `mod` 256) m) (bytes object) [0 .. widthOf ty - 1]
+      updated = writeScalar displacement (widthOf ty) raw (bytes object)
       caps = if ty == PointerType then M.insert displacement converted (shadow object) else shadow object
       modes
         | declared == AtomicType PointerType = I.insert displacement (atomicSlots object)

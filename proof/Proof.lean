@@ -330,11 +330,114 @@ theorem release_preserves_other (memory next : Memory) (heap : Nat → Bool) (po
   obtain ⟨_, _, _, _, rfl⟩ := release_data_sound memory next heap pointer success
   exact invalidation_preserves_other memory pointer.capability ident different
 
+def little_endian_byte (value : Int) (index : Nat) : Int := value / (256 ^ index) % 256
+
+def little_endian_read (width : Nat) (payload : Nat → Int) : Int :=
+  ((List.range width).map fun index => payload index * 256 ^ index).sum
+
+private theorem little_endian_read_succ (width : Nat) (payload : Nat → Int) :
+    little_endian_read (width + 1) payload =
+      payload 0 + little_endian_read width (fun index => payload (index + 1)) * 256 := by
+  have weight (indices : List Nat) :
+      (indices.map fun index => payload (index + 1) * (256 : Int) ^ (index + 1)).sum =
+        (indices.map fun index => payload (index + 1) * (256 : Int) ^ index).sum * 256 := by
+    induction indices with
+    | nil => simp
+    | cons _ _ rest =>
+      simp only [List.map_cons, List.sum_cons]
+      rw [rest, Int.pow_succ, ← Int.mul_assoc, Int.add_mul]
+  simp [little_endian_read, List.range_succ_eq_map, List.map_map, Function.comp_def, weight]
+
+private theorem byte_radix (value place : Int) (positive : 0 < place) :
+    value % 256 + ((value / 256) % place) * 256 = value % (place * 256) := by
+  have byte_lo := Int.emod_nonneg value (by decide : (256 : Int) ≠ 0)
+  have byte_hi := Int.emod_lt_of_pos value (by decide : (0 : Int) < 256)
+  have upper_lo := Int.emod_nonneg (value / 256) (Int.ne_of_gt positive)
+  have upper_hi := Int.emod_lt_of_pos (value / 256) positive
+  have division : value % 256 + ((value / 256) % place) * 256 +
+      (place * 256) * ((value / 256) / place) = value := by
+    calc
+      _ = value % 256 + 256 * ((value / 256) % place + place * ((value / 256) / place)) := by
+        rw [Int.mul_add, ← Int.mul_assoc, ← Int.add_assoc, Int.mul_comm 256 place,
+          Int.mul_comm 256 ((value / 256) % place)]
+      _ = value := by rw [Int.emod_add_mul_ediv, Int.emod_add_mul_ediv]
+  exact ((Int.ediv_emod_unique (b := place * 256) (by omega)).mpr ⟨division, by omega, by omega⟩).2.symm
+
+theorem little_endian_roundtrip (value : Int) (width : Nat) :
+    little_endian_read width (little_endian_byte value) = value % (256 : Int) ^ width := by
+  induction width generalizing value with
+  | zero => simp [little_endian_read]
+  | succ width rest =>
+    have suffix : (fun index => little_endian_byte value (index + 1)) = little_endian_byte (value / 256) := by
+      funext index
+      simp only [little_endian_byte, Int.pow_succ]
+      rw [Int.ediv_ediv (by decide : (0 : Int) ≤ 256), Int.mul_comm 256]
+    rw [little_endian_read_succ, suffix, rest, Int.pow_succ]
+    simpa [little_endian_byte] using byte_radix value (256 ^ width) (Int.pow_pos (by decide))
+
+private theorem byte_modulus (width : Nat) : (256 : Int) ^ width = modulus (8 * width) := by
+  induction width with
+  | zero => rfl
+  | succ width rest =>
+    rw [Int.pow_succ, rest, Nat.mul_succ]
+    simp [modulus, Int.pow_add]
+
 def integer_store (object : Object) (offset width : Nat) (value : Int) : Object :=
   { object with bytes := fun index =>
       if offset ≤ index ∧ index < offset + width then
-        (value / 2 ^ (8 * (index - offset))) % 256
+        little_endian_byte value (index - offset)
       else object.bytes index }
+
+theorem integer_store_load_roundtrip (object : Object) (offset width : Nat) (value : Int) :
+    little_endian_read width (fun index => (integer_store object offset width value).bytes (offset + index)) =
+      unsigned (8 * width) value := by
+  rw [unsigned, ← byte_modulus, ← little_endian_roundtrip]
+  unfold little_endian_read
+  congr 1
+  apply List.map_congr_left
+  intro index member
+  have within := List.mem_range.mp member
+  have stored : offset ≤ offset + index ∧ offset + index < offset + width := by omega
+  simp [integer_store, stored]
+
+def write_scalar_indices (offset : Nat) (value : Int) (indices : List Nat) (payload : Nat → Int) : Nat → Int :=
+  indices.foldl (fun bytes digit index => if index = offset + digit then little_endian_byte value digit else bytes index) payload
+
+private theorem write_scalar_indices_at (offset : Nat) (value : Int) (indices : List Nat)
+    (payload : Nat → Int) (index : Nat) :
+    write_scalar_indices offset value indices payload index =
+      if index ∈ indices.map (offset + ·) then little_endian_byte value (index - offset) else payload index := by
+  induction indices generalizing payload with
+  | nil => simp [write_scalar_indices]
+  | cons digit rest tail =>
+    simp only [write_scalar_indices, List.foldl_cons] at tail ⊢
+    rw [tail]
+    by_cases written : index ∈ rest.map (offset + ·)
+    · simp [written]
+    · by_cases first : index = offset + digit
+      · subst index
+        simp [written]
+      · simp [written, first]
+
+theorem scalar_write_refines (object : Object) (offset width : Nat) (value : Int) (index : Nat) :
+    write_scalar_indices offset value (List.range width) object.bytes index =
+      (integer_store object offset width value).bytes index := by
+  have keys : (index ∈ (List.range width).map (offset + ·)) ↔ offset ≤ index ∧ index < offset + width := by
+    constructor
+    · intro present
+      obtain ⟨digit, inside, rfl⟩ := List.mem_map.mp present
+      have valid := List.mem_range.mp inside
+      omega
+    · intro inside
+      exact List.mem_map.mpr ⟨index - offset, List.mem_range.mpr (by omega), by omega⟩
+  simp only [write_scalar_indices_at, keys, integer_store]
+
+theorem signed_store_load_roundtrip (object : Object) (offset width : Nat) (value : Int) :
+    signed (8 * width)
+      (little_endian_read width (fun index => (integer_store object offset width value).bytes (offset + index))) =
+      signed (8 * width) value := by
+  rw [integer_store_load_roundtrip]
+  simp only [signed, unsigned_idempotent]
 
 theorem integer_store_preserves_shadow (object : Object) (offset width : Nat) (value : Int) :
     (integer_store object offset width value).shadow = object.shadow := by
@@ -989,6 +1092,10 @@ end Heresy
 #print axioms Heresy.release_alias_fault
 #print axioms Heresy.release_preserves_other
 #print axioms Heresy.integer_store_preserves_shadow
+#print axioms Heresy.little_endian_roundtrip
+#print axioms Heresy.integer_store_load_roundtrip
+#print axioms Heresy.signed_store_load_roundtrip
+#print axioms Heresy.scalar_write_refines
 #print axioms Heresy.readonly_rejects_store
 #print axioms Heresy.signed_bounds
 #print axioms Heresy.lowered_bounds
