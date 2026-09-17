@@ -480,6 +480,48 @@ theorem guarded_store_sound (object updated : Object) (address : Int) (width : N
     exact ⟨valid.1, valid.2, rfl⟩
   · contradiction
 
+def runtime_freeze (memory : Memory) (address : Option Pointer) : Except AccessFault Memory :=
+  match address with
+  | none => .error .notPointer
+  | some pointer =>
+    match memory pointer.capability with
+    | none => .error .noCapability
+    | some object => .ok (fun ident => if ident = pointer.capability then
+        some { object with readonly := true } else memory ident)
+
+theorem freeze_alias_reads (memory next : Memory) (owner alias : Pointer) (count : Nat) (object : Object)
+    (frozen : runtime_freeze memory (some owner) = .ok next)
+    (same_capability : alias.capability = owner.capability)
+    (access : checked memory alias count = some object) :
+    checked next alias count = some { object with readonly := true } := by
+  obtain ⟨lookup, valid⟩ := checked_sound memory alias count object access
+  have owned : memory owner.capability = some object := same_capability ▸ lookup
+  simp only [runtime_freeze, owned, Except.ok.injEq] at frozen
+  rw [← frozen]
+  simp only [checked, same_capability, ↓reduceIte]
+  exact if_pos valid
+
+theorem freeze_alias_rejects_store (memory next : Memory) (owner alias : Pointer) (count : Nat)
+    (object : Object) (value : Int)
+    (frozen : runtime_freeze memory (some owner) = .ok next)
+    (same_capability : alias.capability = owner.capability)
+    (access : checked memory alias count = some object) :
+    ∃ updated, checked next alias count = some updated ∧ updated.bytes = object.bytes ∧
+      guarded_store updated alias.address count value = none := by
+  refine ⟨{ object with readonly := true }, freeze_alias_reads memory next owner alias count object frozen same_capability access,
+    rfl, ?_⟩
+  exact readonly_rejects_store _ _ _ _ rfl
+
+theorem freeze_preserves_other (memory next : Memory) (owner : Pointer) (ident : Nat)
+    (frozen : runtime_freeze memory (some owner) = .ok next) (different : ident ≠ owner.capability) :
+    next ident = memory ident := by
+  cases found : memory owner.capability with
+  | none => simp [runtime_freeze, found] at frozen
+  | some object =>
+    simp only [runtime_freeze, found, Except.ok.injEq] at frozen
+    rw [← frozen]
+    exact if_neg different
+
 structure Snapshot where
   size : Nat
   bytes : Nat → Int
@@ -1018,6 +1060,20 @@ def runtime_copy_offsets (memory : Memory) (source destination : Pointer) (count
       | .ok (object, destination_offset) =>
         if object.readonly then .error .readonly else .ok (some (source_offset, destination_offset))
 
+theorem freeze_alias_rejects_copy (memory next : Memory) (owner source destination : Pointer) (count : Nat)
+    (src dst : Object) (nonempty : count ≠ 0)
+    (frozen : runtime_freeze memory (some owner) = .ok next)
+    (same_capability : destination.capability = owner.capability)
+    (readable : checked next source count = some src) (destination_access : checked memory destination count = some dst) :
+    runtime_copy_offsets next source destination count = .error .readonly := by
+  have destination_frozen := freeze_alias_reads memory next owner destination count dst frozen same_capability destination_access
+  let so := (source.address - src.base).toNat
+  let doff := (destination.address - dst.base).toNat
+  have read_source := (checked_refines next source count so src).mpr ⟨readable, rfl⟩
+  have read_destination := (checked_refines next destination count doff { dst with readonly := true }).mpr
+    ⟨destination_frozen, rfl⟩
+  simp [runtime_copy_offsets, nonempty, read_source, read_destination]
+
 theorem copy_offsets_sound (memory : Memory) (source destination : Pointer) (count s d : Nat)
     (copied : runtime_copy_offsets memory source destination count = .ok (some (s, d))) :
     ∃ src dst, memory source.capability = some src ∧ memory destination.capability = some dst ∧
@@ -1097,6 +1153,9 @@ end Heresy
 #print axioms Heresy.signed_store_load_roundtrip
 #print axioms Heresy.scalar_write_refines
 #print axioms Heresy.readonly_rejects_store
+#print axioms Heresy.freeze_alias_reads
+#print axioms Heresy.freeze_alias_rejects_store
+#print axioms Heresy.freeze_preserves_other
 #print axioms Heresy.signed_bounds
 #print axioms Heresy.lowered_bounds
 #print axioms Heresy.guarded_store_sound
@@ -1123,6 +1182,7 @@ end Heresy
 #print axioms Heresy.payload_copy_refines
 #print axioms Heresy.atomic_copy_refines
 #print axioms Heresy.copy_offsets_sound
+#print axioms Heresy.freeze_alias_rejects_copy
 #print axioms Heresy.copy_snapshot_refines
 #print axioms Heresy.runtime_copy_snapshot
 #print axioms Heresy.lower_program_correct

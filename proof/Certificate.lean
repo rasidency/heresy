@@ -335,6 +335,23 @@ def validates_scalar_memory (generated : String) : Bool :=
     "      updated = writeScalar displacement (widthOf ty) raw (bytes object)"]
   [read, write].all sections.contains && uses.all lines.contains && has_normalisation lines
 
+def validates_freeze (generated : String) : Bool :=
+  let freeze := String.intercalate "\n" [
+    "freeze :: R Value -> R ()",
+    "freeze action = do",
+    "  pointer <- action",
+    "  case pointer of",
+    "    Pointer capability _ -> locked $ do",
+    "      object <- readObject capability",
+    "      writeObject capability (object { storage = \"constant\" })",
+    "    _ -> panic \"read-only storage requires a data pointer\""]
+  let scalar_guard := String.intercalate "\n" [
+    "storeCell declared pointer value = do",
+    "  let ty = case declared of AtomicType inner -> inner; other -> other",
+    "  (ident, object, displacement) <- checked (widthOf declared) pointer",
+    "  when (readOnly object) (panic \"write to read-only memory\")"]
+  (generated.splitOn "\n\n").contains freeze && (generated.splitOn scalar_guard).length == 2
+
 private def closed_source (frontend : String) : Except String Source := do
   let tree ← Json.parse frontend
   unless field_text tree "kind" == "TranslationUnitDecl" do
@@ -403,7 +420,9 @@ def main (arguments : List String) : IO UInt32 := do
       IO.eprintln "memory copy differs from the model"; pure 1
     else if !Heresy.validates_scalar_memory generated then
       IO.eprintln "scalar memory differs from the model"; pure 1
-    else IO.println "checked allocation, access, release, memory copy and scalar equations"; pure 0
+    else if !Heresy.validates_freeze generated then
+      IO.eprintln "read-only transition differs from the model"; pure 1
+    else IO.println "checked allocation, access, release, copy, scalar and read-only equations"; pure 0
   | ["program", ast, haskell] =>
     match Heresy.validate_program (← IO.FS.readFile ast) (← IO.FS.readFile haskell) with
     | .ok () => IO.println "checked emitted closed program and exit status"; pure 0
