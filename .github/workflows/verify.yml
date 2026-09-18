@@ -20,7 +20,10 @@ jobs:
           lake exe certificate memory /tmp/Values.hs &&
           "$FILCC" -std=c11 -fsyntax-only -Xclang -ast-dump=json test/closed.c > /tmp/closed.json &&
           dune exec --profile release -- heresy test/closed.c --closed -o /tmp/Closed.hs &&
-          lake exe certificate program /tmp/closed.json /tmp/Closed.hs'
+          lake exe certificate program /tmp/closed.json /tmp/Closed.hs &&
+          "$FILCC" -std=c11 -fsyntax-only -Xclang -ast-dump=json test/slots.c > /tmp/slots.json &&
+          dune exec --profile release -- heresy test/slots.c --closed -o /tmp/Slots.hs &&
+          lake exe certificate program /tmp/slots.json /tmp/Slots.hs'
       - run: >-
           docker run --rm --network none heresy sh -c
           'dune exec --profile release tools/release.exe -- /tmp/first &&

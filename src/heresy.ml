@@ -1634,7 +1634,7 @@ let rec pure_expression ?(closed = false) context params node =
   match kind node, children node with
   | "IntegerLiteral", _ -> text node "value"
   | "DeclRefExpr", _ ->
-      begin match List.assoc_opt (text (field node "referencedDecl") "id") params with
+      begin match params (text (field node "referencedDecl") "id") with
       | Some p -> p | None -> raise (Error "pure expression references external state") end
   | "ParenExpr", [child] -> ex child
   | "ImplicitCastExpr", [child] when not closed || List.mem (text node "castKind") ["LValueToRValue"; "NoOp"] -> ex child
@@ -1851,7 +1851,7 @@ let context namespace symbols source content frontend_layouts vla_bounds vla_ali
             begin match children ret with
             | [value] ->
                 let bindings = List.mapi (fun i p -> text p "id", "x" ^ string_of_int i) params in
-                Hashtbl.add context.pure (text f "name") (params, pure_expression context bindings value)
+                Hashtbl.add context.pure (text f "name") (params, pure_expression context (fun id -> List.assoc_opt id bindings) value)
             | _ -> () end
         | _ -> ()
     with Error _ -> ()
@@ -2294,6 +2294,17 @@ let prepare_frontend source content dump =
     end) tree;
   content, layouts, bounds, aliases, inherited, adjusted, tree
 
+type closed_command =
+  | Closed_skip
+  | Closed_store of int * string
+  | Closed_sequence of closed_command * closed_command
+  | Closed_select of string * closed_command * closed_command
+  | Closed_result of string
+
+let closed_sequence = function
+  | [] -> Closed_skip
+  | last :: rest -> List.fold_left (fun tail first -> Closed_sequence (first, tail)) last rest
+
 let emit_closed contexts trees =
   let declarations tree = List.filter (fun node -> kind node <> "EmptyDecl" &&
     not (kind node = "TypedefDecl" && Json.bool (field node "isImplicit"))) (children tree) in
@@ -2302,30 +2313,101 @@ let emit_closed contexts trees =
       let main = match declarations tree with
         | [main] when kind main = "FunctionDecl" && text main "name" = "main" && ty main = "int (void)" -> main
         | _ -> raise (Error "closed compilation requires only an int main(void) definition") in
-      let return = match children main with
-        | [body] when kind body = "CompoundStmt" -> children body
-        | _ -> [] in
-      let expression = match return with
-        | [node] when kind node = "ReturnStmt" ->
-            begin match children node with
-            | [cast] when kind cast = "CStyleCastExpr" && text cast "castKind" = "IntegralCast" && ty cast = "int" -> children cast
-            | _ -> [] end
-        | _ -> [] in
-      let body = match expression with
-        | [value] when ty value = "unsigned long" -> pure_expression ~closed:true context [] value
-        | _ -> fail context main "closed main must return an unsigned long expression cast to int" in
-      String.concat "\n" [
+      let rank = ref 0 in
+      let expression scope = pure_expression ~closed:true context (fun id ->
+        Option.map (fun slot -> "(readSlot " ^ string_of_int slot ^ " slots)") (List.assoc_opt id scope)) in
+      let rec lvalue scope node = match kind node, children node with
+        | "ParenExpr", [child] -> lvalue scope child
+        | "DeclRefExpr", [] when ty node = "unsigned long" ->
+            begin match List.assoc_opt (text (field node "referencedDecl") "id") scope with
+            | Some slot -> slot
+            | None -> fail context node "closed assignment requires an in-scope local" end
+        | _ -> fail context node "closed assignment requires an unsigned long local" in
+      let rec statement scope node = match kind node, children node with
+        | "CompoundStmt", nodes ->
+            let _, reversed = List.fold_left (fun (scope, reversed) child ->
+              if kind child = "DeclStmt" then begin
+                let scope, locals = List.fold_left (fun (scope, locals) local ->
+                  let id = text local "id" in
+                  match kind local, children local with
+                  | "VarDecl", [value] when ty local = "unsigned long" && text local "storageClass" = "" &&
+                      text local "init" = "c" && id <> "" && not (List.mem_assoc id scope) ->
+                      let value = expression scope value in
+                      let slot = !rank in
+                      incr rank;
+                      (id, slot) :: scope, Closed_store (slot, value) :: locals
+                  | _ -> fail context local "closed declaration requires an initialised unsigned long local"
+                ) (scope, []) (children child) in
+                scope, closed_sequence locals :: reversed
+              end else scope, statement scope child :: reversed
+            ) (scope, []) nodes in
+            closed_sequence reversed
+        | "NullStmt", [] -> Closed_skip
+        | "BinaryOperator", [left; right] when text node "opcode" = "=" ->
+            Closed_store (lvalue scope left, expression scope right)
+        | "IfStmt", [guard; yes] -> Closed_select (expression scope guard, statement scope yes, Closed_skip)
+        | "IfStmt", [guard; yes; no] ->
+            let yes = statement scope yes in
+            let no = statement scope no in
+            Closed_select (expression scope guard, yes, no)
+        | "ReturnStmt", [cast] when kind cast = "CStyleCastExpr" && text cast "castKind" = "IntegralCast" && ty cast = "int" ->
+            begin match children cast with
+            | [value] -> Closed_result (expression scope value)
+            | _ -> fail context node "closed return requires an unsigned long expression cast to int" end
+        | _ -> fail context node ("unsupported closed statement " ^ kind node) in
+      let body = match children main with
+        | [body] when kind body = "CompoundStmt" -> statement [] body
+        | _ -> fail context main "invalid closed main definition" in
+      let header = [
         "module Main where"; "";
-        "import Data.Bits";
-        "import System.Exit"; "";
+        "import Data.Bits"; "import System.Exit"] in
+      let exit = ["";
         "normalise :: Int -> Bool -> Integer -> Integer";
         "normalise width _ value = value `mod` (2 ^ width)"; "";
         "exitStatus :: Integer -> ExitCode";
         "exitStatus value = case fromInteger (value `mod` 256) of";
         "  0 -> ExitSuccess";
-        "  code -> ExitFailure code"; "";
-        "main :: IO ()";
-        "main = exitWith (exitStatus " ^ par body ^ ")"; ""]
+        "  code -> ExitFailure code"; ""] in
+      begin match body with
+      | Closed_result value ->
+          String.concat "\n" (header @ exit @ ["main :: IO ()"; "main = exitWith (exitStatus " ^ par value ^ ")"; ""])
+      | _ ->
+          let buffer = Buffer.create 2048 in
+          let emit = Buffer.add_string buffer in
+          let rec render = function
+            | Closed_skip -> emit "Next"
+            | Closed_store (slot, value) -> Printf.bprintf buffer "storeSlot %d (\\slots -> %s)" slot value
+            | Closed_sequence (first, second) ->
+                emit "thenSlot ("; render first; emit ") ("; render second; emit ")"
+            | Closed_select (guard, yes, no) ->
+                Printf.bprintf buffer "chooseSlot (\\slots -> %s) (" guard;
+                render yes; emit ") ("; render no; emit ")"
+            | Closed_result value -> Printf.bprintf buffer "returnSlot (\\slots -> %s)" value in
+          emit (String.concat "\n" (header @ ["import qualified Data.IntMap.Strict as Slots"] @ exit @ [
+            "type Locals = Slots.IntMap Integer";
+            "data SlotFlow = Next !Locals | Returned !Integer";
+            "type Action = Locals -> SlotFlow"; "";
+            "readSlot :: Int -> Locals -> Integer";
+            "readSlot = Slots.findWithDefault 0"; "";
+            "storeSlot :: Int -> (Locals -> Integer) -> Action";
+            "storeSlot slot value locals = Next (Slots.insert slot (value locals) locals)"; "";
+            "thenSlot :: Action -> Action -> Action";
+            "thenSlot first second locals = case first locals of";
+            "  Next updated -> second updated";
+            "  result -> result"; "";
+            "chooseSlot :: (Locals -> Integer) -> Action -> Action -> Action";
+            "chooseSlot guard yes no locals = if guard locals == 0 then no locals else yes locals"; "";
+            "returnSlot :: (Locals -> Integer) -> Action";
+            "returnSlot value locals = Returned (value locals)"; "";
+            "runSlots :: Action -> Integer";
+            "runSlots action = case action Slots.empty of";
+            "  Next _ -> 0";
+            "  Returned value -> value"; "";
+            "main :: IO ()"; "main = exitWith (exitStatus (runSlots ("]));
+          render body;
+          emit ")))\n";
+          Buffer.contents buffer
+      end
   | _ -> raise (Error "closed compilation requires one translation unit")
 
 let main () =

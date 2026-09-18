@@ -15,15 +15,18 @@ def operator_text : Operator → String
   | .bor => ".|."
   | .bxor => "`xor`"
 
-def render_target : Target → String
+def render_expression (render_slot : Nat → String) : Target → String
   | .constant value => toString value
-  | .parameter index => "x" ++ toString index
+  | .parameter index => render_slot index
   | .binary operator left right =>
-    "(" ++ render_target left ++ ") " ++ operator_text operator ++ " (" ++ render_target right ++ ")"
+    "(" ++ render_expression render_slot left ++ ") " ++ operator_text operator ++ " (" ++ render_expression render_slot right ++ ")"
   | .wrap width expression =>
-    "normalise " ++ toString width ++ " False (" ++ render_target expression ++ ")"
+    "normalise " ++ toString width ++ " False (" ++ render_expression render_slot expression ++ ")"
   | .conditional condition yes no =>
-    "if (" ++ render_target condition ++ ") == 0 then (" ++ render_target no ++ ") else (" ++ render_target yes ++ ")"
+    "if (" ++ render_expression render_slot condition ++ ") == 0 then (" ++ render_expression render_slot no ++
+      ") else (" ++ render_expression render_slot yes ++ ")"
+
+def render_target := render_expression (fun index => "x" ++ toString index)
 
 def validates_kernel (expression : Source) (body : String) : Bool :=
   body == render_target (lower expression)
@@ -61,7 +64,7 @@ private def read_operator : String → Except String Operator
   | "^" => .ok .bxor
   | other => .error ("unsupported kernel operator " ++ other)
 
-private def read_expression (parameters : List String) : Nat → Json → Except String Source
+private def read_expression (lookup_slot : String → Option Nat) : Nat → Json → Except String Source
   | 0, _ => .error "incomplete kernel expression"
   | depth + 1, node => do
     unless type_spelling node == "unsigned long" do
@@ -73,21 +76,21 @@ private def read_expression (parameters : List String) : Nat → Json → Except
       else throw "kernel constant exceeds 64 bits"
     | "DeclRefExpr", [] =>
       let ident := field_text (json_field node "referencedDecl") "id"
-      let index ← require (parameters.idxOf? ident) "kernel references external state"
+      let index ← require (lookup_slot ident) "expression references external or uninitialised state"
       pure (.parameter index)
-    | "ParenExpr", [child] => read_expression parameters depth child
+    | "ParenExpr", [child] => read_expression lookup_slot depth child
     | "ImplicitCastExpr", [child] =>
       unless field_text node "castKind" == "LValueToRValue" ||
           field_text node "castKind" == "NoOp" do
         throw "kernel cast changes the value"
-      read_expression parameters depth child
+      read_expression lookup_slot depth child
     | "BinaryOperator", [left, right] =>
       .binary <$> read_operator (field_text node "opcode")
-              <*> read_expression parameters depth left
-              <*> read_expression parameters depth right
+              <*> read_expression lookup_slot depth left
+              <*> read_expression lookup_slot depth right
     | "ConditionalOperator", [condition, yes, no] =>
-      .conditional <$> read_expression parameters depth condition
-                   <*> read_expression parameters depth yes <*> read_expression parameters depth no
+      .conditional <$> read_expression lookup_slot depth condition
+                   <*> read_expression lookup_slot depth yes <*> read_expression lookup_slot depth no
     | _, _ => throw "unsupported kernel expression"
 
 private def kernel_symbol (name : String) : String :=
@@ -110,7 +113,7 @@ private def kernel_source (node : Json) (depth : Nat) : Except String (Source ×
   | [statement] =>
     match field_text statement "kind", child_nodes statement with
     | "ReturnStmt", [expression] =>
-      let source ← read_expression identifiers depth expression
+      let source ← read_expression (fun name => identifiers.idxOf? name) depth expression
       pure (source, inputs.length)
     | _, _ => throw "kernel body must return one expression"
   | _ => throw "kernel body must have one statement"
@@ -352,7 +355,78 @@ def validates_freeze (generated : String) : Bool :=
     "  when (readOnly object) (panic \"write to read-only memory\")"]
   (generated.splitOn "\n\n").contains freeze && (generated.splitOn scalar_guard).length == 2
 
-private def closed_source (frontend : String) : Except String Source := do
+private abbrev Scope := List (String × Nat)
+
+private def read_local (scope : Scope) : Nat → Json → Except String Nat
+  | 0, _ => .error "incomplete closed assignment target"
+  | depth + 1, node =>
+    match field_text node "kind", child_nodes node with
+    | "ParenExpr", [child] => read_local scope depth child
+    | "DeclRefExpr", [] => do
+      unless type_spelling node == "unsigned long" do
+        throw "closed assignment requires an unsigned long local"
+      let ident := field_text (json_field node "referencedDecl") "id"
+      require (List.lookup ident scope) "closed assignment requires an in-scope local"
+    | _, _ => .error "closed assignment requires an unsigned long local"
+
+private def sequence_commands : List (Command Source) → Command Source
+  | [] => .skip
+  | last :: rest => rest.foldl (fun tail first => .sequence first tail) last
+
+private def read_command : Nat → Scope → Nat → Json → Except String (Command Source × Nat)
+  | 0, _, _, _ => .error "incomplete closed statement"
+  | depth + 1, scope, rank, node => do
+    match field_text node "kind", child_nodes node with
+    | "CompoundStmt", statements =>
+      let mut scope := scope
+      let mut rank := rank
+      let mut reversed := []
+      for statement in statements do
+        if field_text statement "kind" == "DeclStmt" then
+          let mut declarations := []
+          for declaration in child_nodes statement do
+            let ident := field_text declaration "id"
+            unless field_text declaration "kind" == "VarDecl" && type_spelling declaration == "unsigned long" &&
+                (field_text declaration "storageClass").isEmpty && field_text declaration "init" == "c" &&
+                !ident.isEmpty && (List.lookup ident scope).isNone do
+              throw "closed declaration requires an initialised unsigned long local"
+            let [expression] := child_nodes declaration | throw "missing closed local initialiser"
+            let value ← read_expression (fun ident => List.lookup ident scope) depth expression
+            declarations := .store rank value :: declarations
+            scope := (ident, rank) :: scope
+            rank := rank + 1
+          reversed := sequence_commands declarations :: reversed
+        else
+          let (command, next) ← read_command depth scope rank statement
+          rank := next
+          reversed := command :: reversed
+      pure (sequence_commands reversed, rank)
+    | "NullStmt", [] => pure (.skip, rank)
+    | "BinaryOperator", [left, right] =>
+      unless field_text node "opcode" == "=" do
+        throw "closed statement requires simple assignment"
+      let slot ← read_local scope depth left
+      let value ← read_expression (fun ident => List.lookup ident scope) depth right
+      pure (.store slot value, rank)
+    | "IfStmt", [guard, yes] =>
+      let condition ← read_expression (fun ident => List.lookup ident scope) depth guard
+      let (chosen, next) ← read_command depth scope rank yes
+      pure (.select condition chosen .skip, next)
+    | "IfStmt", [guard, yes, no] =>
+      let condition ← read_expression (fun ident => List.lookup ident scope) depth guard
+      let (chosen, next) ← read_command depth scope rank yes
+      let (alternative, next) ← read_command depth scope next no
+      pure (.select condition chosen alternative, next)
+    | "ReturnStmt", [cast] =>
+      unless field_text cast "kind" == "CStyleCastExpr" && field_text cast "castKind" == "IntegralCast" &&
+          type_spelling cast == "int" do
+        throw "closed return requires an unsigned long expression cast to int"
+      let [expression] := child_nodes cast | throw "missing closed return expression"
+      let value ← read_expression (fun ident => List.lookup ident scope) depth expression
+      pure (.result value, rank)
+    | _, _ => throw "unsupported closed statement"
+
+private def closed_source (frontend : String) : Except String (Command Source) := do
   let tree ← Json.parse frontend
   unless field_text tree "kind" == "TranslationUnitDecl" do
     throw "expected a translation unit"
@@ -364,32 +438,62 @@ private def closed_source (frontend : String) : Except String Source := do
       type_spelling main == "int (void)" do
     throw "closed program must define int main(void)"
   let [body] := child_nodes main | throw "invalid closed main definition"
-  let [statement] := child_nodes body | throw "closed main must contain one return"
-  let [cast] := child_nodes statement | throw "closed main must return one value"
-  let [expression] := child_nodes cast | throw "closed main must cast its return value to int"
-  unless field_text body "kind" == "CompoundStmt" && field_text statement "kind" == "ReturnStmt" &&
-      field_text cast "kind" == "CStyleCastExpr" && field_text cast "castKind" == "IntegralCast" &&
-      type_spelling cast == "int" do
-    throw "closed main must return an unsigned long expression cast to int"
-  read_expression [] frontend.length expression
+  unless field_text body "kind" == "CompoundStmt" do
+    throw "invalid closed main body"
+  Prod.fst <$> read_command frontend.length [] 0 body
 
-def render_program (body : Target) : String := String.intercalate "\n" [
-  "module Main where", "",
-  "import Data.Bits", "import System.Exit", "",
+private def exit_definition : List String := ["",
   "normalise :: Int -> Bool -> Integer -> Integer",
   "normalise width _ value = value `mod` (2 ^ width)", "",
   "exitStatus :: Integer -> ExitCode",
   "exitStatus value = case fromInteger (value `mod` 256) of",
-  "  0 -> ExitSuccess", "  code -> ExitFailure code", "",
-  "main :: IO ()", "main = exitWith (exitStatus (" ++ render_target body ++ "))", ""]
+  "  0 -> ExitSuccess", "  code -> ExitFailure code", ""]
 
-def validates_program (body : Source) (generated : String) : Bool :=
-  generated == render_program (lower body)
+private def render_slot_expression (expression : Target) : String :=
+  "(\\slots -> " ++ render_expression (fun index => "(readSlot " ++ toString index ++ " slots)") expression ++ ")"
 
-theorem program_certificate_sound (body : Source) (generated : String)
+private def render_command : Command Target → String
+  | .skip => "Next"
+  | .store slot expression => "storeSlot " ++ toString slot ++ " " ++ render_slot_expression expression
+  | .sequence first second => "thenSlot (" ++ render_command first ++ ") (" ++ render_command second ++ ")"
+  | .select guard yes no => "chooseSlot " ++ render_slot_expression guard ++ " (" ++ render_command yes ++ ") (" ++ render_command no ++ ")"
+  | .result expression => "returnSlot " ++ render_slot_expression expression
+
+def render_program (body : Command Target) : String :=
+  let header := ["module Main where", "", "import Data.Bits", "import System.Exit"]
+  match body with
+  | .result expression => String.intercalate "\n" (header ++ exit_definition ++ [
+    "main :: IO ()", "main = exitWith (exitStatus (" ++ render_target expression ++ "))", ""])
+  | _ => String.intercalate "\n" (header ++ ["import qualified Data.IntMap.Strict as Slots"] ++ exit_definition ++ [
+    "type Locals = Slots.IntMap Integer",
+    "data SlotFlow = Next !Locals | Returned !Integer",
+    "type Action = Locals -> SlotFlow", "",
+    "readSlot :: Int -> Locals -> Integer",
+    "readSlot = Slots.findWithDefault 0", "",
+    "storeSlot :: Int -> (Locals -> Integer) -> Action",
+    "storeSlot slot value locals = Next (Slots.insert slot (value locals) locals)", "",
+    "thenSlot :: Action -> Action -> Action",
+    "thenSlot first second locals = case first locals of",
+    "  Next updated -> second updated",
+    "  result -> result", "",
+    "chooseSlot :: (Locals -> Integer) -> Action -> Action -> Action",
+    "chooseSlot guard yes no locals = if guard locals == 0 then no locals else yes locals", "",
+    "returnSlot :: (Locals -> Integer) -> Action",
+    "returnSlot value locals = Returned (value locals)", "",
+    "runSlots :: Action -> Integer",
+    "runSlots action = case action Slots.empty of",
+    "  Next _ -> 0",
+    "  Returned value -> value", "",
+    "main :: IO ()", "main = exitWith (exitStatus (runSlots (" ++ render_command body ++ ")))", ""])
+
+def validates_program (body : Command Source) (generated : String) : Bool :=
+  generated == render_program (body.map lower)
+
+theorem program_certificate_sound (body : Command Source) (generated : String)
     (accepted : validates_program body generated = true) :
-    ∃ target : Target, generated = render_program target ∧ target_status target = source_status body := by
-  refine ⟨lower body, ?_, lower_program_correct body⟩
+    ∃ target : Command Target, generated = render_program target ∧
+      ∀ status, target_observes target status ↔ source_observes body status := by
+  refine ⟨body.map lower, ?_, lower_commands_correct body⟩
   simpa [validates_program] using accepted
 
 def validate_program (frontend generated : String) : Except String Unit := do

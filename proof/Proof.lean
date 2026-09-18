@@ -157,6 +157,66 @@ private theorem exit_status_truncation (value : Int) : unsigned 8 (signed 32 val
 theorem lower_program_correct (body : Source) : target_status (lower body) = source_status body := by
   simp only [target_status, lower_correct, source_status, exit_status_truncation]
 
+abbrev Locals := Nat → Int
+
+inductive Command (expr : Type) where
+  | skip
+  | store (slot : Nat) (value : expr)
+  | sequence (first second : Command expr)
+  | select (guard : expr) (yes no : Command expr)
+  | result (value : expr)
+
+def Command.map (transform : α → β) : Command α → Command β
+  | .skip => .skip
+  | .store slot value => .store slot (transform value)
+  | .sequence first second => .sequence (first.map transform) (second.map transform)
+  | .select guard yes no => .select (transform guard) (yes.map transform) (no.map transform)
+  | .result value => .result (transform value)
+
+inductive CommandOutcome where
+  | next (locals : Locals)
+  | returned (value : Int)
+
+def write_local (locals : Locals) (slot : Nat) (value : Int) : Locals :=
+  fun index => if index = slot then value else locals index
+
+inductive Executes : Command (Locals → Int) → Locals → CommandOutcome → Prop where
+  | skip : Executes .skip locals (.next locals)
+  | store : Executes (.store slot expression) locals (.next (write_local locals slot (expression locals)))
+  | result : Executes (.result expression) locals (.returned (expression locals))
+  | sequence_next : Executes first locals (.next updated) → Executes second updated outcome →
+      Executes (.sequence first second) locals outcome
+  | sequence_returned : Executes first locals (.returned value) →
+      Executes (.sequence first second) locals (.returned value)
+  | select_yes {condition : Locals → Int} : condition locals ≠ 0 → Executes yes locals outcome →
+      Executes (.select condition yes no) locals outcome
+  | select_no {condition : Locals → Int} : condition locals = 0 → Executes no locals outcome →
+      Executes (.select condition yes no) locals outcome
+
+def source_commands (body : Command Source) : Command (Locals → Int) := body.map (fun expr locals => source_eval locals expr)
+
+def target_commands (body : Command Target) : Command (Locals → Int) := body.map (fun expr locals => target_eval locals expr)
+
+theorem lower_commands_preserves_operations (body : Command Source) :
+    target_commands (body.map lower) = source_commands body := by
+  have expression (expr : Source) : (fun locals => target_eval locals (lower expr)) = (fun locals => source_eval locals expr) :=
+    funext (lower_correct expr)
+  induction body <;> simp only [source_commands, target_commands, Command.map, expression] at * <;> simp_all
+
+def CommandOutcome.value : CommandOutcome → Int
+  | .next _ => 0
+  | .returned value => value
+
+def source_observes (body : Command Source) (status : Int) : Prop :=
+  ∃ outcome, Executes (source_commands body) (fun _ => 0) outcome ∧ status = unsigned 8 (signed 32 outcome.value)
+
+def target_observes (body : Command Target) (status : Int) : Prop :=
+  ∃ outcome, Executes (target_commands body) (fun _ => 0) outcome ∧ status = unsigned 8 outcome.value
+
+theorem lower_commands_correct (body : Command Source) (status : Int) :
+    target_observes (body.map lower) status ↔ source_observes body status := by
+  simp only [target_observes, source_observes, lower_commands_preserves_operations, exit_status_truncation]
+
 structure Object where
   base : Int
   size : Nat
@@ -1186,3 +1246,4 @@ end Heresy
 #print axioms Heresy.copy_snapshot_refines
 #print axioms Heresy.runtime_copy_snapshot
 #print axioms Heresy.lower_program_correct
+#print axioms Heresy.lower_commands_correct
