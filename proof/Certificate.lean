@@ -463,7 +463,7 @@ def render_program (body : Command Target) : String :=
   let header := ["module Main where", "", "import Data.Bits", "import System.Exit"]
   match body with
   | .result expression => String.intercalate "\n" (header ++ exit_definition ++ [
-    "main :: IO ()", "main = exitWith (exitStatus (" ++ render_target expression ++ "))", ""])
+    "main :: IO ()", "main = exitWith (exitStatus (" ++ render_expression (fun _ => "0") expression ++ "))", ""])
   | _ => String.intercalate "\n" (header ++ ["import qualified Data.IntMap.Strict as Slots"] ++ exit_definition ++ [
     "type Locals = Slots.IntMap Integer",
     "data SlotFlow = Next !Locals | Returned !Integer",

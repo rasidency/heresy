@@ -173,25 +173,79 @@ def Command.map (transform : α → β) : Command α → Command β
   | .select guard yes no => .select (transform guard) (yes.map transform) (no.map transform)
   | .result value => .result (transform value)
 
-inductive CommandOutcome where
-  | next (locals : Locals)
+inductive CommandOutcome (state : Type) where
+  | next (locals : state)
   | returned (value : Int)
 
 def write_local (locals : Locals) (slot : Nat) (value : Int) : Locals :=
   fun index => if index = slot then value else locals index
 
-inductive Executes : Command (Locals → Int) → Locals → CommandOutcome → Prop where
-  | skip : Executes .skip locals (.next locals)
-  | store : Executes (.store slot expression) locals (.next (write_local locals slot (expression locals)))
-  | result : Executes (.result expression) locals (.returned (expression locals))
-  | sequence_next : Executes first locals (.next updated) → Executes second updated outcome →
-      Executes (.sequence first second) locals outcome
-  | sequence_returned : Executes first locals (.returned value) →
-      Executes (.sequence first second) locals (.returned value)
-  | select_yes {condition : Locals → Int} : condition locals ≠ 0 → Executes yes locals outcome →
-      Executes (.select condition yes no) locals outcome
-  | select_no {condition : Locals → Int} : condition locals = 0 → Executes no locals outcome →
-      Executes (.select condition yes no) locals outcome
+inductive Executes (project : state → Locals) (write : state → Nat → Int → state) :
+    Command (Locals → Int) → state → CommandOutcome state → Prop where
+  | skip : Executes project write .skip locals (.next locals)
+  | store : Executes project write (.store slot expression) locals
+      (.next (write locals slot (expression (project locals))))
+  | result : Executes project write (.result expression) locals (.returned (expression (project locals)))
+  | sequence_next : Executes project write first locals (.next updated) → Executes project write second updated outcome →
+      Executes project write (.sequence first second) locals outcome
+  | sequence_returned : Executes project write first locals (.returned value) →
+      Executes project write (.sequence first second) locals (.returned value)
+  | select_yes : condition (project locals) ≠ 0 → Executes project write yes locals outcome →
+      Executes project write (.select condition yes no) locals outcome
+  | select_no : condition (project locals) = 0 → Executes project write no locals outcome →
+      Executes project write (.select condition yes no) locals outcome
+
+def CommandOutcome.project (view : state → Locals) : CommandOutcome state → CommandOutcome Locals
+  | .next locals => .next (view locals)
+  | .returned value => .returned value
+
+private theorem project_execution (view : state → Locals) (write : state → Nat → Int → state)
+    (writes : ∀ initial slot value, view (write initial slot value) = write_local (view initial) slot value)
+    (body : Command (Locals → Int)) (initial : state) (outcome : CommandOutcome state)
+    (run : Executes view write body initial outcome) :
+    Executes id write_local body (view initial) (outcome.project view) := by
+  induction run with
+  | skip => exact .skip
+  | store =>
+    rw [CommandOutcome.project, writes]
+    exact .store
+  | result => exact .result
+  | sequence_next _ _ first second => exact .sequence_next first second
+  | sequence_returned _ first => exact .sequence_returned first
+  | select_yes condition _ chosen => exact .select_yes condition chosen
+  | select_no condition _ chosen => exact .select_no condition chosen
+
+private theorem lift_execution (view : state → Locals) (write : state → Nat → Int → state)
+    (writes : ∀ initial slot value, view (write initial slot value) = write_local (view initial) slot value)
+    (body : Command (Locals → Int)) (locals : Locals) (outcome : CommandOutcome Locals)
+    (run : Executes id write_local body locals outcome) (initial : state) (same : view initial = locals) :
+    ∃ result, Executes view write body initial result ∧ result.project view = outcome := by
+  induction run generalizing initial with
+  | skip => exact ⟨.next initial, .skip, congrArg CommandOutcome.next same⟩
+  | store =>
+    refine ⟨_, .store, ?_⟩
+    simp only [CommandOutcome.project, writes, same, id_eq]
+  | result =>
+    refine ⟨_, .result, ?_⟩
+    simp only [CommandOutcome.project, same, id_eq]
+  | sequence_next _ _ first second =>
+    obtain ⟨step, first_run, projected⟩ := first initial same
+    cases step with
+    | next updated =>
+      obtain ⟨result, second_run, final⟩ := second updated (CommandOutcome.next.inj projected)
+      exact ⟨result, .sequence_next first_run second_run, final⟩
+    | returned value => cases projected
+  | sequence_returned _ first =>
+    obtain ⟨step, first_run, projected⟩ := first initial same
+    cases step with
+    | next updated => cases projected
+    | returned value => exact ⟨.returned value, .sequence_returned first_run, projected⟩
+  | select_yes condition _ chosen =>
+    obtain ⟨result, selected, projected⟩ := chosen initial same
+    exact ⟨result, .select_yes (by simpa only [same, id_eq] using condition) selected, projected⟩
+  | select_no condition _ chosen =>
+    obtain ⟨result, selected, projected⟩ := chosen initial same
+    exact ⟨result, .select_no (by simpa only [same, id_eq] using condition) selected, projected⟩
 
 def source_commands (body : Command Source) : Command (Locals → Int) := body.map (fun expr locals => source_eval locals expr)
 
@@ -203,19 +257,52 @@ theorem lower_commands_preserves_operations (body : Command Source) :
     funext (lower_correct expr)
   induction body <;> simp only [source_commands, target_commands, Command.map, expression] at * <;> simp_all
 
-def CommandOutcome.value : CommandOutcome → Int
+def CommandOutcome.value : CommandOutcome state → Int
   | .next _ => 0
   | .returned value => value
 
+@[simp] private theorem CommandOutcome.project_value (view : state → Locals) (outcome : CommandOutcome state) :
+    (outcome.project view).value = outcome.value := by cases outcome <;> rfl
+
+abbrev SparseLocals := Std.TreeMap Nat Int
+
+def read_sparse (locals : SparseLocals) : Locals := fun slot => locals.getD slot 0
+
+def write_sparse (locals : SparseLocals) (slot : Nat) (value : Int) : SparseLocals := locals.insert slot value
+
+theorem sparse_write_refines (locals : SparseLocals) (slot : Nat) (value : Int) :
+    read_sparse (write_sparse locals slot value) = write_local (read_sparse locals) slot value := by
+  funext index
+  simp only [read_sparse, write_sparse, Std.TreeMap.getD_insert, Nat.compare_eq_eq, write_local]
+  by_cases same : index = slot
+  · subst index
+    rfl
+  · simp [same, Ne.symm same]
+
+private theorem sparse_empty : read_sparse ∅ = (fun _ => 0) := by
+  funext slot
+  exact Std.TreeMap.getD_emptyc
+
 def source_observes (body : Command Source) (status : Int) : Prop :=
-  ∃ outcome, Executes (source_commands body) (fun _ => 0) outcome ∧ status = unsigned 8 (signed 32 outcome.value)
+  ∃ outcome, Executes id write_local (source_commands body) (fun _ => 0) outcome ∧
+    status = unsigned 8 (signed 32 outcome.value)
 
 def target_observes (body : Command Target) (status : Int) : Prop :=
-  ∃ outcome, Executes (target_commands body) (fun _ => 0) outcome ∧ status = unsigned 8 outcome.value
+  ∃ outcome, Executes read_sparse write_sparse (target_commands body) ∅ outcome ∧ status = unsigned 8 outcome.value
 
 theorem lower_commands_correct (body : Command Source) (status : Int) :
     target_observes (body.map lower) status ↔ source_observes body status := by
   simp only [target_observes, source_observes, lower_commands_preserves_operations, exit_status_truncation]
+  constructor
+  · rintro ⟨result, execution, observed⟩
+    refine ⟨result.project read_sparse, ?_, by simpa using observed⟩
+    have projected := project_execution read_sparse write_sparse sparse_write_refines _ _ _ execution
+    simpa only [sparse_empty] using projected
+  · rintro ⟨result, execution, observed⟩
+    obtain ⟨target, run, projected⟩ := lift_execution read_sparse write_sparse sparse_write_refines _ _ _
+      execution ∅ sparse_empty
+    refine ⟨target, run, ?_⟩
+    rw [observed, ← projected, CommandOutcome.project_value]
 
 structure Object where
   base : Int
@@ -1247,3 +1334,4 @@ end Heresy
 #print axioms Heresy.runtime_copy_snapshot
 #print axioms Heresy.lower_program_correct
 #print axioms Heresy.lower_commands_correct
+#print axioms Heresy.sparse_write_refines
