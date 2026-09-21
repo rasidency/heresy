@@ -2299,6 +2299,7 @@ type closed_command =
   | Closed_store of int * string
   | Closed_sequence of closed_command * closed_command
   | Closed_select of string * closed_command * closed_command
+  | Closed_loop of string * closed_command
   | Closed_result of string
 
 let closed_sequence = function
@@ -2350,6 +2351,7 @@ let emit_closed contexts trees =
             let yes = statement scope yes in
             let no = statement scope no in
             Closed_select (expression scope guard, yes, no)
+        | "WhileStmt", [guard; body] -> Closed_loop (expression scope guard, statement scope body)
         | "ReturnStmt", [cast] when kind cast = "CStyleCastExpr" && text cast "castKind" = "IntegralCast" && ty cast = "int" ->
             begin match children cast with
             | [value] -> Closed_result (expression scope value)
@@ -2382,6 +2384,9 @@ let emit_closed contexts trees =
             | Closed_select (guard, yes, no) ->
                 Printf.bprintf buffer "chooseSlot (\\slots -> %s) (" guard;
                 render yes; emit ") ("; render no; emit ")"
+            | Closed_loop (guard, body) ->
+                Printf.bprintf buffer "whileSlot (\\slots -> %s) (" guard;
+                render body; emit ")"
             | Closed_result value -> Printf.bprintf buffer "returnSlot (\\slots -> %s)" value in
           emit (String.concat "\n" (header @ ["import qualified Data.IntMap.Strict as Slots"] @ exit @ [
             "type Locals = Slots.IntMap Integer";
@@ -2397,6 +2402,14 @@ let emit_closed contexts trees =
             "  result -> result"; "";
             "chooseSlot :: (Locals -> Integer) -> Action -> Action -> Action";
             "chooseSlot guard yes no locals = if guard locals == 0 then no locals else yes locals"; "";
+            "whileSlot :: (Locals -> Integer) -> Action -> Action";
+            "whileSlot guard body = loop";
+            "  where";
+            "    loop locals";
+            "      | guard locals == 0 = Next locals";
+            "      | otherwise = case body locals of";
+            "          Next updated -> loop updated";
+            "          result -> result"; "";
             "returnSlot :: (Locals -> Integer) -> Action";
             "returnSlot value locals = Returned (value locals)"; "";
             "runSlots :: Action -> Integer";

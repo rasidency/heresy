@@ -210,7 +210,7 @@ let () =
       (status = 37 && output = "" && errors = "" && (status, output, errors) = run "build/exitstatusref" []);
     ignore (success compiler ["test/slots.c"; "--closed"; "--build"; "build/slots"]);
     ignore (success frontend ["-std=c11"; "-O1"; "test/slots.c"; "-o"; "build/slotsref"]);
-    check "closed local assignments preserve scope, branch joins and process status"
+    check "closed local assignments preserve scope, branch joins, loop state and process status"
       (run "build/slots" [] = (37, "", "") && run "build/slotsref" [] = (37, "", ""));
     check "value copies preserve ownership and IEEE scalar behaviour"
       (contains values "copies 11 12 1 42 1 10\nmembers 28 42 -3\nieee 4b800000 1 8000000000000000 1 1 1 0 -3\n" &&

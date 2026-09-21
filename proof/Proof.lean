@@ -164,6 +164,7 @@ inductive Command (expr : Type) where
   | store (slot : Nat) (value : expr)
   | sequence (first second : Command expr)
   | select (guard : expr) (yes no : Command expr)
+  | loop (guard : expr) (body : Command expr)
   | result (value : expr)
 
 def Command.map (transform : α → β) : Command α → Command β
@@ -171,6 +172,7 @@ def Command.map (transform : α → β) : Command α → Command β
   | .store slot value => .store slot (transform value)
   | .sequence first second => .sequence (first.map transform) (second.map transform)
   | .select guard yes no => .select (transform guard) (yes.map transform) (no.map transform)
+  | .loop guard body => .loop (transform guard) (body.map transform)
   | .result value => .result (transform value)
 
 inductive CommandOutcome (state : Type) where
@@ -194,6 +196,55 @@ inductive Executes (project : state → Locals) (write : state → Nat → Int �
       Executes project write (.select condition yes no) locals outcome
   | select_no : condition (project locals) = 0 → Executes project write no locals outcome →
       Executes project write (.select condition yes no) locals outcome
+  | loop_done : condition (project locals) = 0 → Executes project write (.loop condition body) locals (.next locals)
+  | loop_next : condition (project locals) ≠ 0 → Executes project write body locals (.next updated) →
+      Executes project write (.loop condition body) updated outcome → Executes project write (.loop condition body) locals outcome
+  | loop_returned : condition (project locals) ≠ 0 → Executes project write body locals (.returned value) →
+      Executes project write (.loop condition body) locals (.returned value)
+
+theorem executes_deterministic {view : state → Locals} {write : state → Nat → Int → state}
+    {body : Command (Locals → Int)} {initial : state} {observed alternative : CommandOutcome state}
+    (run : Executes view write body initial observed) (other : Executes view write body initial alternative) :
+    observed = alternative := by
+  induction run generalizing alternative with
+  | skip => cases other; rfl
+  | store => cases other; rfl
+  | result => cases other; rfl
+  | sequence_next _ _ first second =>
+    cases other with
+    | sequence_next first_other second_other =>
+      cases CommandOutcome.next.inj (first first_other)
+      exact second second_other
+    | sequence_returned first_other => cases first first_other
+  | sequence_returned _ first =>
+    cases other with
+    | sequence_next first_other _ => cases first first_other
+    | sequence_returned first_other => exact first first_other
+  | select_yes condition _ chosen =>
+    cases other with
+    | select_yes _ other_run => exact chosen other_run
+    | select_no untaken _ => exact (condition untaken).elim
+  | select_no condition _ chosen =>
+    cases other with
+    | select_yes untaken _ => exact (untaken condition).elim
+    | select_no _ other_run => exact chosen other_run
+  | loop_done condition =>
+    cases other with
+    | loop_done => rfl
+    | loop_next untaken _ _ => exact (untaken condition).elim
+    | loop_returned untaken _ => exact (untaken condition).elim
+  | loop_next condition _ _ iteration rest =>
+    cases other with
+    | loop_done untaken => exact (condition untaken).elim
+    | loop_next _ iteration_other rest_other =>
+      cases CommandOutcome.next.inj (iteration iteration_other)
+      exact rest rest_other
+    | loop_returned _ iteration_other => cases iteration iteration_other
+  | loop_returned condition _ iteration =>
+    cases other with
+    | loop_done untaken => exact (condition untaken).elim
+    | loop_next _ iteration_other _ => cases iteration iteration_other
+    | loop_returned _ iteration_other => exact iteration iteration_other
 
 def CommandOutcome.project (view : state → Locals) : CommandOutcome state → CommandOutcome Locals
   | .next locals => .next (view locals)
@@ -214,6 +265,9 @@ private theorem project_execution (view : state → Locals) (write : state → N
   | sequence_returned _ first => exact .sequence_returned first
   | select_yes condition _ chosen => exact .select_yes condition chosen
   | select_no condition _ chosen => exact .select_no condition chosen
+  | loop_done condition => exact .loop_done condition
+  | loop_next condition _ _ iteration rest => exact .loop_next condition iteration rest
+  | loop_returned condition _ iteration => exact .loop_returned condition iteration
 
 private theorem lift_execution (view : state → Locals) (write : state → Nat → Int → state)
     (writes : ∀ initial slot value, view (write initial slot value) = write_local (view initial) slot value)
@@ -246,6 +300,21 @@ private theorem lift_execution (view : state → Locals) (write : state → Nat 
   | select_no condition _ chosen =>
     obtain ⟨result, selected, projected⟩ := chosen initial same
     exact ⟨result, .select_no (by simpa only [same, id_eq] using condition) selected, projected⟩
+  | loop_done condition =>
+    exact ⟨.next initial, .loop_done (by simpa only [same, id_eq] using condition), congrArg CommandOutcome.next same⟩
+  | loop_next condition _ _ iteration rest =>
+    obtain ⟨step, step_run, projected⟩ := iteration initial same
+    cases step with
+    | next updated =>
+      obtain ⟨result, rest_run, final⟩ := rest updated (CommandOutcome.next.inj projected)
+      exact ⟨result, .loop_next (by simpa only [same, id_eq] using condition) step_run rest_run, final⟩
+    | returned value => cases projected
+  | loop_returned condition _ iteration =>
+    obtain ⟨step, step_run, projected⟩ := iteration initial same
+    cases step with
+    | next updated => cases projected
+    | returned value => exact ⟨.returned value,
+        .loop_returned (by simpa only [same, id_eq] using condition) step_run, projected⟩
 
 def source_commands (body : Command Source) : Command (Locals → Int) := body.map (fun expr locals => source_eval locals expr)
 
@@ -1334,4 +1403,5 @@ end Heresy
 #print axioms Heresy.runtime_copy_snapshot
 #print axioms Heresy.lower_program_correct
 #print axioms Heresy.lower_commands_correct
+#print axioms Heresy.executes_deterministic
 #print axioms Heresy.sparse_write_refines

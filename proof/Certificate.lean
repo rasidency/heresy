@@ -417,6 +417,10 @@ private def read_command : Nat → Scope → Nat → Json → Except String (Com
       let (chosen, next) ← read_command depth scope rank yes
       let (alternative, next) ← read_command depth scope next no
       pure (.select condition chosen alternative, next)
+    | "WhileStmt", [guard, body] =>
+      let condition ← read_expression (fun ident => List.lookup ident scope) depth guard
+      let (iteration, next) ← read_command depth scope rank body
+      pure (.loop condition iteration, next)
     | "ReturnStmt", [cast] =>
       unless field_text cast "kind" == "CStyleCastExpr" && field_text cast "castKind" == "IntegralCast" &&
           type_spelling cast == "int" do
@@ -457,6 +461,7 @@ private def render_command : Command Target → String
   | .store slot expression => "storeSlot " ++ toString slot ++ " " ++ render_slot_expression expression
   | .sequence first second => "thenSlot (" ++ render_command first ++ ") (" ++ render_command second ++ ")"
   | .select guard yes no => "chooseSlot " ++ render_slot_expression guard ++ " (" ++ render_command yes ++ ") (" ++ render_command no ++ ")"
+  | .loop guard body => "whileSlot " ++ render_slot_expression guard ++ " (" ++ render_command body ++ ")"
   | .result expression => "returnSlot " ++ render_slot_expression expression
 
 def render_program (body : Command Target) : String :=
@@ -478,6 +483,14 @@ def render_program (body : Command Target) : String :=
     "  result -> result", "",
     "chooseSlot :: (Locals -> Integer) -> Action -> Action -> Action",
     "chooseSlot guard yes no locals = if guard locals == 0 then no locals else yes locals", "",
+    "whileSlot :: (Locals -> Integer) -> Action -> Action",
+    "whileSlot guard body = loop",
+    "  where",
+    "    loop locals",
+    "      | guard locals == 0 = Next locals",
+    "      | otherwise = case body locals of",
+    "          Next updated -> loop updated",
+    "          result -> result", "",
     "returnSlot :: (Locals -> Integer) -> Action",
     "returnSlot value locals = Returned (value locals)", "",
     "runSlots :: Action -> Integer",
