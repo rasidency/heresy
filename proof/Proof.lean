@@ -107,6 +107,16 @@ def admissible : Source → Prop
   | .binary _ left right => admissible left ∧ admissible right
   | .conditional condition yes no => admissible condition ∧ admissible yes ∧ admissible no
 
+def check_expression : Source → Bool
+  | .constant value => decide (0 ≤ value ∧ value < modulus 64)
+  | .parameter _ => true
+  | .binary _ left right => check_expression left && check_expression right
+  | .conditional condition yes no => check_expression condition && (check_expression yes && check_expression no)
+
+theorem check_expression_sound (expression : Source) (accepted : check_expression expression = true) :
+    admissible expression := by
+  induction expression <;> simp_all [check_expression, admissible]
+
 theorem source_eval_bounds (expression : Source) (parameters : Nat → Int)
     (valid : admissible expression)
     (bounded : ∀ index, 0 ≤ parameters index ∧ parameters index < modulus 64) :
@@ -320,6 +330,78 @@ def source_commands (body : Command Source) : Command (Locals → Int) := body.m
 
 def target_commands (body : Command Target) : Command (Locals → Int) := body.map (fun expr locals => target_eval locals expr)
 
+def Command.all (predicate : α → Prop) : Command α → Prop
+  | .skip => True
+  | .store _ value | .result value => predicate value
+  | .sequence first second => first.all predicate ∧ second.all predicate
+  | .select condition yes no => predicate condition ∧ yes.all predicate ∧ no.all predicate
+  | .loop condition body => predicate condition ∧ body.all predicate
+
+def check_commands : Command Source → Bool
+  | .skip => true
+  | .store _ value | .result value => check_expression value
+  | .sequence first second => check_commands first && check_commands second
+  | .select condition yes no => check_expression condition && (check_commands yes && check_commands no)
+  | .loop condition body => check_expression condition && check_commands body
+
+theorem check_commands_sound (body : Command Source) (accepted : check_commands body = true) : body.all admissible := by
+  induction body with
+  | skip => trivial
+  | store _ value => exact check_expression_sound value accepted
+  | result value => exact check_expression_sound value accepted
+  | sequence _ _ first second =>
+    simp only [check_commands, Bool.and_eq_true] at accepted
+    obtain ⟨first_ok, second_ok⟩ := accepted
+    exact ⟨first first_ok, second second_ok⟩
+  | select condition _ _ yes no =>
+    simp only [check_commands, Bool.and_eq_true] at accepted
+    obtain ⟨guard_ok, yes_ok, no_ok⟩ := accepted
+    exact ⟨check_expression_sound condition guard_ok, yes yes_ok, no no_ok⟩
+  | loop condition _ body =>
+    simp only [check_commands, Bool.and_eq_true] at accepted
+    obtain ⟨guard_ok, body_ok⟩ := accepted
+    exact ⟨check_expression_sound condition guard_ok, body body_ok⟩
+
+def BoundedWord (value : Int) : Prop := 0 ≤ value ∧ value < modulus 64
+
+def BoundedLocals (locals : Locals) : Prop := ∀ slot, BoundedWord (locals slot)
+
+def BoundedExpression (expression : Locals → Int) : Prop :=
+  ∀ locals, BoundedLocals locals → BoundedWord (expression locals)
+
+private theorem bounded_source_commands (body : Command Source) (valid : body.all admissible) :
+    (source_commands body).all BoundedExpression := by
+  have arithmetic (expression : Source) (ok : admissible expression) :
+      BoundedExpression (fun locals => source_eval locals expression) :=
+    fun locals bounded => source_eval_bounds expression locals ok bounded
+  induction body <;> simp_all [Command.all, source_commands, Command.map]
+
+def CommandOutcome.bounded (view : state → Locals) : CommandOutcome state → Prop
+  | .next updated => BoundedLocals (view updated)
+  | .returned value => BoundedWord value
+
+theorem execution_preserves_words {view : state → Locals} {write : state → Nat → Int → state}
+    (writes : ∀ initial slot value, view (write initial slot value) = write_local (view initial) slot value)
+    {body : Command (Locals → Int)} {initial : state} {outcome : CommandOutcome state}
+    (run : Executes view write body initial outcome) (valid : body.all BoundedExpression)
+    (bounded : BoundedLocals (view initial)) : outcome.bounded view := by
+  induction run with
+  | skip => exact bounded
+  | store =>
+    simp only [CommandOutcome.bounded, writes, BoundedLocals, write_local]
+    intro index
+    split
+    · exact valid _ bounded
+    · exact bounded index
+  | result => exact valid _ bounded
+  | sequence_next _ _ first second => exact second valid.2 (first valid.1 bounded)
+  | sequence_returned _ first => exact first valid.1 bounded
+  | select_yes _ _ chosen => exact chosen valid.2.1 bounded
+  | select_no _ _ chosen => exact chosen valid.2.2 bounded
+  | loop_done => exact bounded
+  | loop_next _ _ _ iteration rest => exact rest valid (iteration valid.2 bounded)
+  | loop_returned _ _ iteration => exact iteration valid.2 bounded
+
 theorem lower_commands_preserves_operations (body : Command Source) :
     target_commands (body.map lower) = source_commands body := by
   have expression (expr : Source) : (fun locals => target_eval locals (lower expr)) = (fun locals => source_eval locals expr) :=
@@ -372,6 +454,17 @@ theorem lower_commands_correct (body : Command Source) (status : Int) :
       execution ∅ sparse_empty
     refine ⟨target, run, ?_⟩
     rw [observed, ← projected, CommandOutcome.project_value]
+
+theorem lowered_execution_preserves_words (body : Command Source) (accepted : check_commands body = true)
+    (outcome : CommandOutcome SparseLocals)
+    (run : Executes read_sparse write_sparse (target_commands (body.map lower)) ∅ outcome) :
+    outcome.bounded read_sparse := by
+  rw [lower_commands_preserves_operations] at run
+  have valid := bounded_source_commands body (check_commands_sound body accepted)
+  apply execution_preserves_words sparse_write_refines run valid
+  rw [sparse_empty]
+  intro _
+  exact ⟨Int.le_refl 0, modulus_positive 64⟩
 
 structure Object where
   base : Int
@@ -1404,4 +1497,5 @@ end Heresy
 #print axioms Heresy.lower_program_correct
 #print axioms Heresy.lower_commands_correct
 #print axioms Heresy.executes_deterministic
+#print axioms Heresy.lowered_execution_preserves_words
 #print axioms Heresy.sparse_write_refines

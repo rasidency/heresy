@@ -500,14 +500,16 @@ def render_program (body : Command Target) : String :=
     "main :: IO ()", "main = exitWith (exitStatus (runSlots (" ++ render_command body ++ ")))", ""])
 
 def validates_program (body : Command Source) (generated : String) : Bool :=
-  generated == render_program (body.map lower)
+  check_commands body && generated == render_program (body.map lower)
 
 theorem program_certificate_sound (body : Command Source) (generated : String)
     (accepted : validates_program body generated = true) :
     ∃ target : Command Target, generated = render_program target ∧
-      ∀ status, target_observes target status ↔ source_observes body status := by
-  refine ⟨body.map lower, ?_, lower_commands_correct body⟩
-  simpa [validates_program] using accepted
+      (∀ status, target_observes target status ↔ source_observes body status) ∧
+      (∀ outcome, Executes read_sparse write_sparse (target_commands target) ∅ outcome → outcome.bounded read_sparse) := by
+  simp only [validates_program, Bool.and_eq_true, beq_iff_eq] at accepted
+  obtain ⟨bounded, emitted⟩ := accepted
+  exact ⟨body.map lower, emitted, lower_commands_correct body, lowered_execution_preserves_words body bounded⟩
 
 def validate_program (frontend generated : String) : Except String Unit := do
   let body ← closed_source frontend
