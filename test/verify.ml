@@ -212,6 +212,10 @@ let () =
     ignore (success frontend ["-std=c11"; "-O1"; "test/slots.c"; "-o"; "build/slotsref"]);
     check "closed local assignments preserve scope, branch joins, loop state and process status"
       (run "build/slots" [] = (37, "", "") && run "build/slotsref" [] = (37, "", ""));
+    ignore (success compiler ["test/helpers.c"; "--closed"; "--build"; "build/helpers"]);
+    ignore (success frontend ["-std=c11"; "-O1"; "test/helpers.c"; "-o"; "build/helpersref"]);
+    check "closed helper calls preserve argument order, return values and caller state"
+      (run "build/helpers" [] = (168, "", "") && run "build/helpersref" [] = (168, "", ""));
     check "value copies preserve ownership and IEEE scalar behaviour"
       (contains values "copies 11 12 1 42 1 10\nmembers 28 42 -3\nieee 4b800000 1 8000000000000000 1 1 1 0 -3\n" &&
        contains values "decimal -00003.50 2.67 2 4 -0.000000       inf\nliveness 0 0\n");

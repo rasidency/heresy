@@ -20,7 +20,7 @@ let files = [
   "dune-project"; "dune"; "heresy.opam";
   "src/dune"; "src/heresy.ml"; "src/process.ml"; "src/process.mli";
   "runtime/Heap.hs"; "tools/dune"; "tools/embed.ml"; "tools/release.ml";
-  "test/dune"; "test/verify.ml"; "test/fault.ml"; "test/closed.c"; "test/slots.c"; "test/lowering.c"; "test/values.c"; "proof/Proof.lean"; "proof/Certificate.lean";
+  "test/dune"; "test/verify.ml"; "test/fault.ml"; "test/closed.c"; "test/helpers.c"; "test/slots.c"; "test/lowering.c"; "test/values.c"; "proof/Proof.lean"; "proof/Certificate.lean";
   "test/linkage/entry.c"; "test/linkage/worker.c";
   "assets/pipeline.svg"; "assets/capability.svg"; "assets/pipeline.dot"; "assets/capability.dot";
   "lean-toolchain"; "lakefile.toml"; "lake-manifest.json";

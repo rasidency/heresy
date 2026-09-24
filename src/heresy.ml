@@ -1626,11 +1626,19 @@ and control_flow context body =
   Queue.add (graph, entry, targets) context.graphs;
   "dispatch " ^ graph ^ " [" ^ join (List.map (fun (_, _, action) -> par action) blocks) ^ "]"
 
-let rec pure_expression ?(closed = false) context params node =
+let rec closed_callee node =
+  match kind node, children node with
+  | "DeclRefExpr", [] when kind (field node "referencedDecl") = "FunctionDecl" ->
+      text (field node "referencedDecl") "name"
+  | "ParenExpr", [child] -> closed_callee child
+  | "ImplicitCastExpr", [child] when text node "castKind" = "FunctionToPointerDecay" -> closed_callee child
+  | _ -> ""
+
+let rec pure_expression ?(closed = false) ?(helpers = fun _ -> None) context params node =
   if contains (ty node) "volatile" || contains (ty node) "_Atomic" then raise (Error "effectful scalar access");
   if (closed && ty node <> "unsigned long") || scalar context (ty node) <> (64, false) then
     raise (Error "pure recovery requires unsigned long arithmetic");
-  let ex = pure_expression ~closed context params in
+  let ex = pure_expression ~closed ~helpers context params in
   match kind node, children node with
   | "IntegerLiteral", _ -> text node "value"
   | "DeclRefExpr", _ ->
@@ -1640,6 +1648,14 @@ let rec pure_expression ?(closed = false) context params node =
   | "ImplicitCastExpr", [child] when not closed || List.mem (text node "castKind") ["LValueToRValue"; "NoOp"] -> ex child
   | "ConditionalOperator", [condition; yes; no] ->
       "if " ^ par (ex condition) ^ " == 0 then " ^ par (ex no) ^ " else " ^ par (ex yes)
+  | "CallExpr", target :: arguments when closed ->
+      begin match helpers (closed_callee target) with
+      | Some (slot, arity) when List.length arguments = arity ->
+          let call = String.concat " " (("h_" ^ string_of_int slot) :: List.map (fun value -> par (ex value)) arguments) in
+          par call
+      | Some _ -> fail context node "closed helper call has the wrong arity"
+      | None -> fail context node "closed call requires an available unsigned long helper"
+      end
   | "BinaryOperator", [left; right] ->
       let operator = match text node "opcode" with
         | "+" -> "+" | "-" -> "-" | "*" -> "*" | "^" -> "`xor`" | "&" -> ".&." | "|" -> ".|."
@@ -2311,11 +2327,43 @@ let emit_closed contexts trees =
     not (kind node = "TypedefDecl" && Json.bool (field node "isImplicit"))) (children tree) in
   match contexts, trees with
   | [context], [tree] when kind tree = "TranslationUnitDecl" ->
-      let main = match declarations tree with
-        | [main] when kind main = "FunctionDecl" && text main "name" = "main" && ty main = "int (void)" -> main
-        | _ -> raise (Error "closed compilation requires only an int main(void) definition") in
+      let declarations = declarations tree in
+      let definitions = List.filter function_definition declarations in
+      let entries, helpers = List.partition (fun node -> text node "name" = "main") definitions in
+      let main = match entries with
+        | [main] when ty main = "int (void)" -> main
+        | _ -> raise (Error "closed compilation requires an int main(void) definition") in
+      List.iter (fun node ->
+        if kind node <> "FunctionDecl" then fail context node "closed compilation requires function declarations"
+      ) declarations;
+      let _, linked, declarations = List.fold_left (fun (slot, linked, declarations) node ->
+        let name = text node "name" in
+        let inputs, blocks = List.partition (fun child -> kind child = "ParmVarDecl") (children node) in
+        let arity = List.length inputs in
+        let arguments = if inputs = [] then "void" else String.concat ", " (List.map (fun _ -> "unsigned long") inputs) in
+        if name = "" || ty node <> "unsigned long (" ^ arguments ^ ")" ||
+           List.exists (fun param -> ty param <> "unsigned long") inputs || List.mem_assoc name linked then
+          fail context node "closed helper requires an unsigned long signature";
+        let value = match blocks with
+          | [block] when kind block = "CompoundStmt" ->
+              begin match children block with
+              | [ret] when kind ret = "ReturnStmt" ->
+                  begin match children ret with
+                  | [value] -> value
+                  | _ -> fail context ret "closed helper requires one return expression" end
+              | _ -> fail context node "closed helper requires one return statement" end
+          | _ -> fail context node "invalid closed helper definition" in
+        let parameters = List.mapi (fun index node -> text node "id", "x" ^ string_of_int index) inputs in
+        let body = pure_expression ~closed:true ~helpers:(fun name -> List.assoc_opt name linked) context
+          (fun id -> List.assoc_opt id parameters) value in
+        let name_in_target = "h_" ^ string_of_int slot in
+        let signature = name_in_target ^ " :: " ^ String.concat " -> " (List.init (arity + 1) (fun _ -> "Integer")) in
+        let equation = String.concat " " (name_in_target :: List.map snd parameters @ ["="; body]) in
+        slot + 1, (name, (slot, arity)) :: linked, "" :: equation :: signature :: declarations
+      ) (0, [], []) helpers in
+      let definitions = List.rev declarations in
       let rank = ref 0 in
-      let expression scope = pure_expression ~closed:true context (fun id ->
+      let expression scope = pure_expression ~closed:true ~helpers:(fun name -> List.assoc_opt name linked) context (fun id ->
         Option.map (fun slot -> "(readSlot " ^ string_of_int slot ^ " slots)") (List.assoc_opt id scope)) in
       let rec lvalue scope node = match kind node, children node with
         | "ParenExpr", [child] -> lvalue scope child
@@ -2372,7 +2420,7 @@ let emit_closed contexts trees =
         "  code -> ExitFailure code"; ""] in
       begin match body with
       | Closed_result value ->
-          String.concat "\n" (header @ exit @ ["main :: IO ()"; "main = exitWith (exitStatus " ^ par value ^ ")"; ""])
+          String.concat "\n" (header @ exit @ definitions @ ["main :: IO ()"; "main = exitWith (exitStatus " ^ par value ^ ")"; ""])
       | _ ->
           let buffer = Buffer.create 2048 in
           let emit = Buffer.add_string buffer in
@@ -2388,7 +2436,7 @@ let emit_closed contexts trees =
                 Printf.bprintf buffer "whileSlot (\\slots -> %s) (" guard;
                 render body; emit ")"
             | Closed_result value -> Printf.bprintf buffer "returnSlot (\\slots -> %s)" value in
-          emit (String.concat "\n" (header @ ["import qualified Data.IntMap.Strict as Slots"] @ exit @ [
+          emit (String.concat "\n" (header @ ["import qualified Data.IntMap.Strict as Slots"] @ exit @ definitions @ [
             "type Locals = Slots.IntMap Integer";
             "data SlotFlow = Next !Locals | Returned !Integer";
             "type Action = Locals -> SlotFlow"; "";

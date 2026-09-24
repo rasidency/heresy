@@ -25,6 +25,9 @@ def render_expression (render_slot : Nat → String) : Target → String
   | .conditional condition yes no =>
     "if (" ++ render_expression render_slot condition ++ ") == 0 then (" ++ render_expression render_slot no ++
       ") else (" ++ render_expression render_slot yes ++ ")"
+  | .invoke slot arguments =>
+    "(" ++ String.intercalate " " (("h_" ++ toString slot) ::
+      arguments.map (fun value => "(" ++ render_expression render_slot value ++ ")")) ++ ")"
 
 def render_target := render_expression (fun index => "x" ++ toString index)
 
@@ -64,7 +67,22 @@ private def read_operator : String → Except String Operator
   | "^" => .ok .bxor
   | other => .error ("unsupported kernel operator " ++ other)
 
-private def read_expression (lookup_slot : String → Option Nat) : Nat → Json → Except String Source
+private def direct_callee : Nat → Json → String
+  | 0, _ => ""
+  | depth + 1, node =>
+    match field_text node "kind", child_nodes node with
+    | "DeclRefExpr", [] =>
+      let declaration := json_field node "referencedDecl"
+      if field_text declaration "kind" == "FunctionDecl" then field_text declaration "name" else ""
+    | "ParenExpr", [child] => direct_callee depth child
+    | "ImplicitCastExpr", [child] =>
+      if field_text node "castKind" == "FunctionToPointerDecay" then direct_callee depth child else ""
+    | _, _ => ""
+
+private abbrev HelperScope := String → Option (Nat × Nat)
+
+private def read_expression (lookup_helper : HelperScope) (lookup_slot : String → Option Nat) :
+    Nat → Json → Except String Source
   | 0, _ => .error "incomplete kernel expression"
   | depth + 1, node => do
     unless type_spelling node == "unsigned long" do
@@ -78,19 +96,24 @@ private def read_expression (lookup_slot : String → Option Nat) : Nat → Json
       let ident := field_text (json_field node "referencedDecl") "id"
       let index ← require (lookup_slot ident) "expression references external or uninitialised state"
       pure (.parameter index)
-    | "ParenExpr", [child] => read_expression lookup_slot depth child
+    | "ParenExpr", [child] => read_expression lookup_helper lookup_slot depth child
     | "ImplicitCastExpr", [child] =>
       unless field_text node "castKind" == "LValueToRValue" ||
           field_text node "castKind" == "NoOp" do
         throw "kernel cast changes the value"
-      read_expression lookup_slot depth child
+      read_expression lookup_helper lookup_slot depth child
     | "BinaryOperator", [left, right] =>
       .binary <$> read_operator (field_text node "opcode")
-              <*> read_expression lookup_slot depth left
-              <*> read_expression lookup_slot depth right
+              <*> read_expression lookup_helper lookup_slot depth left
+              <*> read_expression lookup_helper lookup_slot depth right
     | "ConditionalOperator", [condition, yes, no] =>
-      .conditional <$> read_expression lookup_slot depth condition
-                   <*> read_expression lookup_slot depth yes <*> read_expression lookup_slot depth no
+      .conditional <$> read_expression lookup_helper lookup_slot depth condition
+                   <*> read_expression lookup_helper lookup_slot depth yes <*> read_expression lookup_helper lookup_slot depth no
+    | "CallExpr", target :: arguments =>
+      let (slot, arity) ← require (lookup_helper (direct_callee depth target)) "call requires an available unsigned long helper"
+      unless arity == arguments.length do
+        throw "closed helper call has the wrong arity"
+      .invoke slot <$> arguments.mapM (read_expression lookup_helper lookup_slot depth)
     | _, _ => throw "unsupported kernel expression"
 
 private def kernel_symbol (name : String) : String :=
@@ -98,7 +121,8 @@ private def kernel_symbol (name : String) : String :=
   name.toUTF8.toList.foldl (fun symbol byte =>
     (symbol.push digits[byte.toNat / 16]!).push digits[byte.toNat % 16]!) "k_"
 
-private def kernel_source (node : Json) (depth : Nat) : Except String (Source × Nat) := do
+private def kernel_source (node : Json) (depth : Nat) (lookup_helper : HelperScope := fun _ => none) :
+    Except String (Source × Nat) := do
   let inputs := (child_nodes node).filter (fun child => field_text child "kind" == "ParmVarDecl")
   unless inputs.all (fun argument => type_spelling argument == "unsigned long") do
     throw "kernel parameters require unsigned long"
@@ -113,7 +137,7 @@ private def kernel_source (node : Json) (depth : Nat) : Except String (Source ×
   | [statement] =>
     match field_text statement "kind", child_nodes statement with
     | "ReturnStmt", [expression] =>
-      let source ← read_expression (fun name => identifiers.idxOf? name) depth expression
+      let source ← read_expression lookup_helper (fun name => identifiers.idxOf? name) depth expression
       pure (source, inputs.length)
     | _, _ => throw "kernel body must return one expression"
   | _ => throw "kernel body must have one statement"
@@ -373,7 +397,7 @@ private def sequence_commands : List (Command Source) → Command Source
   | [] => .skip
   | last :: rest => rest.foldl (fun tail first => .sequence first tail) last
 
-private def read_command : Nat → Scope → Nat → Json → Except String (Command Source × Nat)
+private def read_command (lookup_helper : HelperScope) : Nat → Scope → Nat → Json → Except String (Command Source × Nat)
   | 0, _, _, _ => .error "incomplete closed statement"
   | depth + 1, scope, rank, node => do
     match field_text node "kind", child_nodes node with
@@ -391,13 +415,13 @@ private def read_command : Nat → Scope → Nat → Json → Except String (Com
                 !ident.isEmpty && (List.lookup ident scope).isNone do
               throw "closed declaration requires an initialised unsigned long local"
             let [expression] := child_nodes declaration | throw "missing closed local initialiser"
-            let value ← read_expression (fun ident => List.lookup ident scope) depth expression
+            let value ← read_expression lookup_helper (fun ident => List.lookup ident scope) depth expression
             declarations := .store rank value :: declarations
             scope := (ident, rank) :: scope
             rank := rank + 1
           reversed := sequence_commands declarations :: reversed
         else
-          let (command, next) ← read_command depth scope rank statement
+          let (command, next) ← read_command lookup_helper depth scope rank statement
           rank := next
           reversed := command :: reversed
       pure (sequence_commands reversed, rank)
@@ -406,45 +430,63 @@ private def read_command : Nat → Scope → Nat → Json → Except String (Com
       unless field_text node "opcode" == "=" do
         throw "closed statement requires simple assignment"
       let slot ← read_local scope depth left
-      let value ← read_expression (fun ident => List.lookup ident scope) depth right
+      let value ← read_expression lookup_helper (fun ident => List.lookup ident scope) depth right
       pure (.store slot value, rank)
     | "IfStmt", [guard, yes] =>
-      let condition ← read_expression (fun ident => List.lookup ident scope) depth guard
-      let (chosen, next) ← read_command depth scope rank yes
+      let condition ← read_expression lookup_helper (fun ident => List.lookup ident scope) depth guard
+      let (chosen, next) ← read_command lookup_helper depth scope rank yes
       pure (.select condition chosen .skip, next)
     | "IfStmt", [guard, yes, no] =>
-      let condition ← read_expression (fun ident => List.lookup ident scope) depth guard
-      let (chosen, next) ← read_command depth scope rank yes
-      let (alternative, next) ← read_command depth scope next no
+      let condition ← read_expression lookup_helper (fun ident => List.lookup ident scope) depth guard
+      let (chosen, next) ← read_command lookup_helper depth scope rank yes
+      let (alternative, next) ← read_command lookup_helper depth scope next no
       pure (.select condition chosen alternative, next)
     | "WhileStmt", [guard, body] =>
-      let condition ← read_expression (fun ident => List.lookup ident scope) depth guard
-      let (iteration, next) ← read_command depth scope rank body
+      let condition ← read_expression lookup_helper (fun ident => List.lookup ident scope) depth guard
+      let (iteration, next) ← read_command lookup_helper depth scope rank body
       pure (.loop condition iteration, next)
     | "ReturnStmt", [cast] =>
       unless field_text cast "kind" == "CStyleCastExpr" && field_text cast "castKind" == "IntegralCast" &&
           type_spelling cast == "int" do
         throw "closed return requires an unsigned long expression cast to int"
       let [expression] := child_nodes cast | throw "missing closed return expression"
-      let value ← read_expression (fun ident => List.lookup ident scope) depth expression
+      let value ← read_expression lookup_helper (fun ident => List.lookup ident scope) depth expression
       pure (.result value, rank)
     | _, _ => throw "unsupported closed statement"
 
-private def closed_source (frontend : String) : Except String (Command Source) := do
+private def closed_source (frontend : String) : Except String (List (Helper Source) × Command Source) := do
   let tree ← Json.parse frontend
   unless field_text tree "kind" == "TranslationUnitDecl" do
     throw "expected a translation unit"
   let declarations := (child_nodes tree).filter fun node =>
     field_text node "kind" != "EmptyDecl" &&
       !(field_text node "kind" == "TypedefDecl" && json_field node "isImplicit" == .bool true)
-  let [main] := declarations | throw "closed program must define only main"
-  unless field_text main "kind" == "FunctionDecl" && field_text main "name" == "main" &&
-      type_spelling main == "int (void)" do
+  unless declarations.all (fun node => field_text node "kind" == "FunctionDecl") do
+    throw "closed compilation requires function declarations"
+  let definitions := declarations.filter fun node => (child_nodes node).any (fun child => field_text child "kind" == "CompoundStmt")
+  let [main] := definitions.filter (fun node => field_text node "name" == "main") |
+    throw "closed program must define int main(void)"
+  unless type_spelling main == "int (void)" do
     throw "closed program must define int main(void)"
   let [body] := child_nodes main | throw "invalid closed main definition"
   unless field_text body "kind" == "CompoundStmt" do
     throw "invalid closed main body"
-  Prod.fst <$> read_command frontend.length [] 0 body
+  let mut linked : List (String × (Nat × Nat)) := []
+  let mut helpers : List (Helper Source) := []
+  let mut slot := 0
+  for definition in definitions do
+    let name := field_text definition "name"
+    if name == "main" then continue
+    let (code, arity) ← kernel_source definition frontend.length (fun name => List.lookup name linked)
+    let parameters := if arity == 0 then "void" else String.intercalate ", " (List.replicate arity "unsigned long")
+    unless !name.isEmpty && (List.lookup name linked).isNone &&
+        type_spelling definition == ("unsigned long (" ++ parameters ++ ")") do
+      throw "closed helper requires an unsigned long signature"
+    helpers := ⟨arity, code⟩ :: helpers
+    linked := (name, (slot, arity)) :: linked
+    slot := slot + 1
+  let (entry, _) ← read_command (fun name => List.lookup name linked) frontend.length [] 0 body
+  pure (helpers.reverse, entry)
 
 private def exit_definition : List String := ["",
   "normalise :: Int -> Bool -> Integer -> Integer",
@@ -464,12 +506,20 @@ private def render_command : Command Target → String
   | .loop guard body => "whileSlot " ++ render_slot_expression guard ++ " (" ++ render_command body ++ ")"
   | .result expression => "returnSlot " ++ render_slot_expression expression
 
-def render_program (body : Command Target) : String :=
+private def render_helper (slot : Nat) (helper : Helper Target) : List String :=
+  let name := "h_" ++ toString slot
+  let signature := name ++ " :: " ++ String.intercalate " -> " (List.replicate (helper.arity + 1) "Integer")
+  let parameters := (List.range helper.arity).map (fun index => "x" ++ toString index)
+  let equation := String.intercalate " " (name :: parameters ++ ["=", render_target helper.body])
+  [signature, equation, ""]
+
+def render_program (helpers : List (Helper Target)) (body : Command Target) : String :=
   let header := ["module Main where", "", "import Data.Bits", "import System.Exit"]
+  let definitions := exit_definition ++ (helpers.zipIdx.flatMap fun (helper, slot) => render_helper slot helper)
   match body with
-  | .result expression => String.intercalate "\n" (header ++ exit_definition ++ [
+  | .result expression => String.intercalate "\n" (header ++ definitions ++ [
     "main :: IO ()", "main = exitWith (exitStatus (" ++ render_expression (fun _ => "0") expression ++ "))", ""])
-  | _ => String.intercalate "\n" (header ++ ["import qualified Data.IntMap.Strict as Slots"] ++ exit_definition ++ [
+  | _ => String.intercalate "\n" (header ++ ["import qualified Data.IntMap.Strict as Slots"] ++ definitions ++ [
     "type Locals = Slots.IntMap Integer",
     "data SlotFlow = Next !Locals | Returned !Integer",
     "type Action = Locals -> SlotFlow", "",
@@ -499,21 +549,34 @@ def render_program (body : Command Target) : String :=
     "  Returned value -> value", "",
     "main :: IO ()", "main = exitWith (exitStatus (runSlots (" ++ render_command body ++ ")))", ""])
 
-def validates_program (body : Command Source) (generated : String) : Bool :=
-  check_commands body && generated == render_program (body.map lower)
+private def body_calls_in_scope (arities : Array Nat) : Command Source → Bool
+  | .skip => true
+  | .store _ expression | .result expression => calls_in_scope arities (fun _ => true) expression
+  | .sequence first second => body_calls_in_scope arities first && body_calls_in_scope arities second
+  | .select condition yes no => calls_in_scope arities (fun _ => true) condition &&
+      (body_calls_in_scope arities yes && body_calls_in_scope arities no)
+  | .loop condition body => calls_in_scope arities (fun _ => true) condition && body_calls_in_scope arities body
 
-theorem program_certificate_sound (body : Command Source) (generated : String)
-    (accepted : validates_program body generated = true) :
-    ∃ target : Command Target, generated = render_program target ∧
-      (∀ status, target_observes target status ↔ source_observes body status) ∧
-      (∀ outcome, Executes read_sparse write_sparse (target_commands target) ∅ outcome → outcome.bounded read_sparse) := by
+def validates_program (helpers : List (Helper Source)) (body : Command Source) (generated : String) : Bool :=
+  check_helpers #[] helpers && (check_commands body &&
+    (body_calls_in_scope (helpers.toArray.map Helper.arity) body && generated == render_program (helpers.map Helper.lower) (body.map lower)))
+
+theorem program_certificate_sound (helpers : List (Helper Source)) (body : Command Source) (generated : String)
+    (accepted : validates_program helpers body generated = true) :
+    ∃ lowered_helpers : List (Helper Target), ∃ target : Command Target, generated = render_program lowered_helpers target ∧
+      (∀ status, target_observes_with (link_helpers target_eval_with 0 lowered_helpers no_calls) target status ↔
+        source_observes_with (link_helpers source_eval_with 0 helpers no_calls) body status) ∧
+      (∀ outcome, Executes read_sparse write_sparse
+        (target_commands_with (link_helpers target_eval_with 0 lowered_helpers no_calls) target) ∅ outcome →
+          outcome.bounded read_sparse) := by
   simp only [validates_program, Bool.and_eq_true, beq_iff_eq] at accepted
-  obtain ⟨bounded, emitted⟩ := accepted
-  exact ⟨body.map lower, emitted, lower_commands_correct body, lowered_execution_preserves_words body bounded⟩
+  obtain ⟨linked, bounded, _, emitted⟩ := accepted
+  exact ⟨helpers.map Helper.lower, body.map lower, emitted, linked_program_correct helpers body,
+    linked_execution_preserves_words helpers body linked bounded⟩
 
 def validate_program (frontend generated : String) : Except String Unit := do
-  let body ← closed_source frontend
-  unless validates_program body generated do
+  let (helpers, body) ← closed_source frontend
+  unless validates_program helpers body generated do
     throw "emitted program differs from verified lowering"
 
 end Heresy

@@ -71,6 +71,7 @@ inductive Source where
   | parameter (index : Nat)
   | binary (operator : Operator) (left right : Source)
   | conditional (condition yes no : Source)
+  | invoke (slot : Nat) (arguments : List Source)
 
 inductive Target where
   | constant (value : Int)
@@ -78,68 +79,134 @@ inductive Target where
   | binary (operator : Operator) (left right : Target)
   | wrap (width : Nat) (body : Target)
   | conditional (condition yes no : Target)
+  | invoke (slot : Nat) (arguments : List Target)
 
-def source_eval (parameters : Nat → Int) : Source → Int
+private theorem Source.induct {P : Source → Prop}
+    (literal : ∀ value, P (.constant value)) (param : ∀ index, P (.parameter index))
+    (binary : ∀ op left right, P left → P right → P (.binary op left right))
+    (conditional : ∀ condition yes no, P condition → P yes → P no → P (.conditional condition yes no))
+    (invoke : ∀ slot arguments, (∀ argument ∈ arguments, P argument) → P (.invoke slot arguments))
+    (expression : Source) : P expression :=
+  match expression with
+  | .constant value => literal value
+  | .parameter index => param index
+  | .binary op left right => binary op left right (induct literal param binary conditional invoke left)
+      (induct literal param binary conditional invoke right)
+  | .conditional condition yes no => conditional condition yes no (induct literal param binary conditional invoke condition)
+      (induct literal param binary conditional invoke yes) (induct literal param binary conditional invoke no)
+  | .invoke slot arguments => invoke slot arguments fun argument _present =>
+      induct literal param binary conditional invoke argument
+termination_by sizeOf expression
+decreasing_by
+  all_goals simp_wf
+  all_goals first | omega | (have small := List.sizeOf_lt_of_mem _present; omega)
+
+abbrev CallTable := Nat → List Int → Int
+
+def no_calls : CallTable := fun _ _ => 0
+
+def source_eval_with (calls : CallTable) (parameters : Nat → Int) : Source → Int
   | .constant value => value
   | .parameter index => parameters index
   | .binary operator left right =>
-    unsigned 64 (operate operator (source_eval parameters left) (source_eval parameters right))
+    unsigned 64 (operate operator (source_eval_with calls parameters left) (source_eval_with calls parameters right))
   | .conditional condition yes no =>
-    if source_eval parameters condition = 0 then source_eval parameters no else source_eval parameters yes
+    if source_eval_with calls parameters condition = 0 then source_eval_with calls parameters no else source_eval_with calls parameters yes
+  | .invoke slot arguments => calls slot (arguments.map (source_eval_with calls parameters))
 
-def target_eval (parameters : Nat → Int) : Target → Int
+def target_eval_with (calls : CallTable) (parameters : Nat → Int) : Target → Int
   | .constant value => value
   | .parameter index => parameters index
-  | .binary operator left right => operate operator (target_eval parameters left) (target_eval parameters right)
-  | .wrap width body => unsigned width (target_eval parameters body)
+  | .binary operator left right => operate operator (target_eval_with calls parameters left) (target_eval_with calls parameters right)
+  | .wrap width body => unsigned width (target_eval_with calls parameters body)
   | .conditional condition yes no =>
-    if target_eval parameters condition = 0 then target_eval parameters no else target_eval parameters yes
+    if target_eval_with calls parameters condition = 0 then target_eval_with calls parameters no else target_eval_with calls parameters yes
+  | .invoke slot arguments => calls slot (arguments.map (target_eval_with calls parameters))
+
+def source_eval := source_eval_with no_calls
+
+def target_eval := target_eval_with no_calls
 
 def lower : Source → Target
   | .constant value => .constant value
   | .parameter index => .parameter index
   | .binary operator left right => .wrap 64 (.binary operator (lower left) (lower right))
   | .conditional condition yes no => .conditional (lower condition) (lower yes) (lower no)
+  | .invoke slot arguments => .invoke slot (arguments.map lower)
 
 def admissible : Source → Prop
   | .constant value => 0 ≤ value ∧ value < modulus 64
   | .parameter _ => True
   | .binary _ left right => admissible left ∧ admissible right
   | .conditional condition yes no => admissible condition ∧ admissible yes ∧ admissible no
+  | .invoke _ arguments => ∀ argument ∈ arguments, admissible argument
 
 def check_expression : Source → Bool
   | .constant value => decide (0 ≤ value ∧ value < modulus 64)
   | .parameter _ => true
   | .binary _ left right => check_expression left && check_expression right
   | .conditional condition yes no => check_expression condition && (check_expression yes && check_expression no)
+  | .invoke _ arguments => (arguments.map check_expression).all id
 
 theorem check_expression_sound (expression : Source) (accepted : check_expression expression = true) :
     admissible expression := by
-  induction expression <;> simp_all [check_expression, admissible]
+  induction expression using Source.induct <;> simp_all [check_expression, admissible, List.all_map, List.all_eq_true]
 
-theorem source_eval_bounds (expression : Source) (parameters : Nat → Int)
+def BoundedWord (value : Int) : Prop := 0 ≤ value ∧ value < modulus 64
+
+def BoundedCalls (calls : CallTable) : Prop :=
+  ∀ slot values, (∀ value ∈ values, BoundedWord value) → BoundedWord (calls slot values)
+
+private theorem zero_word : BoundedWord 0 := ⟨Int.le_refl 0, modulus_positive 64⟩
+
+private theorem no_calls_bounded : BoundedCalls no_calls := fun _ _ _ => zero_word
+
+theorem source_eval_with_bounds (calls : CallTable) (safe_calls : BoundedCalls calls)
+    (expression : Source) (parameters : Nat → Int)
     (valid : admissible expression)
     (bounded : ∀ index, 0 ≤ parameters index ∧ parameters index < modulus 64) :
-    0 ≤ source_eval parameters expression ∧ source_eval parameters expression < modulus 64 := by
-  induction expression with
-  | constant value => exact valid
-  | parameter index => exact bounded index
-  | binary _ _ _ _ _ => exact unsigned_bounds 64 _
+    BoundedWord (source_eval_with calls parameters expression) := by
+  induction expression using Source.induct with
+  | literal value => simpa only [source_eval_with, BoundedWord, admissible] using valid
+  | param index => simpa only [source_eval_with, BoundedWord] using bounded index
+  | binary _ _ _ _ _ =>
+    simp only [source_eval_with, BoundedWord]
+    exact unsigned_bounds 64 _
   | conditional _ _ _ _ yes_bounded no_bounded =>
-    simp only [source_eval]
+    simp only [admissible] at valid
+    simp only [source_eval_with]
     split
     · exact no_bounded valid.2.2
     · exact yes_bounded valid.2.1
+  | invoke slot arguments each =>
+    simp only [source_eval_with]
+    apply safe_calls slot
+    intro value member
+    obtain ⟨argument, present, rfl⟩ := List.mem_map.mp member
+    simp only [admissible] at valid
+    exact each argument present (valid argument present)
+
+theorem source_eval_bounds (expression : Source) (parameters : Nat → Int)
+    (valid : admissible expression) (bounded : ∀ index, BoundedWord (parameters index)) :
+    BoundedWord (source_eval parameters expression) :=
+  source_eval_with_bounds no_calls no_calls_bounded expression parameters valid bounded
+
+theorem lower_with_correct (calls : CallTable) (expression : Source) (parameters : Nat → Int) :
+    target_eval_with calls parameters (lower expression) = source_eval_with calls parameters expression := by
+  induction expression using Source.induct with
+  | literal value => simp only [lower, target_eval_with, source_eval_with]
+  | param index => simp only [lower, target_eval_with, source_eval_with]
+  | binary operator left right left_correct right_correct =>
+    simp only [lower, target_eval_with, source_eval_with, left_correct, right_correct]
+  | conditional condition yes no condition_correct yes_correct no_correct =>
+    simp only [lower, target_eval_with, source_eval_with, condition_correct, yes_correct, no_correct]
+  | invoke slot arguments each =>
+    simp only [lower, target_eval_with, source_eval_with, List.map_map, Function.comp_def]
+    exact congrArg (calls slot) (List.map_congr_left each)
 
 theorem lower_correct (expression : Source) (parameters : Nat → Int) :
-    target_eval parameters (lower expression) = source_eval parameters expression := by
-  induction expression with
-  | constant value => rfl
-  | parameter index => rfl
-  | binary operator left right left_correct right_correct =>
-    simp only [lower, target_eval, source_eval, left_correct, right_correct]
-  | conditional condition yes no condition_correct yes_correct no_correct =>
-    simp only [lower, target_eval, source_eval, condition_correct, yes_correct, no_correct]
+    target_eval parameters (lower expression) = source_eval parameters expression :=
+  lower_with_correct no_calls expression parameters
 
 theorem lowered_bounds (expression : Source) (parameters : Nat → Int)
     (valid : admissible expression)
@@ -168,6 +235,69 @@ theorem lower_program_correct (body : Source) : target_status (lower body) = sou
   simp only [target_status, lower_correct, source_status, exit_status_truncation]
 
 abbrev Locals := Nat → Int
+
+structure Helper (expr : Type) where
+  arity : Nat
+  body : expr
+
+def Helper.lower (helper : Helper Source) : Helper Target := ⟨helper.arity, Heresy.lower helper.body⟩
+
+def arguments_view (values : List Int) : Locals := fun index => (values[index]?).getD 0
+
+theorem argument_binding (values : List Int) (index : Nat) (present : index < values.length) :
+    arguments_view values index = values[index] := by
+  simp [arguments_view, present]
+
+def bind_helper (calls : CallTable) (slot : Nat) (implementation : List Int → Int) : CallTable :=
+  fun requested values => if requested = slot then implementation values else calls requested values
+
+def link_helpers (evaluate : CallTable → Locals → expr → Int) : Nat → List (Helper expr) → CallTable → CallTable
+  | _, [], calls => calls
+  | slot, helper :: rest, calls =>
+    let implementation := fun values => evaluate calls (arguments_view values) helper.body
+    link_helpers evaluate (slot + 1) rest (bind_helper calls slot implementation)
+
+theorem lower_helpers_correct (helpers : List (Helper Source)) (slot : Nat) (calls : CallTable) :
+    link_helpers target_eval_with slot (helpers.map Helper.lower) calls = link_helpers source_eval_with slot helpers calls := by
+  induction helpers generalizing slot calls with
+  | nil => rfl
+  | cons helper rest later =>
+    simp only [List.map_cons, link_helpers, Helper.lower, lower_with_correct]
+    exact later _ _
+
+def calls_in_scope (arities : Array Nat) (parameter_ok : Nat → Bool) : Source → Bool
+  | .constant _ => true
+  | .parameter index => parameter_ok index
+  | .binary _ left right => calls_in_scope arities parameter_ok left && calls_in_scope arities parameter_ok right
+  | .conditional condition yes no => calls_in_scope arities parameter_ok condition &&
+      (calls_in_scope arities parameter_ok yes && calls_in_scope arities parameter_ok no)
+  | .invoke slot arguments => arities[slot]? == some arguments.length &&
+      (arguments.map (calls_in_scope arities parameter_ok)).all id
+
+def check_helpers (arities : Array Nat) : List (Helper Source) → Bool
+  | [] => true
+  | helper :: rest =>
+    check_expression helper.body && (calls_in_scope arities (fun index => index < helper.arity) helper.body &&
+      check_helpers (arities.push helper.arity) rest)
+
+theorem linked_helpers_bounded (helpers : List (Helper Source)) (arities : Array Nat)
+    (slot : Nat) (calls : CallTable) (accepted : check_helpers arities helpers = true) (safe : BoundedCalls calls) :
+    BoundedCalls (link_helpers source_eval_with slot helpers calls) := by
+  induction helpers generalizing arities slot calls with
+  | nil => exact safe
+  | cons helper rest later =>
+    simp only [check_helpers, Bool.and_eq_true] at accepted
+    apply later _ _ _ accepted.2.2
+    intro requested values arguments
+    by_cases found : requested = slot
+    · simp only [bind_helper, found, ↓reduceIte]
+      apply source_eval_with_bounds calls safe _ _ (check_expression_sound _ accepted.1)
+      intro index
+      unfold arguments_view
+      cases read : values[index]? with
+      | none => exact zero_word
+      | some value => exact arguments value (List.mem_of_getElem? read)
+    · simpa only [bind_helper, found, ↓reduceIte] using safe requested values arguments
 
 inductive Command (expr : Type) where
   | skip
@@ -326,9 +456,15 @@ private theorem lift_execution (view : state → Locals) (write : state → Nat 
     | returned value => exact ⟨.returned value,
         .loop_returned (by simpa only [same, id_eq] using condition) step_run, projected⟩
 
-def source_commands (body : Command Source) : Command (Locals → Int) := body.map (fun expr locals => source_eval locals expr)
+def source_commands_with (calls : CallTable) (body : Command Source) : Command (Locals → Int) :=
+  body.map (fun expr locals => source_eval_with calls locals expr)
 
-def target_commands (body : Command Target) : Command (Locals → Int) := body.map (fun expr locals => target_eval locals expr)
+def target_commands_with (calls : CallTable) (body : Command Target) : Command (Locals → Int) :=
+  body.map (fun expr locals => target_eval_with calls locals expr)
+
+def source_commands := source_commands_with no_calls
+
+def target_commands := target_commands_with no_calls
 
 def Command.all (predicate : α → Prop) : Command α → Prop
   | .skip => True
@@ -362,19 +498,17 @@ theorem check_commands_sound (body : Command Source) (accepted : check_commands 
     obtain ⟨guard_ok, body_ok⟩ := accepted
     exact ⟨check_expression_sound condition guard_ok, body body_ok⟩
 
-def BoundedWord (value : Int) : Prop := 0 ≤ value ∧ value < modulus 64
-
 def BoundedLocals (locals : Locals) : Prop := ∀ slot, BoundedWord (locals slot)
 
 def BoundedExpression (expression : Locals → Int) : Prop :=
   ∀ locals, BoundedLocals locals → BoundedWord (expression locals)
 
-private theorem bounded_source_commands (body : Command Source) (valid : body.all admissible) :
-    (source_commands body).all BoundedExpression := by
+private theorem bounded_source_commands (calls : CallTable) (safe : BoundedCalls calls)
+    (body : Command Source) (valid : body.all admissible) : (source_commands_with calls body).all BoundedExpression := by
   have arithmetic (expression : Source) (ok : admissible expression) :
-      BoundedExpression (fun locals => source_eval locals expression) :=
-    fun locals bounded => source_eval_bounds expression locals ok bounded
-  induction body <;> simp_all [Command.all, source_commands, Command.map]
+      BoundedExpression (fun locals => source_eval_with calls locals expression) :=
+    fun locals bounded => source_eval_with_bounds calls safe expression locals ok bounded
+  induction body <;> simp_all [Command.all, source_commands_with, Command.map]
 
 def CommandOutcome.bounded (view : state → Locals) : CommandOutcome state → Prop
   | .next updated => BoundedLocals (view updated)
@@ -402,11 +536,12 @@ theorem execution_preserves_words {view : state → Locals} {write : state → N
   | loop_next _ _ _ iteration rest => exact rest valid (iteration valid.2 bounded)
   | loop_returned _ _ iteration => exact iteration valid.2 bounded
 
-theorem lower_commands_preserves_operations (body : Command Source) :
-    target_commands (body.map lower) = source_commands body := by
-  have expression (expr : Source) : (fun locals => target_eval locals (lower expr)) = (fun locals => source_eval locals expr) :=
-    funext (lower_correct expr)
-  induction body <;> simp only [source_commands, target_commands, Command.map, expression] at * <;> simp_all
+theorem lower_commands_with_preserves_operations (calls : CallTable) (body : Command Source) :
+    target_commands_with calls (body.map lower) = source_commands_with calls body := by
+  have expression (expr : Source) :
+      (fun locals => target_eval_with calls locals (lower expr)) = (fun locals => source_eval_with calls locals expr) :=
+    funext (lower_with_correct calls expr)
+  induction body <;> simp only [source_commands_with, target_commands_with, Command.map, expression] at * <;> simp_all
 
 def CommandOutcome.value : CommandOutcome state → Int
   | .next _ => 0
@@ -434,16 +569,20 @@ private theorem sparse_empty : read_sparse ∅ = (fun _ => 0) := by
   funext slot
   exact Std.TreeMap.getD_emptyc
 
-def source_observes (body : Command Source) (status : Int) : Prop :=
-  ∃ outcome, Executes id write_local (source_commands body) (fun _ => 0) outcome ∧
+def source_observes_with (calls : CallTable) (body : Command Source) (status : Int) : Prop :=
+  ∃ outcome, Executes id write_local (source_commands_with calls body) (fun _ => 0) outcome ∧
     status = unsigned 8 (signed 32 outcome.value)
 
-def target_observes (body : Command Target) (status : Int) : Prop :=
-  ∃ outcome, Executes read_sparse write_sparse (target_commands body) ∅ outcome ∧ status = unsigned 8 outcome.value
+def target_observes_with (calls : CallTable) (body : Command Target) (status : Int) : Prop :=
+  ∃ outcome, Executes read_sparse write_sparse (target_commands_with calls body) ∅ outcome ∧ status = unsigned 8 outcome.value
 
-theorem lower_commands_correct (body : Command Source) (status : Int) :
-    target_observes (body.map lower) status ↔ source_observes body status := by
-  simp only [target_observes, source_observes, lower_commands_preserves_operations, exit_status_truncation]
+def source_observes := source_observes_with no_calls
+
+def target_observes := target_observes_with no_calls
+
+theorem lower_commands_with_correct (calls : CallTable) (body : Command Source) (status : Int) :
+    target_observes_with calls (body.map lower) status ↔ source_observes_with calls body status := by
+  simp only [target_observes_with, source_observes_with, lower_commands_with_preserves_operations, exit_status_truncation]
   constructor
   · rintro ⟨result, execution, observed⟩
     refine ⟨result.project read_sparse, ?_, by simpa using observed⟩
@@ -455,16 +594,43 @@ theorem lower_commands_correct (body : Command Source) (status : Int) :
     refine ⟨target, run, ?_⟩
     rw [observed, ← projected, CommandOutcome.project_value]
 
-theorem lowered_execution_preserves_words (body : Command Source) (accepted : check_commands body = true)
+theorem lower_commands_correct (body : Command Source) (status : Int) :
+    target_observes (body.map lower) status ↔ source_observes body status :=
+  lower_commands_with_correct no_calls body status
+
+theorem lowered_execution_with_preserves_words (calls : CallTable) (safe : BoundedCalls calls)
+    (body : Command Source) (accepted : check_commands body = true)
     (outcome : CommandOutcome SparseLocals)
-    (run : Executes read_sparse write_sparse (target_commands (body.map lower)) ∅ outcome) :
+    (run : Executes read_sparse write_sparse (target_commands_with calls (body.map lower)) ∅ outcome) :
     outcome.bounded read_sparse := by
-  rw [lower_commands_preserves_operations] at run
-  have valid := bounded_source_commands body (check_commands_sound body accepted)
+  rw [lower_commands_with_preserves_operations] at run
+  have valid := bounded_source_commands calls safe body (check_commands_sound body accepted)
   apply execution_preserves_words sparse_write_refines run valid
   rw [sparse_empty]
   intro _
-  exact ⟨Int.le_refl 0, modulus_positive 64⟩
+  exact zero_word
+
+theorem lowered_execution_preserves_words (body : Command Source) (accepted : check_commands body = true)
+    (outcome : CommandOutcome SparseLocals)
+    (run : Executes read_sparse write_sparse (target_commands (body.map lower)) ∅ outcome) :
+    outcome.bounded read_sparse :=
+  lowered_execution_with_preserves_words no_calls no_calls_bounded body accepted outcome run
+
+theorem linked_program_correct (helpers : List (Helper Source)) (body : Command Source) (status : Int) :
+    target_observes_with (link_helpers target_eval_with 0 (helpers.map Helper.lower) no_calls) (body.map lower) status ↔
+    source_observes_with (link_helpers source_eval_with 0 helpers no_calls) body status := by
+  rw [lower_helpers_correct]
+  exact lower_commands_with_correct _ _ _
+
+theorem linked_execution_preserves_words (helpers : List (Helper Source)) (body : Command Source)
+    (checked_helpers : check_helpers #[] helpers = true) (checked_body : check_commands body = true)
+    (outcome : CommandOutcome SparseLocals)
+    (run : Executes read_sparse write_sparse
+      (target_commands_with (link_helpers target_eval_with 0 (helpers.map Helper.lower) no_calls) (body.map lower)) ∅ outcome) :
+    outcome.bounded read_sparse := by
+  rw [lower_helpers_correct] at run
+  exact lowered_execution_with_preserves_words _ (linked_helpers_bounded helpers #[] 0 no_calls checked_helpers no_calls_bounded)
+    body checked_body outcome run
 
 structure Object where
   base : Int
@@ -1496,6 +1662,9 @@ end Heresy
 #print axioms Heresy.runtime_copy_snapshot
 #print axioms Heresy.lower_program_correct
 #print axioms Heresy.lower_commands_correct
+#print axioms Heresy.lower_helpers_correct
+#print axioms Heresy.linked_program_correct
+#print axioms Heresy.linked_execution_preserves_words
 #print axioms Heresy.executes_deterministic
 #print axioms Heresy.lowered_execution_preserves_words
 #print axioms Heresy.sparse_write_refines
