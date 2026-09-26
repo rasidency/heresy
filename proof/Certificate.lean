@@ -564,6 +564,7 @@ def validates_program (helpers : List (Helper Source)) (body : Command Source) (
 theorem program_certificate_sound (helpers : List (Helper Source)) (body : Command Source) (generated : String)
     (accepted : validates_program helpers body generated = true) :
     ∃ lowered_helpers : List (Helper Target), ∃ target : Command Target, generated = render_program lowered_helpers target ∧
+      LinkedHelperEquations lowered_helpers (link_helpers target_eval_with 0 lowered_helpers no_calls) ∧
       (∀ status, target_observes_with (link_helpers target_eval_with 0 lowered_helpers no_calls) target status ↔
         source_observes_with (link_helpers source_eval_with 0 helpers no_calls) body status) ∧
       (∀ outcome, Executes read_sparse write_sparse
@@ -571,7 +572,7 @@ theorem program_certificate_sound (helpers : List (Helper Source)) (body : Comma
           outcome.bounded read_sparse) := by
   simp only [validates_program, Bool.and_eq_true, beq_iff_eq] at accepted
   obtain ⟨linked, bounded, _, emitted⟩ := accepted
-  exact ⟨helpers.map Helper.lower, body.map lower, emitted, linked_program_correct helpers body,
+  exact ⟨helpers.map Helper.lower, body.map lower, emitted, lowered_helper_equations helpers linked, linked_program_correct helpers body,
     linked_execution_preserves_words helpers body linked bounded⟩
 
 def validate_program (frontend generated : String) : Except String Unit := do

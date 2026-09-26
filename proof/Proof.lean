@@ -280,6 +280,87 @@ def check_helpers (arities : Array Nat) : List (Helper Source) → Bool
     check_expression helper.body && (calls_in_scope arities (fun index => index < helper.arity) helper.body &&
       check_helpers (arities.push helper.arity) rest)
 
+theorem read_calls_in_scope (arities : Array Nat) (parameter_ok : Nat → Bool)
+    (expression : Source) (parameters : Locals) (before after : CallTable)
+    (accepted : calls_in_scope arities parameter_ok expression = true)
+    (agree : ∀ slot, slot < arities.size → ∀ values, before slot values = after slot values) :
+    source_eval_with before parameters expression = source_eval_with after parameters expression := by
+  induction expression using Source.induct with
+  | literal value => simp only [source_eval_with]
+  | param index => simp only [source_eval_with]
+  | binary op left right first second =>
+    simp only [calls_in_scope, Bool.and_eq_true] at accepted
+    simp only [source_eval_with, first accepted.1, second accepted.2]
+  | conditional condition yes no first second third =>
+    simp only [calls_in_scope, Bool.and_eq_true] at accepted
+    simp only [source_eval_with, first accepted.1, second accepted.2.1, third accepted.2.2]
+  | invoke slot arguments each =>
+    simp only [calls_in_scope, Bool.and_eq_true, beq_iff_eq] at accepted
+    obtain ⟨known, checked_arguments⟩ := accepted
+    have bound := (Array.getElem?_eq_some_iff.mp known).1
+    simp only [List.all_map, List.all_eq_true, Function.comp_def, id_eq] at checked_arguments
+    have same_arguments := List.map_congr_left (fun argument present => each argument present (checked_arguments argument present))
+    simp only [source_eval_with, same_arguments, agree slot bound]
+
+theorem link_preserves_prefix (evaluate : CallTable → Locals → expr → Int) (helpers : List (Helper expr))
+    (rank : Nat) (calls : CallTable) (slot : Nat) (before : slot < rank) (values : List Int) :
+    link_helpers evaluate rank helpers calls slot values = calls slot values := by
+  induction helpers generalizing rank calls with
+  | nil => rfl
+  | cons helper rest kept =>
+    rw [link_helpers, kept (rank + 1) _ (by omega)]
+    simp [bind_helper, show slot ≠ rank by omega]
+
+theorem linked_helper_equation (helpers : List (Helper Source)) (arities : Array Nat) (calls : CallTable)
+    (accepted : check_helpers arities helpers = true) (index : Nat) (helper : Helper Source)
+    (found : helpers[index]? = some helper) (values : List Int) :
+    let linked := link_helpers source_eval_with arities.size helpers calls
+    linked (arities.size + index) values = source_eval_with linked (arguments_view values) helper.body := by
+  induction helpers generalizing arities calls index helper with
+  | nil => simp at found
+  | cons first rest equations =>
+    simp only [check_helpers, Bool.and_eq_true] at accepted
+    cases index with
+    | zero =>
+      simp only [List.getElem?_cons_zero, Option.some.injEq] at found
+      subst helper
+      let added := bind_helper calls arities.size (fun input => source_eval_with calls (arguments_view input) first.body)
+      let complete := link_helpers source_eval_with (arities.size + 1) rest added
+      have current : complete arities.size values = source_eval_with calls (arguments_view values) first.body := by
+        unfold complete
+        rw [link_preserves_prefix _ rest _ added _ (Nat.lt_succ_self _) values]
+        simp [added, bind_helper]
+      have earlier (slot : Nat) (bound : slot < arities.size) (input : List Int) :
+          calls slot input = complete slot input := by
+        unfold complete
+        rw [link_preserves_prefix _ rest _ added _ (by omega) input]
+        simp [added, bind_helper, show slot ≠ arities.size by omega]
+      change complete arities.size values = source_eval_with complete (arguments_view values) first.body
+      rw [current]
+      exact read_calls_in_scope arities _ first.body _ calls complete accepted.2.1 earlier
+    | succ index =>
+      simp only [List.getElem?_cons_succ] at found
+      let added := bind_helper calls arities.size (fun input => source_eval_with calls (arguments_view input) first.body)
+      simpa only [link_helpers, Array.size_push, Nat.add_assoc, Nat.add_comm 1 index] using
+        equations (arities.push first.arity) added accepted.2.2 index helper found
+
+def LinkedHelperEquations (helpers : List (Helper Target)) (calls : CallTable) : Prop :=
+  ∀ slot helper, helpers[slot]? = some helper → ∀ values,
+    calls slot values = target_eval_with calls (arguments_view values) helper.body
+
+theorem lowered_helper_equations (helpers : List (Helper Source)) (accepted : check_helpers #[] helpers = true) :
+    LinkedHelperEquations (helpers.map Helper.lower) (link_helpers target_eval_with 0 (helpers.map Helper.lower) no_calls) := by
+  intro slot helper located values
+  rw [List.getElem?_map] at located
+  cases original : helpers[slot]? with
+  | none => simp [original] at located
+  | some source =>
+    simp only [original, Option.map_some, Option.some.injEq] at located
+    subst helper
+    rw [lower_helpers_correct]
+    simp only [Helper.lower, lower_with_correct]
+    simpa using linked_helper_equation helpers #[] no_calls accepted slot source original values
+
 theorem linked_helpers_bounded (helpers : List (Helper Source)) (arities : Array Nat)
     (slot : Nat) (calls : CallTable) (accepted : check_helpers arities helpers = true) (safe : BoundedCalls calls) :
     BoundedCalls (link_helpers source_eval_with slot helpers calls) := by
@@ -1663,6 +1744,8 @@ end Heresy
 #print axioms Heresy.lower_program_correct
 #print axioms Heresy.lower_commands_correct
 #print axioms Heresy.lower_helpers_correct
+#print axioms Heresy.argument_binding
+#print axioms Heresy.lowered_helper_equations
 #print axioms Heresy.linked_program_correct
 #print axioms Heresy.linked_execution_preserves_words
 #print axioms Heresy.executes_deterministic
