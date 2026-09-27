@@ -2322,6 +2322,32 @@ let closed_sequence = function
   | [] -> Closed_skip
   | last :: rest -> List.fold_left (fun tail first -> Closed_sequence (first, tail)) last rest
 
+let order_closed_helpers context helpers =
+  let definitions = Hashtbl.create (List.length helpers) in
+  let visited = Hashtbl.create (List.length helpers) in
+  let ordered = ref [] in
+  List.iter (fun node -> Hashtbl.add definitions (text node "name") node) helpers;
+  let rec visit node =
+    let name = text node "name" in
+    match Hashtbl.find_opt visited name with
+    | Some true -> ()
+    | Some false -> fail context node ("cyclic closed helper dependency on " ^ name)
+    | None ->
+        Hashtbl.add visited name false;
+        walk (fun call -> match kind call, children call with
+          | "CallExpr", target :: _ ->
+              let dependency = closed_callee target in
+              begin match Hashtbl.find_opt definitions dependency with
+              | Some definition -> visit definition
+              | None -> fail context call "closed call requires a defined unsigned long helper"
+              end
+          | _ -> ()) node;
+        Hashtbl.replace visited name true;
+        ordered := node :: !ordered
+  in
+  List.iter visit helpers;
+  List.rev !ordered
+
 let emit_closed contexts trees =
   let declarations tree = List.filter (fun node -> kind node <> "EmptyDecl" &&
     not (kind node = "TypedefDecl" && Json.bool (field node "isImplicit"))) (children tree) in
@@ -2336,6 +2362,7 @@ let emit_closed contexts trees =
       List.iter (fun node ->
         if kind node <> "FunctionDecl" then fail context node "closed compilation requires function declarations"
       ) declarations;
+      let helpers = order_closed_helpers context helpers in
       let _, linked, declarations = List.fold_left (fun (slot, linked, declarations) node ->
         let name = text node "name" in
         let inputs, blocks = List.partition (fun child -> kind child = "ParmVarDecl") (children node) in

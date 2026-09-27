@@ -454,6 +454,45 @@ private def read_command (lookup_helper : HelperScope) : Nat → Scope → Nat �
       pure (.result value, rank)
     | _, _ => throw "unsupported closed statement"
 
+private def helper_dependencies : Nat → Json → List String → List String
+  | 0, _, tail => tail
+  | depth + 1, node, tail =>
+    let children := child_nodes node
+    let nested := children.foldr (helper_dependencies depth) tail
+    match field_text node "kind", children with
+    | "CallExpr", target :: _ => direct_callee depth target :: nested
+    | _, _ => nested
+
+private structure HelperOrder where
+  visited : Std.HashMap String Bool
+  reversed : List Json
+
+private def visit_helper (definitions : Std.HashMap String Json) (source_depth : Nat) :
+    Nat → HelperOrder → String → Except String HelperOrder
+  | 0, _, _ => .error "incomplete closed helper graph"
+  | depth + 1, state, name => do
+    match state.visited[name]? with
+    | some true => pure state
+    | some false => throw ("cyclic closed helper dependency on " ++ name)
+    | none =>
+      let definition ← require definitions[name]? "closed call requires a defined unsigned long helper"
+      let mut next := { state with visited := state.visited.insert name false }
+      for dependency in helper_dependencies source_depth definition [] do
+        next ← visit_helper definitions source_depth depth next dependency
+      pure { next with visited := next.visited.insert name true, reversed := definition :: next.reversed }
+
+private def order_helpers (helpers : List Json) (source_depth : Nat) : Except String (List Json) := do
+  let mut definitions : Std.HashMap String Json := ∅
+  for definition in helpers do
+    let name := field_text definition "name"
+    if name.isEmpty || definitions.contains name then
+      throw "invalid closed helper identity"
+    definitions := definitions.insert name definition
+  let mut seen : HelperOrder := ⟨∅, []⟩
+  for definition in helpers do
+    seen ← visit_helper definitions source_depth (helpers.length + 1) seen (field_text definition "name")
+  pure seen.reversed.reverse
+
 private def closed_source (frontend : String) : Except String (List (Helper Source) × Command Source) := do
   let tree ← Json.parse frontend
   unless field_text tree "kind" == "TranslationUnitDecl" do
@@ -471,12 +510,12 @@ private def closed_source (frontend : String) : Except String (List (Helper Sour
   let [body] := child_nodes main | throw "invalid closed main definition"
   unless field_text body "kind" == "CompoundStmt" do
     throw "invalid closed main body"
+  let ordered ← order_helpers (definitions.filter (fun node => field_text node "name" != "main")) frontend.length
   let mut linked : List (String × (Nat × Nat)) := []
   let mut helpers : List (Helper Source) := []
   let mut slot := 0
-  for definition in definitions do
+  for definition in ordered do
     let name := field_text definition "name"
-    if name == "main" then continue
     let (code, arity) ← kernel_source definition frontend.length (fun name => List.lookup name linked)
     let parameters := if arity == 0 then "void" else String.intercalate ", " (List.replicate arity "unsigned long")
     unless !name.isEmpty && (List.lookup name linked).isNone &&
