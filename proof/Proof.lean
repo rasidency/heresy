@@ -280,14 +280,17 @@ def check_helpers (arities : Array Nat) : List (Helper Source) → Bool
     check_expression helper.body && (calls_in_scope arities (fun index => index < helper.arity) helper.body &&
       check_helpers (arities.push helper.arity) rest)
 
-theorem read_calls_in_scope (arities : Array Nat) (parameter_ok : Nat → Bool)
-    (expression : Source) (parameters : Locals) (before after : CallTable)
+theorem scoped_expression_reads (arities : Array Nat) (parameter_ok : Nat → Bool)
+    (expression : Source) (inputs other : Locals) (before after : CallTable)
     (accepted : calls_in_scope arities parameter_ok expression = true)
-    (agree : ∀ slot, slot < arities.size → ∀ values, before slot values = after slot values) :
-    source_eval_with before parameters expression = source_eval_with after parameters expression := by
+    (agree : ∀ slot, slot < arities.size → ∀ values, before slot values = after slot values)
+    (bound_arguments : ∀ index, parameter_ok index = true → inputs index = other index) :
+    source_eval_with before inputs expression = source_eval_with after other expression := by
   induction expression using Source.induct with
   | literal value => simp only [source_eval_with]
-  | param index => simp only [source_eval_with]
+  | param index =>
+    simp only [source_eval_with]
+    exact bound_arguments index (by simpa only [calls_in_scope] using accepted)
   | binary op left right first second =>
     simp only [calls_in_scope, Bool.and_eq_true] at accepted
     simp only [source_eval_with, first accepted.1, second accepted.2]
@@ -337,7 +340,7 @@ theorem linked_helper_equation (helpers : List (Helper Source)) (arities : Array
         simp [added, bind_helper, show slot ≠ arities.size by omega]
       change complete arities.size values = source_eval_with complete (arguments_view values) first.body
       rw [current]
-      exact read_calls_in_scope arities _ first.body _ calls complete accepted.2.1 earlier
+      exact scoped_expression_reads arities _ first.body _ _ calls complete accepted.2.1 earlier (fun _ _ => rfl)
     | succ index =>
       simp only [List.getElem?_cons_succ] at found
       let added := bind_helper calls arities.size (fun input => source_eval_with calls (arguments_view input) first.body)
@@ -360,6 +363,39 @@ theorem lowered_helper_equations (helpers : List (Helper Source)) (accepted : ch
     rw [lower_helpers_correct]
     simp only [Helper.lower, lower_with_correct]
     simpa using linked_helper_equation helpers #[] no_calls accepted slot source original values
+
+private theorem checked_helper_scope (helpers : List (Helper Source)) (arities : Array Nat)
+    (accepted : check_helpers arities helpers = true) (index : Nat) (helper : Helper Source)
+    (found : helpers[index]? = some helper) :
+    ∃ scope, calls_in_scope scope (fun slot => slot < helper.arity) helper.body = true := by
+  induction helpers generalizing arities index helper with
+  | nil => simp at found
+  | cons first rest later =>
+    simp only [check_helpers, Bool.and_eq_true] at accepted
+    cases index with
+    | zero =>
+      simp only [List.getElem?_cons_zero, Option.some.injEq] at found
+      subst helper
+      exact ⟨arities, accepted.2.1⟩
+    | succ index =>
+      exact later (arities.push first.arity) accepted.2.2 index helper (List.getElem?_cons_succ ▸ found)
+
+theorem lowered_helper_uses_bound_arguments (helpers : List (Helper Source)) (accepted : check_helpers #[] helpers = true)
+    (slot : Nat) (helper : Helper Source) (found : helpers[slot]? = some helper) (inputs other : List Int)
+    (bound_arguments : ∀ index, index < helper.arity → inputs[index]? = other[index]?) :
+    let linked := link_helpers target_eval_with 0 (helpers.map Helper.lower) no_calls
+    linked slot inputs = linked slot other := by
+  obtain ⟨scope, valid_body⟩ := checked_helper_scope helpers #[] accepted slot helper found
+  dsimp only
+  rw [lower_helpers_correct]
+  have equation (values : List Int) :
+      let linked := link_helpers source_eval_with 0 helpers no_calls
+      linked slot values = source_eval_with linked (arguments_view values) helper.body := by
+    simpa using linked_helper_equation helpers #[] no_calls accepted slot helper found values
+  rw [equation inputs, equation other]
+  apply scoped_expression_reads scope _ helper.body _ _ _ _ valid_body (fun _ _ _ => rfl)
+  intro index present
+  simp only [arguments_view, bound_arguments index (of_decide_eq_true present)]
 
 theorem linked_helpers_bounded (helpers : List (Helper Source)) (arities : Array Nat)
     (slot : Nat) (calls : CallTable) (accepted : check_helpers arities helpers = true) (safe : BoundedCalls calls) :
@@ -1746,6 +1782,7 @@ end Heresy
 #print axioms Heresy.lower_helpers_correct
 #print axioms Heresy.argument_binding
 #print axioms Heresy.lowered_helper_equations
+#print axioms Heresy.lowered_helper_uses_bound_arguments
 #print axioms Heresy.linked_program_correct
 #print axioms Heresy.linked_execution_preserves_words
 #print axioms Heresy.executes_deterministic

@@ -614,6 +614,15 @@ theorem program_certificate_sound (helpers : List (Helper Source)) (body : Comma
   exact ⟨helpers.map Helper.lower, body.map lower, emitted, lowered_helper_equations helpers linked, linked_program_correct helpers body,
     linked_execution_preserves_words helpers body linked bounded⟩
 
+theorem certified_helper_uses_bound_arguments (helpers : List (Helper Source)) (body : Command Source)
+    (generated : String) (accepted : validates_program helpers body generated = true)
+    (slot : Nat) (helper : Helper Source) (found : helpers[slot]? = some helper) (inputs other : List Int)
+    (bound_arguments : ∀ index, index < helper.arity → inputs[index]? = other[index]?) :
+    let linked := link_helpers target_eval_with 0 (helpers.map Helper.lower) no_calls
+    linked slot inputs = linked slot other := by
+  simp only [validates_program, Bool.and_eq_true] at accepted
+  exact lowered_helper_uses_bound_arguments helpers accepted.1 slot helper found inputs other bound_arguments
+
 def validate_program (frontend generated : String) : Except String Unit := do
   let (helpers, body) ← closed_source frontend
   unless validates_program helpers body generated do
@@ -623,6 +632,7 @@ end Heresy
 
 #print axioms Heresy.kernel_certificate_sound
 #print axioms Heresy.program_certificate_sound
+#print axioms Heresy.certified_helper_uses_bound_arguments
 
 def main (arguments : List String) : IO UInt32 := do
   match arguments with
