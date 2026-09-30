@@ -81,7 +81,7 @@ inductive Target where
   | conditional (condition yes no : Target)
   | invoke (slot : Nat) (arguments : List Target)
 
-private theorem Source.induct {P : Source → Prop}
+theorem Source.induct {P : Source → Prop}
     (literal : ∀ value, P (.constant value)) (param : ∀ index, P (.parameter index))
     (binary : ∀ op left right, P left → P right → P (.binary op left right))
     (conditional : ∀ condition yes no, P condition → P yes → P no → P (.conditional condition yes no))
@@ -220,7 +220,7 @@ def source_status (body : Source) : Int := unsigned 8 (signed 32 (source_eval (f
 
 def target_status (body : Target) : Int := unsigned 8 (target_eval (fun _ => 0) body)
 
-private theorem exit_status_truncation (value : Int) : unsigned 8 (signed 32 value) = unsigned 8 value := by
+theorem exit_status_truncation (value : Int) : unsigned 8 (signed 32 value) = unsigned 8 value := by
   have divides : modulus 8 ∣ modulus 32 := ⟨16777216, by decide⟩
   have wrap : unsigned 8 (unsigned 32 value) = unsigned 8 value := Int.emod_emod_of_dvd value divides
   unfold signed
@@ -682,7 +682,7 @@ theorem sparse_write_refines (locals : SparseLocals) (slot : Nat) (value : Int) 
     rfl
   · simp [same, Ne.symm same]
 
-private theorem sparse_empty : read_sparse ∅ = (fun _ => 0) := by
+theorem sparse_empty : read_sparse ∅ = (fun _ => 0) := by
   funext slot
   exact Std.TreeMap.getD_emptyc
 

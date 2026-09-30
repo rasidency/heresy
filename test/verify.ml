@@ -216,6 +216,10 @@ let () =
     ignore (success frontend ["-std=c11"; "-O1"; "test/helpers.c"; "-o"; "build/helpersref"]);
     check "closed helper calls preserve argument order, return values and caller state"
       (run "build/helpers" [] = (168, "", "") && run "build/helpersref" [] = (168, "", ""));
+    ignore (success compiler ["test/frames.c"; "--closed"; "--build"; "build/frames"]);
+    ignore (success frontend ["-std=c11"; "-O1"; "test/frames.c"; "-o"; "build/framesref"]);
+    check "closed helper frames isolate mutable locals across repeated calls"
+      (run "build/frames" [] = (50, "", "") && run "build/framesref" [] = (50, "", ""));
     let cycle = "build/cycle.c" in
     write cycle "static unsigned long first(unsigned long);\nstatic unsigned long second(unsigned long n){return n?first(n-1UL):0UL;}\nstatic unsigned long first(unsigned long n){return n?second(n-1UL):0UL;}\nint main(void){return (int)first(2UL);}";
     let code, _, errors = run compiler [cycle; "--closed"; "--check"] in

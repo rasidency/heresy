@@ -1634,11 +1634,11 @@ let rec closed_callee node =
   | "ImplicitCastExpr", [child] when text node "castKind" = "FunctionToPointerDecay" -> closed_callee child
   | _ -> ""
 
-let rec pure_expression ?(closed = false) ?(helpers = fun _ -> None) context params node =
+let rec pure_expression ?(closed = false) ?(strict = false) ?(helpers = fun _ -> None) context params node =
   if contains (ty node) "volatile" || contains (ty node) "_Atomic" then raise (Error "effectful scalar access");
   if (closed && ty node <> "unsigned long") || scalar context (ty node) <> (64, false) then
     raise (Error "pure recovery requires unsigned long arithmetic");
-  let ex = pure_expression ~closed ~helpers context params in
+  let ex = pure_expression ~closed ~strict ~helpers context params in
   match kind node, children node with
   | "IntegerLiteral", _ -> text node "value"
   | "DeclRefExpr", _ ->
@@ -1660,7 +1660,11 @@ let rec pure_expression ?(closed = false) ?(helpers = fun _ -> None) context par
       let operator = match text node "opcode" with
         | "+" -> "+" | "-" -> "-" | "*" -> "*" | "^" -> "`xor`" | "&" -> ".&." | "|" -> ".|."
         | _ -> raise (Error "operation needs the checked runtime")
-      in "normalise 64 False " ^ par (par (ex left) ^ " " ^ operator ^ " " ^ par (ex right))
+      in
+      let left = par (ex left) and right = par (ex right) in
+      let body = if strict then "strictOperands (\\left right -> left " ^ operator ^ " right) " ^ left ^ " " ^ right
+        else left ^ " " ^ operator ^ " " ^ right in
+      "normalise 64 False " ^ par body
   | _ -> raise (Error "expression needs the checked runtime")
 
 let next_integer value =
@@ -2322,6 +2326,28 @@ let closed_sequence = function
   | [] -> Closed_skip
   | last :: rest -> List.fold_left (fun tail first -> Closed_sequence (first, tail)) last rest
 
+let rec closed_returns = function
+  | Closed_result _ -> true
+  | Closed_sequence (first, second) -> closed_returns first || closed_returns second
+  | Closed_select (_, yes, no) -> closed_returns yes && closed_returns no
+  | Closed_skip | Closed_store _ | Closed_loop _ -> false
+
+let render_closed buffer =
+  let emit = Buffer.add_string buffer in
+  let rec render = function
+    | Closed_skip -> emit "Next"
+    | Closed_store (slot, value) -> Printf.bprintf buffer "storeSlot %d (\\slots -> %s)" slot value
+    | Closed_sequence (first, second) ->
+        emit "thenSlot ("; render first; emit ") ("; render second; emit ")"
+    | Closed_select (guard, yes, no) ->
+        Printf.bprintf buffer "chooseSlot (\\slots -> %s) (" guard;
+        render yes; emit ") ("; render no; emit ")"
+    | Closed_loop (guard, body) ->
+        Printf.bprintf buffer "whileSlot (\\slots -> %s) (" guard;
+        render body; emit ")"
+    | Closed_result value -> Printf.bprintf buffer "returnSlot (\\slots -> %s)" value
+  in render
+
 let order_closed_helpers context helpers =
   let definitions = Hashtbl.create (List.length helpers) in
   let visited = Hashtbl.create (List.length helpers) in
@@ -2363,35 +2389,23 @@ let emit_closed contexts trees =
         if kind node <> "FunctionDecl" then fail context node "closed compilation requires function declarations"
       ) declarations;
       let helpers = order_closed_helpers context helpers in
-      let _, linked, declarations = List.fold_left (fun (slot, linked, declarations) node ->
+      let helpers = List.map (fun node ->
         let name = text node "name" in
         let inputs, blocks = List.partition (fun child -> kind child = "ParmVarDecl") (children node) in
-        let arity = List.length inputs in
         let arguments = if inputs = [] then "void" else String.concat ", " (List.map (fun _ -> "unsigned long") inputs) in
         if name = "" || ty node <> "unsigned long (" ^ arguments ^ ")" ||
-           List.exists (fun param -> ty param <> "unsigned long") inputs || List.mem_assoc name linked then
+           List.exists (fun param -> ty param <> "unsigned long") inputs then
           fail context node "closed helper requires an unsigned long signature";
-        let value = match blocks with
-          | [block] when kind block = "CompoundStmt" ->
-              begin match children block with
-              | [ret] when kind ret = "ReturnStmt" ->
-                  begin match children ret with
-                  | [value] -> value
-                  | _ -> fail context ret "closed helper requires one return expression" end
-              | _ -> fail context node "closed helper requires one return statement" end
+        let block = match blocks with
+          | [block] when kind block = "CompoundStmt" -> block
           | _ -> fail context node "invalid closed helper definition" in
-        let parameters = List.mapi (fun index node -> text node "id", "x" ^ string_of_int index) inputs in
-        let body = pure_expression ~closed:true ~helpers:(fun name -> List.assoc_opt name linked) context
-          (fun id -> List.assoc_opt id parameters) value in
-        let name_in_target = "h_" ^ string_of_int slot in
-        let signature = name_in_target ^ " :: " ^ String.concat " -> " (List.init (arity + 1) (fun _ -> "Integer")) in
-        let equation = String.concat " " (name_in_target :: List.map snd parameters @ ["="; body]) in
-        slot + 1, (name, (slot, arity)) :: linked, "" :: equation :: signature :: declarations
-      ) (0, [], []) helpers in
-      let definitions = List.rev declarations in
-      let rank = ref 0 in
-      let expression scope = pure_expression ~closed:true ~helpers:(fun name -> List.assoc_opt name linked) context (fun id ->
-        Option.map (fun slot -> "(readSlot " ^ string_of_int slot ^ " slots)") (List.assoc_opt id scope)) in
+        name, inputs, block
+      ) helpers in
+      let simple_return block = match children block with
+        | [ret] when kind ret = "ReturnStmt" ->
+            begin match children ret with [value] -> Some value | _ -> None end
+        | _ -> None in
+      let framed = List.exists (fun (_, _, block) -> Option.is_none (simple_return block)) helpers in
       let rec lvalue scope node = match kind node, children node with
         | "ParenExpr", [child] -> lvalue scope child
         | "DeclRefExpr", [] when ty node = "unsigned long" ->
@@ -2399,41 +2413,70 @@ let emit_closed contexts trees =
             | Some slot -> slot
             | None -> fail context node "closed assignment requires an in-scope local" end
         | _ -> fail context node "closed assignment requires an unsigned long local" in
-      let rec statement scope node = match kind node, children node with
-        | "CompoundStmt", nodes ->
-            let _, reversed = List.fold_left (fun (scope, reversed) child ->
-              if kind child = "DeclStmt" then begin
-                let scope, locals = List.fold_left (fun (scope, locals) local ->
-                  let id = text local "id" in
-                  match kind local, children local with
-                  | "VarDecl", [value] when ty local = "unsigned long" && text local "storageClass" = "" &&
-                      text local "init" = "c" && id <> "" && not (List.mem_assoc id scope) ->
-                      let value = expression scope value in
-                      let slot = !rank in
-                      incr rank;
-                      (id, slot) :: scope, Closed_store (slot, value) :: locals
-                  | _ -> fail context local "closed declaration requires an initialised unsigned long local"
-                ) (scope, []) (children child) in
-                scope, closed_sequence locals :: reversed
-              end else scope, statement scope child :: reversed
-            ) (scope, []) nodes in
-            closed_sequence reversed
-        | "NullStmt", [] -> Closed_skip
-        | "BinaryOperator", [left; right] when text node "opcode" = "=" ->
-            Closed_store (lvalue scope left, expression scope right)
-        | "IfStmt", [guard; yes] -> Closed_select (expression scope guard, statement scope yes, Closed_skip)
-        | "IfStmt", [guard; yes; no] ->
-            let yes = statement scope yes in
-            let no = statement scope no in
-            Closed_select (expression scope guard, yes, no)
-        | "WhileStmt", [guard; body] -> Closed_loop (expression scope guard, statement scope body)
-        | "ReturnStmt", [cast] when kind cast = "CStyleCastExpr" && text cast "castKind" = "IntegralCast" && ty cast = "int" ->
-            begin match children cast with
-            | [value] -> Closed_result (expression scope value)
-            | _ -> fail context node "closed return requires an unsigned long expression cast to int" end
-        | _ -> fail context node ("unsupported closed statement " ^ kind node) in
+      let command linked entry scope next_slot node =
+        let rank = ref next_slot in
+        let expression scope = pure_expression ~closed:true ~strict:framed ~helpers:(fun name -> List.assoc_opt name linked) context (fun id ->
+          Option.map (fun slot -> "(readSlot " ^ string_of_int slot ^ " slots)") (List.assoc_opt id scope)) in
+        let rec statement scope node = match kind node, children node with
+          | "CompoundStmt", nodes ->
+              let _, reversed = List.fold_left (fun (scope, reversed) child ->
+                if kind child = "DeclStmt" then begin
+                  let scope, locals = List.fold_left (fun (scope, locals) local ->
+                    let id = text local "id" in
+                    match kind local, children local with
+                    | "VarDecl", [value] when ty local = "unsigned long" && text local "storageClass" = "" &&
+                        text local "init" = "c" && id <> "" && not (List.mem_assoc id scope) ->
+                        let value = expression scope value in
+                        let slot = !rank in
+                        incr rank;
+                        (id, slot) :: scope, Closed_store (slot, value) :: locals
+                    | _ -> fail context local "closed declaration requires an initialised unsigned long local"
+                  ) (scope, []) (children child) in
+                  scope, closed_sequence locals :: reversed
+                end else scope, statement scope child :: reversed
+              ) (scope, []) nodes in
+              closed_sequence reversed
+          | "NullStmt", [] -> Closed_skip
+          | "BinaryOperator", [left; right] when text node "opcode" = "=" ->
+              Closed_store (lvalue scope left, expression scope right)
+          | "IfStmt", [guard; yes] -> Closed_select (expression scope guard, statement scope yes, Closed_skip)
+          | "IfStmt", [guard; yes; no] ->
+              let yes = statement scope yes in
+              let no = statement scope no in
+              Closed_select (expression scope guard, yes, no)
+          | "WhileStmt", [guard; body] -> Closed_loop (expression scope guard, statement scope body)
+          | "ReturnStmt", [value] when not entry -> Closed_result (expression scope value)
+          | "ReturnStmt", [cast] when kind cast = "CStyleCastExpr" && text cast "castKind" = "IntegralCast" && ty cast = "int" ->
+              begin match children cast with
+              | [value] -> Closed_result (expression scope value)
+              | _ -> fail context node "closed return requires an unsigned long expression cast to int" end
+          | _ -> fail context node ("unsupported closed statement " ^ kind node) in
+        statement scope node in
+      let _, linked, declarations = List.fold_left (fun (slot, linked, declarations) (name, inputs, block) ->
+        let arity = List.length inputs in
+        let parameters = List.mapi (fun index node -> text node "id", "x" ^ string_of_int index) inputs in
+        let names = List.map snd parameters in
+        let body = if framed then begin
+          let scope = List.mapi (fun index (id, _) -> id, index) parameters in
+          let action = command linked false scope arity block in
+          if not (closed_returns action) then fail context block "closed helper can fall through without returning";
+          let buffer = Buffer.create 512 in
+          Printf.bprintf buffer "runHelper [%s] (" (join names);
+          render_closed buffer action;
+          Buffer.add_char buffer ')';
+          Buffer.contents buffer
+        end else match simple_return block with
+          | Some value -> pure_expression ~closed:true ~helpers:(fun name -> List.assoc_opt name linked) context
+              (fun id -> List.assoc_opt id parameters) value
+          | None -> fail context block "closed helper requires one return statement" in
+        let name_in_target = "h_" ^ string_of_int slot in
+        let signature = name_in_target ^ " :: " ^ String.concat " -> " (List.init (arity + 1) (fun _ -> "Integer")) in
+        let equation = String.concat " " (name_in_target :: names @ ["="; body]) in
+        slot + 1, (name, (slot, arity)) :: linked, "" :: equation :: signature :: declarations
+      ) (0, [], []) helpers in
+      let definitions = List.rev declarations in
       let body = match children main with
-        | [body] when kind body = "CompoundStmt" -> statement [] body
+        | [body] when kind body = "CompoundStmt" -> command linked true [] 0 body
         | _ -> fail context main "invalid closed main definition" in
       let header = [
         "module Main where"; "";
@@ -2446,23 +2489,19 @@ let emit_closed contexts trees =
         "  0 -> ExitSuccess";
         "  code -> ExitFailure code"; ""] in
       begin match body with
-      | Closed_result value ->
+      | Closed_result value when not framed ->
           String.concat "\n" (header @ exit @ definitions @ ["main :: IO ()"; "main = exitWith (exitStatus " ^ par value ^ ")"; ""])
       | _ ->
           let buffer = Buffer.create 2048 in
           let emit = Buffer.add_string buffer in
-          let rec render = function
-            | Closed_skip -> emit "Next"
-            | Closed_store (slot, value) -> Printf.bprintf buffer "storeSlot %d (\\slots -> %s)" slot value
-            | Closed_sequence (first, second) ->
-                emit "thenSlot ("; render first; emit ") ("; render second; emit ")"
-            | Closed_select (guard, yes, no) ->
-                Printf.bprintf buffer "chooseSlot (\\slots -> %s) (" guard;
-                render yes; emit ") ("; render no; emit ")"
-            | Closed_loop (guard, body) ->
-                Printf.bprintf buffer "whileSlot (\\slots -> %s) (" guard;
-                render body; emit ")"
-            | Closed_result value -> Printf.bprintf buffer "returnSlot (\\slots -> %s)" value in
+          let framed_runtime = if framed then [
+            "strictOperands :: (Integer -> Integer -> Integer) -> Integer -> Integer -> Integer";
+            "strictOperands operation left right = left `seq` right `seq` operation left right"; "";
+            "runHelper :: [Integer] -> Action -> Integer";
+            "runHelper values action = foldr seq () values `seq` case action (Slots.fromList (zip [0 ..] values)) of";
+            "  Next _ -> error \"closed helper fell through\"";
+            "  Returned value -> value"; ""
+          ] else [] in
           emit (String.concat "\n" (header @ ["import qualified Data.IntMap.Strict as Slots"] @ exit @ definitions @ [
             "type Locals = Slots.IntMap Integer";
             "data SlotFlow = Next !Locals | Returned !Integer";
@@ -2490,9 +2529,9 @@ let emit_closed contexts trees =
             "runSlots :: Action -> Integer";
             "runSlots action = case action Slots.empty of";
             "  Next _ -> 0";
-            "  Returned value -> value"; "";
-            "main :: IO ()"; "main = exitWith (exitStatus (runSlots ("]));
-          render body;
+            "  Returned value -> value"; ""] @ framed_runtime @
+            ["main :: IO ()"; "main = exitWith (exitStatus (runSlots ("]));
+          render_closed buffer body;
           emit ")))\n";
           Buffer.contents buffer
       end

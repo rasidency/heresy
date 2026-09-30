@@ -1,5 +1,5 @@
 import Lean.Data.Json
-import Proof
+import Execution
 
 set_option warningAsError true
 
@@ -15,21 +15,25 @@ def operator_text : Operator → String
   | .bor => ".|."
   | .bxor => "`xor`"
 
-def render_expression (render_slot : Nat → String) : Target → String
+def render_expression (render_slot : Nat → String) (strict : Bool) : Target → String
   | .constant value => toString value
   | .parameter index => render_slot index
   | .binary operator left right =>
-    "(" ++ render_expression render_slot left ++ ") " ++ operator_text operator ++ " (" ++ render_expression render_slot right ++ ")"
+    let left := "(" ++ render_expression render_slot strict left ++ ")"
+    let right := "(" ++ render_expression render_slot strict right ++ ")"
+    let operator := operator_text operator
+    if strict then "strictOperands (\\left right -> left " ++ operator ++ " right) " ++ left ++ " " ++ right
+    else left ++ " " ++ operator ++ " " ++ right
   | .wrap width expression =>
-    "normalise " ++ toString width ++ " False (" ++ render_expression render_slot expression ++ ")"
+    "normalise " ++ toString width ++ " False (" ++ render_expression render_slot strict expression ++ ")"
   | .conditional condition yes no =>
-    "if (" ++ render_expression render_slot condition ++ ") == 0 then (" ++ render_expression render_slot no ++
-      ") else (" ++ render_expression render_slot yes ++ ")"
+    "if (" ++ render_expression render_slot strict condition ++ ") == 0 then (" ++ render_expression render_slot strict no ++
+      ") else (" ++ render_expression render_slot strict yes ++ ")"
   | .invoke slot arguments =>
     "(" ++ String.intercalate " " (("h_" ++ toString slot) ::
-      arguments.map (fun value => "(" ++ render_expression render_slot value ++ ")")) ++ ")"
+      arguments.map (fun value => "(" ++ render_expression render_slot strict value ++ ")")) ++ ")"
 
-def render_target := render_expression (fun index => "x" ++ toString index)
+def render_target := render_expression (fun index => "x" ++ toString index) false
 
 def validates_kernel (expression : Source) (body : String) : Bool :=
   body == render_target (lower expression)
@@ -397,7 +401,8 @@ private def sequence_commands : List (Command Source) → Command Source
   | [] => .skip
   | last :: rest => rest.foldl (fun tail first => .sequence first tail) last
 
-private def read_command (lookup_helper : HelperScope) : Nat → Scope → Nat → Json → Except String (Command Source × Nat)
+private def read_command (lookup_helper : HelperScope) (entry : Bool) :
+    Nat → Scope → Nat → Json → Except String (Command Source × Nat)
   | 0, _, _, _ => .error "incomplete closed statement"
   | depth + 1, scope, rank, node => do
     match field_text node "kind", child_nodes node with
@@ -421,7 +426,7 @@ private def read_command (lookup_helper : HelperScope) : Nat → Scope → Nat �
             rank := rank + 1
           reversed := sequence_commands declarations :: reversed
         else
-          let (command, next) ← read_command lookup_helper depth scope rank statement
+          let (command, next) ← read_command lookup_helper entry depth scope rank statement
           rank := next
           reversed := command :: reversed
       pure (sequence_commands reversed, rank)
@@ -434,22 +439,25 @@ private def read_command (lookup_helper : HelperScope) : Nat → Scope → Nat �
       pure (.store slot value, rank)
     | "IfStmt", [guard, yes] =>
       let condition ← read_expression lookup_helper (fun ident => List.lookup ident scope) depth guard
-      let (chosen, next) ← read_command lookup_helper depth scope rank yes
+      let (chosen, next) ← read_command lookup_helper entry depth scope rank yes
       pure (.select condition chosen .skip, next)
     | "IfStmt", [guard, yes, no] =>
       let condition ← read_expression lookup_helper (fun ident => List.lookup ident scope) depth guard
-      let (chosen, next) ← read_command lookup_helper depth scope rank yes
-      let (alternative, next) ← read_command lookup_helper depth scope next no
+      let (chosen, next) ← read_command lookup_helper entry depth scope rank yes
+      let (alternative, next) ← read_command lookup_helper entry depth scope next no
       pure (.select condition chosen alternative, next)
     | "WhileStmt", [guard, body] =>
       let condition ← read_expression lookup_helper (fun ident => List.lookup ident scope) depth guard
-      let (iteration, next) ← read_command lookup_helper depth scope rank body
+      let (iteration, next) ← read_command lookup_helper entry depth scope rank body
       pure (.loop condition iteration, next)
-    | "ReturnStmt", [cast] =>
-      unless field_text cast "kind" == "CStyleCastExpr" && field_text cast "castKind" == "IntegralCast" &&
-          type_spelling cast == "int" do
-        throw "closed return requires an unsigned long expression cast to int"
-      let [expression] := child_nodes cast | throw "missing closed return expression"
+    | "ReturnStmt", [value] =>
+      let expression ← if entry then do
+        unless field_text value "kind" == "CStyleCastExpr" && field_text value "castKind" == "IntegralCast" &&
+            type_spelling value == "int" do
+          throw "closed return requires an unsigned long expression cast to int"
+        let [expression] := child_nodes value | throw "missing closed return expression"
+        pure expression
+      else pure value
       let value ← read_expression lookup_helper (fun ident => List.lookup ident scope) depth expression
       pure (.result value, rank)
     | _, _ => throw "unsupported closed statement"
@@ -493,7 +501,16 @@ private def order_helpers (helpers : List Json) (source_depth : Nat) : Except St
     seen ← visit_helper definitions source_depth (helpers.length + 1) seen (field_text definition "name")
   pure seen.reversed.reverse
 
-private def closed_source (frontend : String) : Except String (List (Helper Source) × Command Source) := do
+private inductive ClosedProgram where
+  | direct (helpers : List (Helper Source)) (body : Command Source)
+  | framed (helpers : List (Helper (Command Source))) (body : Command Source)
+
+private def single_return (block : Json) : Bool :=
+  match child_nodes block with
+  | [statement] => field_text statement "kind" == "ReturnStmt" && (child_nodes statement).length == 1
+  | _ => false
+
+private def closed_source (frontend : String) : Except String ClosedProgram := do
   let tree ← Json.parse frontend
   unless field_text tree "kind" == "TranslationUnitDecl" do
     throw "expected a translation unit"
@@ -512,20 +529,36 @@ private def closed_source (frontend : String) : Except String (List (Helper Sour
     throw "invalid closed main body"
   let ordered ← order_helpers (definitions.filter (fun node => field_text node "name" != "main")) frontend.length
   let mut linked : List (String × (Nat × Nat)) := []
-  let mut helpers : List (Helper Source) := []
+  let mut helpers : List (Helper (Command Source)) := []
+  let mut framed := false
   let mut slot := 0
   for definition in ordered do
     let name := field_text definition "name"
-    let (code, arity) ← kernel_source definition frontend.length (fun name => List.lookup name linked)
+    let (inputs, blocks) := (child_nodes definition).partition (fun node => field_text node "kind" == "ParmVarDecl")
+    let arity := inputs.length
     let parameters := if arity == 0 then "void" else String.intercalate ", " (List.replicate arity "unsigned long")
     unless !name.isEmpty && (List.lookup name linked).isNone &&
+        inputs.all (fun node => type_spelling node == "unsigned long") &&
         type_spelling definition == ("unsigned long (" ++ parameters ++ ")") do
       throw "closed helper requires an unsigned long signature"
+    let [block] := blocks | throw "invalid closed helper definition"
+    unless field_text block "kind" == "CompoundStmt" do
+      throw "invalid closed helper body"
+    let identifiers := inputs.map (fun node => field_text node "id")
+    if identifiers.any (·.isEmpty) || !decide identifiers.Nodup then
+      throw "invalid closed helper parameters"
+    let (code, _) ← read_command (fun name => List.lookup name linked) false frontend.length identifiers.zipIdx arity block
+    framed := framed || !single_return block
     helpers := ⟨arity, code⟩ :: helpers
     linked := (name, (slot, arity)) :: linked
     slot := slot + 1
-  let (entry, _) ← read_command (fun name => List.lookup name linked) frontend.length [] 0 body
-  pure (helpers.reverse, entry)
+  let (entry, _) ← read_command (fun name => List.lookup name linked) true frontend.length [] 0 body
+  if framed then pure (.framed helpers.reverse entry)
+  else
+    let direct ← helpers.reverse.mapM fun helper => match helper.body with
+      | .result value => pure ⟨helper.arity, value⟩
+      | _ => throw "closed helper requires one return statement"
+    pure (.direct direct entry)
 
 private def exit_definition : List String := ["",
   "normalise :: Int -> Bool -> Integer -> Integer",
@@ -534,16 +567,17 @@ private def exit_definition : List String := ["",
   "exitStatus value = case fromInteger (value `mod` 256) of",
   "  0 -> ExitSuccess", "  code -> ExitFailure code", ""]
 
-private def render_slot_expression (expression : Target) : String :=
-  "(\\slots -> " ++ render_expression (fun index => "(readSlot " ++ toString index ++ " slots)") expression ++ ")"
+private def render_slot_expression (strict : Bool) (expression : Target) : String :=
+  "(\\slots -> " ++ render_expression (fun index => "(readSlot " ++ toString index ++ " slots)") strict expression ++ ")"
 
-private def render_command : Command Target → String
+private def render_command (strict : Bool) : Command Target → String
   | .skip => "Next"
-  | .store slot expression => "storeSlot " ++ toString slot ++ " " ++ render_slot_expression expression
-  | .sequence first second => "thenSlot (" ++ render_command first ++ ") (" ++ render_command second ++ ")"
-  | .select guard yes no => "chooseSlot " ++ render_slot_expression guard ++ " (" ++ render_command yes ++ ") (" ++ render_command no ++ ")"
-  | .loop guard body => "whileSlot " ++ render_slot_expression guard ++ " (" ++ render_command body ++ ")"
-  | .result expression => "returnSlot " ++ render_slot_expression expression
+  | .store slot expression => "storeSlot " ++ toString slot ++ " " ++ render_slot_expression strict expression
+  | .sequence first second => "thenSlot (" ++ render_command strict first ++ ") (" ++ render_command strict second ++ ")"
+  | .select guard yes no => "chooseSlot " ++ render_slot_expression strict guard ++ " (" ++
+      render_command strict yes ++ ") (" ++ render_command strict no ++ ")"
+  | .loop guard body => "whileSlot " ++ render_slot_expression strict guard ++ " (" ++ render_command strict body ++ ")"
+  | .result expression => "returnSlot " ++ render_slot_expression strict expression
 
 private def render_helper (slot : Nat) (helper : Helper Target) : List String :=
   let name := "h_" ++ toString slot
@@ -552,13 +586,9 @@ private def render_helper (slot : Nat) (helper : Helper Target) : List String :=
   let equation := String.intercalate " " (name :: parameters ++ ["=", render_target helper.body])
   [signature, equation, ""]
 
-def render_program (helpers : List (Helper Target)) (body : Command Target) : String :=
-  let header := ["module Main where", "", "import Data.Bits", "import System.Exit"]
-  let definitions := exit_definition ++ (helpers.zipIdx.flatMap fun (helper, slot) => render_helper slot helper)
-  match body with
-  | .result expression => String.intercalate "\n" (header ++ definitions ++ [
-    "main :: IO ()", "main = exitWith (exitStatus (" ++ render_expression (fun _ => "0") expression ++ "))", ""])
-  | _ => String.intercalate "\n" (header ++ ["import qualified Data.IntMap.Strict as Slots"] ++ definitions ++ [
+private def program_header := ["module Main where", "", "import Data.Bits", "import System.Exit"]
+
+private def slot_runtime : List String := [
     "type Locals = Slots.IntMap Integer",
     "data SlotFlow = Next !Locals | Returned !Integer",
     "type Action = Locals -> SlotFlow", "",
@@ -585,8 +615,37 @@ def render_program (helpers : List (Helper Target)) (body : Command Target) : St
     "runSlots :: Action -> Integer",
     "runSlots action = case action Slots.empty of",
     "  Next _ -> 0",
-    "  Returned value -> value", "",
-    "main :: IO ()", "main = exitWith (exitStatus (runSlots (" ++ render_command body ++ ")))", ""])
+    "  Returned value -> value", ""]
+
+private def slot_entry (strict : Bool) (body : Command Target) : List String :=
+  ["main :: IO ()", "main = exitWith (exitStatus (runSlots (" ++ render_command strict body ++ ")))", ""]
+
+def render_program (helpers : List (Helper Target)) (body : Command Target) : String :=
+  let definitions := exit_definition ++ (helpers.zipIdx.flatMap fun (helper, slot) => render_helper slot helper)
+  match body with
+  | .result expression => String.intercalate "\n" (program_header ++ definitions ++ [
+    "main :: IO ()", "main = exitWith (exitStatus (" ++ render_expression (fun _ => "0") false expression ++ "))", ""])
+  | _ => String.intercalate "\n" (program_header ++ ["import qualified Data.IntMap.Strict as Slots"] ++ definitions ++
+      slot_runtime ++ slot_entry false body)
+
+private def render_framed_helper (slot : Nat) (helper : Helper (Command Target)) : List String :=
+  let name := "h_" ++ toString slot
+  let signature := name ++ " :: " ++ String.intercalate " -> " (List.replicate (helper.arity + 1) "Integer")
+  let parameters := (List.range helper.arity).map (fun index => "x" ++ toString index)
+  let action := "runHelper [" ++ String.intercalate ", " parameters ++ "] (" ++ render_command true helper.body ++ ")"
+  [signature, String.intercalate " " (name :: parameters ++ ["=", action]), ""]
+
+def render_framed_program (helpers : List (Helper (Command Target))) (body : Command Target) : String :=
+  let definitions := helpers.zipIdx.flatMap fun (helper, slot) => render_framed_helper slot helper
+  let runtime := [
+    "strictOperands :: (Integer -> Integer -> Integer) -> Integer -> Integer -> Integer",
+    "strictOperands operation left right = left `seq` right `seq` operation left right", "",
+    "runHelper :: [Integer] -> Action -> Integer",
+    "runHelper values action = foldr seq () values `seq` case action (Slots.fromList (zip [0 ..] values)) of",
+    "  Next _ -> error \"closed helper fell through\"",
+    "  Returned value -> value", ""]
+  String.intercalate "\n" (program_header ++ ["import qualified Data.IntMap.Strict as Slots"] ++ exit_definition ++
+    definitions ++ slot_runtime ++ runtime ++ slot_entry true body)
 
 private def body_calls_in_scope (arities : Array Nat) : Command Source → Bool
   | .skip => true
@@ -595,6 +654,37 @@ private def body_calls_in_scope (arities : Array Nat) : Command Source → Bool
   | .select condition yes no => calls_in_scope arities (fun _ => true) condition &&
       (body_calls_in_scope arities yes && body_calls_in_scope arities no)
   | .loop condition body => calls_in_scope arities (fun _ => true) condition && body_calls_in_scope arities body
+
+def check_frame_helpers (arities : Array Nat) : List (Helper (Command Source)) → Bool
+  | [] => true
+  | helper :: rest => returns_value helper.body && (check_commands helper.body &&
+    (body_calls_in_scope arities helper.body && check_frame_helpers (arities.push helper.arity) rest))
+
+theorem checked_frame_returns (arities : Array Nat) (helpers : List (Helper (Command Source)))
+    (accepted : check_frame_helpers arities helpers = true) (helper : Helper (Command Source))
+    (member : helper ∈ helpers) : returns_value helper.body = true := by
+  induction helpers generalizing arities with
+  | nil => simp at member
+  | cons first rest checked =>
+    simp only [check_frame_helpers, Bool.and_eq_true] at accepted
+    rcases List.mem_cons.mp member with equality | remaining
+    · subst helper
+      exact accepted.1
+    · exact checked (arities.push first.arity) accepted.2.2.2 remaining
+
+def validates_framed_program (helpers : List (Helper (Command Source))) (body : Command Source) (generated : String) : Bool :=
+  check_frame_helpers #[] helpers && (check_commands body &&
+    (body_calls_in_scope (helpers.toArray.map Helper.arity) body &&
+      generated == render_framed_program (helpers.map lower_frame) (body.map lower)))
+
+theorem framed_program_certificate_sound (helpers : List (Helper (Command Source))) (body : Command Source)
+    (generated : String) (accepted : validates_framed_program helpers body generated = true) :
+    generated = render_framed_program (helpers.map lower_frame) (body.map lower) ∧
+      (∀ helper ∈ helpers, returns_value helper.body = true) ∧
+      (∀ status, (∃ fuel, target_exit (helpers.map lower_frame) (body.map lower) fuel = some status) ↔
+        ∃ fuel, source_exit helpers body fuel = some status) := by
+  simp only [validates_framed_program, Bool.and_eq_true, beq_iff_eq] at accepted
+  exact ⟨accepted.2.2.2, checked_frame_returns #[] helpers accepted.1, framed_observations_correct helpers body⟩
 
 def validates_program (helpers : List (Helper Source)) (body : Command Source) (generated : String) : Bool :=
   check_helpers #[] helpers && (check_commands body &&
@@ -624,14 +714,21 @@ theorem certified_helper_uses_bound_arguments (helpers : List (Helper Source)) (
   exact lowered_helper_uses_bound_arguments helpers accepted.1 slot helper found inputs other bound_arguments
 
 def validate_program (frontend generated : String) : Except String Unit := do
-  let (helpers, body) ← closed_source frontend
-  unless validates_program helpers body generated do
-    throw "emitted program differs from verified lowering"
+  match ← closed_source frontend with
+  | .direct helpers body =>
+    unless validates_program helpers body generated do
+      throw "emitted program differs from verified lowering"
+  | .framed helpers body =>
+    unless check_frame_helpers #[] helpers do
+      throw "closed helper can fall through or use an out-of-scope call"
+    unless validates_framed_program helpers body generated do
+      throw "emitted program differs from verified framed lowering"
 
 end Heresy
 
 #print axioms Heresy.kernel_certificate_sound
 #print axioms Heresy.program_certificate_sound
+#print axioms Heresy.framed_program_certificate_sound
 #print axioms Heresy.certified_helper_uses_bound_arguments
 
 def main (arguments : List String) : IO UInt32 := do
