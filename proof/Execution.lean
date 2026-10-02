@@ -10,7 +10,50 @@ def no_partial_calls : PartialCalls := fun _ _ => none
 
 private def collect_arguments : List (Option α) → Option (List α)
   | [] => some []
-  | first :: rest => List.cons <$> first <*> collect_arguments rest
+  | first :: rest => do
+    let value ← first
+    let remainder ← collect_arguments rest
+    pure (value :: remainder)
+
+def OptionExtends (before after : Option α) : Prop :=
+  ∀ value, before = some value → after = some value
+
+private theorem option_same (value : Option α) : OptionExtends value value := fun _ observed => observed
+
+private theorem option_map_extends (transform : α → β) (before after : Option α)
+    (refinement : OptionExtends before after) : OptionExtends (transform <$> before) (transform <$> after) := by
+  cases before with
+  | none => simp [OptionExtends]
+  | some value =>
+    have same := refinement value rfl
+    subst after
+    exact option_same _
+
+private theorem option_bind_extends (before after : Option α) (first second : α → Option β)
+    (refinement : OptionExtends before after) (next : ∀ value, OptionExtends (first value) (second value)) :
+    OptionExtends (before >>= first) (after >>= second) := by
+  cases before with
+  | none => simp [OptionExtends]
+  | some value =>
+    have same := refinement value rfl
+    subst after
+    exact next value
+
+private theorem collect_extends (arguments : List α) (before after : α → Option β)
+    (refinement : ∀ argument ∈ arguments, OptionExtends (before argument) (after argument)) :
+    OptionExtends (collect_arguments (arguments.map before)) (collect_arguments (arguments.map after)) := by
+  induction arguments with
+  | nil => exact option_same _
+  | cons first rest remaining =>
+    simp only [List.map_cons, collect_arguments]
+    apply option_bind_extends _ _ _ _ (refinement first (by simp))
+    intro value
+    apply option_bind_extends _ _ _ _ (remaining (fun argument present => refinement argument (by simp [present])))
+    intro _
+    exact option_same _
+
+def CallsExtend (before after : PartialCalls) : Prop :=
+  ∀ slot arguments, OptionExtends (before slot arguments) (after slot arguments)
 
 def source_expression (calls : PartialCalls) (locals : Locals) : Source → Option Int
   | .constant value => some value
@@ -54,6 +97,30 @@ theorem partial_expression_lower (calls : PartialCalls) (locals : Locals) (expre
   | invoke slot arguments each =>
     simp only [lower, source_expression, target_expression, List.map_map, Function.comp_def]
     rw [List.map_congr_left each]
+
+theorem source_expression_extends (before after : PartialCalls) (links : CallsExtend before after)
+    (locals : Locals) (expression : Source) :
+    OptionExtends (source_expression before locals expression) (source_expression after locals expression) := by
+  induction expression using Source.induct with
+  | literal => simp only [source_expression]; exact option_same _
+  | param => simp only [source_expression]; exact option_same _
+  | binary operator left right first second =>
+    simp only [source_expression]
+    apply option_bind_extends _ _ _ _ first
+    intro x
+    apply option_bind_extends _ _ _ _ second
+    intro y
+    exact option_same (some (unsigned 64 (operate operator x y)))
+  | conditional condition yes no test chosen alternative =>
+    simp only [source_expression]
+    apply option_bind_extends _ _ _ _ test
+    intro guard
+    by_cases taken : guard = 0
+    · simpa only [taken, if_true] using alternative
+    · simpa only [taken, if_false] using chosen
+  | invoke slot arguments each =>
+    simp only [source_expression]
+    exact option_bind_extends _ _ _ _ (collect_extends arguments _ _ each) (links slot)
 
 def run_command (view : state → Locals) (write : state → Nat → Int → state) :
     Nat → Command (Locals → Option Int) → state → Option (CommandOutcome state)
@@ -178,6 +245,55 @@ theorem run_command_projects (view : state → Locals) (write : state → Nat �
             | next updated => exact project_run (.loop condition body) updated
             | returned value => rfl
 
+theorem run_command_extends (view : state → Locals) (write : state → Nat → Int → state)
+    (before after : expr → Locals → Option Int)
+    (expressions : ∀ value locals, OptionExtends (before value locals) (after value locals))
+    (smaller larger : Nat) (more : smaller ≤ larger) (body : Command expr) (initial : state) :
+    OptionExtends (run_command view write smaller (body.map before) initial)
+      (run_command view write larger (body.map after) initial) := by
+  induction smaller generalizing larger body initial with
+  | zero => simp [run_command, OptionExtends]
+  | succ fuel recurse =>
+    cases larger with
+    | zero => omega
+    | succ larger =>
+      have allowed : fuel ≤ larger := by omega
+      cases body with
+      | skip => exact option_same _
+      | store slot value =>
+        simp only [Command.map, run_command]
+        exact option_map_extends _ _ _ (expressions value (view initial))
+      | result value =>
+        simp only [Command.map, run_command]
+        exact option_map_extends _ _ _ (expressions value (view initial))
+      | sequence first second =>
+        simp only [Command.map, run_command]
+        apply option_bind_extends _ _ _ _ (recurse larger allowed first initial)
+        intro step
+        cases step with
+        | next updated => exact recurse larger allowed second updated
+        | returned value => exact option_same _
+      | select condition yes no =>
+        simp only [Command.map, run_command]
+        apply option_bind_extends _ _ _ _ (expressions condition (view initial))
+        intro test
+        by_cases zero : test = 0
+        · simpa only [zero, if_true] using recurse larger allowed no initial
+        · simpa only [zero, if_false] using recurse larger allowed yes initial
+      | loop condition body =>
+        simp only [Command.map, run_command]
+        apply option_bind_extends _ _ _ _ (expressions condition (view initial))
+        intro test
+        by_cases zero : test = 0
+        · simp only [zero, if_true]
+          exact option_same _
+        · simp only [zero, if_false]
+          apply option_bind_extends _ _ _ _ (recurse larger allowed body initial)
+          intro iteration
+          cases iteration with
+          | next updated => exact recurse larger allowed (.loop condition body) updated
+          | returned value => exact option_same _
+
 def initialise_frame (write : state → Nat → Int → state) : Nat → List Int → state → state
   | _, [], initial => initial
   | index, value :: rest, initial => initialise_frame write (index + 1) rest (write initial index value)
@@ -190,6 +306,30 @@ theorem initialise_frame_projects (view : state → Locals) (write : state → N
   induction values generalizing index initial with
   | nil => rfl
   | cons value rest other => simp only [initialise_frame, other, writes]
+
+theorem initialise_frame_read (start : Nat) (values : List Int) (initial : Locals) (index : Nat) :
+    initialise_frame write_local start values initial index =
+      if index < start then initial index else (values[index - start]?).getD (initial index) := by
+  induction values generalizing start initial with
+  | nil => simp [initialise_frame]
+  | cons value rest bound =>
+    rw [initialise_frame, bound]
+    by_cases earlier : index < start
+    · have earlier_next : index < start + 1 := by omega
+      have different : index ≠ start := by omega
+      simp [earlier, earlier_next, write_local, different]
+    · by_cases equal : index = start
+      · subst index
+        simp [write_local]
+      · have later : ¬ index < start + 1 := by omega
+        have displacement : index - start = index - (start + 1) + 1 := by omega
+        simp [earlier, later, displacement, List.getElem?_cons_succ, write_local, equal]
+
+theorem sparse_frame_binds (values : List Int) :
+    read_sparse (initialise_frame write_sparse 0 values ∅) = arguments_view values := by
+  rw [initialise_frame_projects read_sparse write_sparse sparse_write_refines, sparse_empty]
+  funext index
+  simp [initialise_frame_read, arguments_view]
 
 private def frame_result : CommandOutcome state → Option Int
   | .returned value => some value
@@ -248,6 +388,45 @@ def source_exit (helpers : List (Helper (Command Source))) (body : Command Sourc
     (fun _ => 0)
   outcome.map (fun result => unsigned 8 (signed 32 result.value))
 
+theorem source_links_extend (helpers : List (Helper (Command Source))) (smaller larger : Nat)
+    (more : smaller ≤ larger) (slot : Nat) (before after : PartialCalls) (extension : CallsExtend before after) :
+    CallsExtend (link_frames source_expression id write_local (fun _ => 0) smaller slot helpers before)
+      (link_frames source_expression id write_local (fun _ => 0) larger slot helpers after) := by
+  induction helpers generalizing slot before after with
+  | nil => exact extension
+  | cons helper rest recurse =>
+    simp only [link_frames]
+    apply recurse
+    intro requested values
+    by_cases current : requested = slot
+    · simp only [current, if_true]
+      apply option_bind_extends _ _ _ _ (run_command_extends id write_local
+        (fun expression locals => source_expression before locals expression)
+        (fun expression locals => source_expression after locals expression)
+        (fun expression locals => source_expression_extends before after extension locals expression)
+        smaller larger more helper.body (initialise_frame write_local 0 values (fun _ => 0)))
+      intro observed
+      exact option_same (frame_result observed)
+    · simpa only [current, if_false] using extension requested values
+
+theorem source_exit_extends (helpers : List (Helper (Command Source))) (body : Command Source)
+    (smaller larger : Nat) (more : smaller ≤ larger) :
+    OptionExtends (source_exit helpers body smaller) (source_exit helpers body larger) := by
+  simp only [source_exit]
+  apply option_map_extends
+  apply run_command_extends id write_local _ _ _ smaller larger more body (fun _ => 0)
+  intro expression locals
+  apply source_expression_extends
+  exact source_links_extend helpers smaller larger more 0 _ _ (fun _ _ => option_same _)
+
+theorem framed_exit_unique (helpers : List (Helper (Command Source))) (body : Command Source)
+    (first_fuel second_fuel : Nat) (first second : Int)
+    (run_first : source_exit helpers body first_fuel = some first)
+    (run_second : source_exit helpers body second_fuel = some second) : first = second := by
+  have first_observed := source_exit_extends helpers body first_fuel (max first_fuel second_fuel) (Nat.le_max_left _ _) first run_first
+  have second_observed := source_exit_extends helpers body second_fuel (max first_fuel second_fuel) (Nat.le_max_right _ _) second run_second
+  exact Option.some.inj (first_observed.symm.trans second_observed)
+
 def target_exit (helpers : List (Helper (Command Target))) (body : Command Target) (fuel : Nat) : Option Int :=
   let calls := link_frames target_expression read_sparse write_sparse ∅ fuel 0 helpers no_partial_calls
   let outcome := run_command read_sparse write_sparse fuel
@@ -271,8 +450,117 @@ theorem framed_observations_correct (helpers : List (Helper (Command Source))) (
       ∃ fuel, source_exit helpers body fuel = some status := by
   simp only [framed_exit_correct]
 
+def recursive_calls (evaluate : PartialCalls → Locals → expr → Option Int) (view : state → Locals)
+    (write : state → Nat → Int → state) (empty : state) (helpers : Array (Helper (Command expr))) :
+    Nat → PartialCalls
+  | 0 => no_partial_calls
+  | fuel + 1 => fun slot values =>
+    match helpers[slot]? with
+    | none => none
+    | some helper =>
+      if values.length = helper.arity then
+        let prior := recursive_calls evaluate view write empty helpers fuel
+        let command := helper.body.map (fun expression locals => evaluate prior locals expression)
+        (run_command view write (fuel + 1) command (initialise_frame write 0 values empty)).bind frame_result
+      else none
+
+theorem recursive_calls_correct (helpers : Array (Helper (Command Source))) (fuel : Nat) :
+    recursive_calls target_expression read_sparse write_sparse ∅ (helpers.map lower_frame) fuel =
+      recursive_calls source_expression id write_local (fun _ => 0) helpers fuel := by
+  induction fuel with
+  | zero => rfl
+  | succ fuel rest =>
+    funext slot values
+    simp only [recursive_calls, Array.getElem?_map, rest]
+    cases found : helpers[slot]? with
+    | none => rfl
+    | some helper =>
+      simp only [Option.map_some, lower_frame, partial_commands_lower]
+      split
+      · have projected := run_command_projects read_sparse write_sparse sparse_write_refines (fuel + 1)
+          (helper.body.map (fun expression locals =>
+            source_expression (recursive_calls source_expression id write_local (fun _ => 0) helpers fuel) locals expression))
+          (initialise_frame write_sparse 0 values ∅)
+        rw [initialise_frame_projects read_sparse write_sparse sparse_write_refines, sparse_empty] at projected
+        rw [← projected, frame_result_projects]
+      · rfl
+
+theorem recursive_calls_extend (helpers : Array (Helper (Command Source))) (smaller larger : Nat) (more : smaller ≤ larger) :
+    CallsExtend (recursive_calls source_expression id write_local (fun _ => 0) helpers smaller)
+      (recursive_calls source_expression id write_local (fun _ => 0) helpers larger) := by
+  induction smaller generalizing larger with
+  | zero =>
+    intro slot values
+    simp [recursive_calls, no_partial_calls, OptionExtends]
+  | succ fuel recurse =>
+    cases larger with
+    | zero => omega
+    | succ larger =>
+      have earlier := recurse larger (by omega)
+      intro slot values
+      simp only [recursive_calls]
+      cases found : helpers[slot]? with
+      | none => exact option_same _
+      | some helper =>
+        by_cases arity : values.length = helper.arity
+        · simp only [arity, if_true]
+          apply option_bind_extends _ _ _ _ (run_command_extends id write_local
+            (fun expression locals => source_expression
+              (recursive_calls source_expression id write_local (fun _ => 0) helpers fuel) locals expression)
+            (fun expression locals => source_expression
+              (recursive_calls source_expression id write_local (fun _ => 0) helpers larger) locals expression)
+            (fun expression locals => source_expression_extends _ _ earlier locals expression)
+            (fuel + 1) (larger + 1) more helper.body (initialise_frame write_local 0 values (fun _ => 0)))
+          intro result
+          exact option_same (frame_result result)
+        · simpa only [arity, if_false] using option_same (none : Option Int)
+
+def recursive_source_exit (helpers : Array (Helper (Command Source))) (body : Command Source) (fuel : Nat) : Option Int :=
+  let calls := recursive_calls source_expression id write_local (fun _ => 0) helpers fuel
+  let outcome := run_command id write_local fuel (body.map (fun expression locals => source_expression calls locals expression))
+    (fun _ => 0)
+  outcome.map (fun result => unsigned 8 (signed 32 result.value))
+
+theorem recursive_source_exit_extends (helpers : Array (Helper (Command Source))) (body : Command Source)
+    (smaller larger : Nat) (more : smaller ≤ larger) :
+    OptionExtends (recursive_source_exit helpers body smaller) (recursive_source_exit helpers body larger) := by
+  simp only [recursive_source_exit]
+  apply option_map_extends
+  apply run_command_extends id write_local _ _ _ smaller larger more body (fun _ => 0)
+  intro expression locals
+  exact source_expression_extends _ _ (recursive_calls_extend helpers smaller larger more) locals expression
+
+def recursive_target_exit (helpers : Array (Helper (Command Target))) (body : Command Target) (fuel : Nat) : Option Int :=
+  let calls := recursive_calls target_expression read_sparse write_sparse ∅ helpers fuel
+  let outcome := run_command read_sparse write_sparse fuel
+    (body.map (fun expression locals => target_expression calls locals expression)) ∅
+  outcome.map (fun result => unsigned 8 result.value)
+
+theorem recursive_exit_correct (helpers : Array (Helper (Command Source))) (body : Command Source) (fuel : Nat) :
+    recursive_target_exit (helpers.map lower_frame) (body.map lower) fuel = recursive_source_exit helpers body fuel := by
+  simp only [recursive_target_exit, recursive_source_exit, recursive_calls_correct, partial_commands_lower, exit_status_truncation]
+  let calls := recursive_calls source_expression id write_local (fun _ => 0) helpers fuel
+  let command := body.map (fun expression locals => source_expression calls locals expression)
+  have projected := run_command_projects read_sparse write_sparse sparse_write_refines fuel command ∅
+  rw [sparse_empty] at projected
+  rw [← projected]
+  cases run_command read_sparse write_sparse fuel command ∅ with
+  | none => rfl
+  | some result => cases result <;> rfl
+
+theorem recursive_observations_correct (helpers : Array (Helper (Command Source))) (body : Command Source) (status : Int) :
+    (∃ fuel, recursive_target_exit (helpers.map lower_frame) (body.map lower) fuel = some status) ↔
+      ∃ fuel, recursive_source_exit helpers body fuel = some status := by
+  simp only [recursive_exit_correct]
+
 end Heresy
 
 #print axioms Heresy.framed_link_correct
 #print axioms Heresy.framed_exit_correct
 #print axioms Heresy.run_returns_value
+#print axioms Heresy.sparse_frame_binds
+#print axioms Heresy.source_exit_extends
+#print axioms Heresy.framed_exit_unique
+#print axioms Heresy.recursive_calls_correct
+#print axioms Heresy.recursive_source_exit_extends
+#print axioms Heresy.recursive_observations_correct

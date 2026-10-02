@@ -2352,12 +2352,13 @@ let order_closed_helpers context helpers =
   let definitions = Hashtbl.create (List.length helpers) in
   let visited = Hashtbl.create (List.length helpers) in
   let ordered = ref [] in
+  let recursive = ref false in
   List.iter (fun node -> Hashtbl.add definitions (text node "name") node) helpers;
   let rec visit node =
     let name = text node "name" in
     match Hashtbl.find_opt visited name with
     | Some true -> ()
-    | Some false -> fail context node ("cyclic closed helper dependency on " ^ name)
+    | Some false -> recursive := true
     | None ->
         Hashtbl.add visited name false;
         walk (fun call -> match kind call, children call with
@@ -2372,7 +2373,7 @@ let order_closed_helpers context helpers =
         ordered := node :: !ordered
   in
   List.iter visit helpers;
-  List.rev !ordered
+  List.rev !ordered, !recursive
 
 let emit_closed contexts trees =
   let declarations tree = List.filter (fun node -> kind node <> "EmptyDecl" &&
@@ -2388,7 +2389,7 @@ let emit_closed contexts trees =
       List.iter (fun node ->
         if kind node <> "FunctionDecl" then fail context node "closed compilation requires function declarations"
       ) declarations;
-      let helpers = order_closed_helpers context helpers in
+      let helpers, recursive = order_closed_helpers context helpers in
       let helpers = List.map (fun node ->
         let name = text node "name" in
         let inputs, blocks = List.partition (fun child -> kind child = "ParmVarDecl") (children node) in
@@ -2405,7 +2406,8 @@ let emit_closed contexts trees =
         | [ret] when kind ret = "ReturnStmt" ->
             begin match children ret with [value] -> Some value | _ -> None end
         | _ -> None in
-      let framed = List.exists (fun (_, _, block) -> Option.is_none (simple_return block)) helpers in
+      let framed = recursive || List.exists (fun (_, _, block) -> Option.is_none (simple_return block)) helpers in
+      let available = List.mapi (fun slot (name, parameters, _) -> name, (slot, List.length parameters)) helpers in
       let rec lvalue scope node = match kind node, children node with
         | "ParenExpr", [child] -> lvalue scope child
         | "DeclRefExpr", [] when ty node = "unsigned long" ->
@@ -2458,7 +2460,7 @@ let emit_closed contexts trees =
         let names = List.map snd parameters in
         let body = if framed then begin
           let scope = List.mapi (fun index (id, _) -> id, index) parameters in
-          let action = command linked false scope arity block in
+          let action = command available false scope arity block in
           if not (closed_returns action) then fail context block "closed helper can fall through without returning";
           let buffer = Buffer.create 512 in
           Printf.bprintf buffer "runHelper [%s] (" (join names);

@@ -474,6 +474,7 @@ private def helper_dependencies : Nat → Json → List String → List String
 private structure HelperOrder where
   visited : Std.HashMap String Bool
   reversed : List Json
+  recursive : Bool
 
 private def visit_helper (definitions : Std.HashMap String Json) (source_depth : Nat) :
     Nat → HelperOrder → String → Except String HelperOrder
@@ -481,7 +482,7 @@ private def visit_helper (definitions : Std.HashMap String Json) (source_depth :
   | depth + 1, state, name => do
     match state.visited[name]? with
     | some true => pure state
-    | some false => throw ("cyclic closed helper dependency on " ++ name)
+    | some false => pure { state with recursive := true }
     | none =>
       let definition ← require definitions[name]? "closed call requires a defined unsigned long helper"
       let mut next := { state with visited := state.visited.insert name false }
@@ -489,17 +490,17 @@ private def visit_helper (definitions : Std.HashMap String Json) (source_depth :
         next ← visit_helper definitions source_depth depth next dependency
       pure { next with visited := next.visited.insert name true, reversed := definition :: next.reversed }
 
-private def order_helpers (helpers : List Json) (source_depth : Nat) : Except String (List Json) := do
+private def order_helpers (helpers : List Json) (source_depth : Nat) : Except String (List Json × Bool) := do
   let mut definitions : Std.HashMap String Json := ∅
   for definition in helpers do
     let name := field_text definition "name"
     if name.isEmpty || definitions.contains name then
       throw "invalid closed helper identity"
     definitions := definitions.insert name definition
-  let mut seen : HelperOrder := ⟨∅, []⟩
+  let mut seen : HelperOrder := ⟨∅, [], false⟩
   for definition in helpers do
     seen ← visit_helper definitions source_depth (helpers.length + 1) seen (field_text definition "name")
-  pure seen.reversed.reverse
+  pure (seen.reversed.reverse, seen.recursive)
 
 private inductive ClosedProgram where
   | direct (helpers : List (Helper Source)) (body : Command Source)
@@ -527,18 +528,13 @@ private def closed_source (frontend : String) : Except String ClosedProgram := d
   let [body] := child_nodes main | throw "invalid closed main definition"
   unless field_text body "kind" == "CompoundStmt" do
     throw "invalid closed main body"
-  let ordered ← order_helpers (definitions.filter (fun node => field_text node "name" != "main")) frontend.length
-  let mut linked : List (String × (Nat × Nat)) := []
-  let mut helpers : List (Helper (Command Source)) := []
-  let mut framed := false
-  let mut slot := 0
-  for definition in ordered do
+  let (ordered, recursive) ← order_helpers (definitions.filter (fun node => field_text node "name" != "main")) frontend.length
+  let headers ← ordered.mapM fun definition => do
     let name := field_text definition "name"
     let (inputs, blocks) := (child_nodes definition).partition (fun node => field_text node "kind" == "ParmVarDecl")
     let arity := inputs.length
     let parameters := if arity == 0 then "void" else String.intercalate ", " (List.replicate arity "unsigned long")
-    unless !name.isEmpty && (List.lookup name linked).isNone &&
-        inputs.all (fun node => type_spelling node == "unsigned long") &&
+    unless inputs.all (fun node => type_spelling node == "unsigned long") &&
         type_spelling definition == ("unsigned long (" ++ parameters ++ ")") do
       throw "closed helper requires an unsigned long signature"
     let [block] := blocks | throw "invalid closed helper definition"
@@ -547,11 +543,17 @@ private def closed_source (frontend : String) : Except String ClosedProgram := d
     let identifiers := inputs.map (fun node => field_text node "id")
     if identifiers.any (·.isEmpty) || !decide identifiers.Nodup then
       throw "invalid closed helper parameters"
-    let (code, _) ← read_command (fun name => List.lookup name linked) false frontend.length identifiers.zipIdx arity block
-    framed := framed || !single_return block
+    pure (name, identifiers, block)
+  let framed := recursive || headers.any (fun (_, _, block) => !single_return block)
+  let available := headers.zipIdx.map (fun ((name, identifiers, _), slot) => (name, (slot, identifiers.length)))
+  let mut linked : List (String × (Nat × Nat)) := []
+  let mut helpers : List (Helper (Command Source)) := []
+  for ((name, identifiers, block), slot) in headers.zipIdx do
+    let scope := if framed then available else linked
+    let arity := identifiers.length
+    let (code, _) ← read_command (fun callee => List.lookup callee scope) false frontend.length identifiers.zipIdx arity block
     helpers := ⟨arity, code⟩ :: helpers
     linked := (name, (slot, arity)) :: linked
-    slot := slot + 1
   let (entry, _) ← read_command (fun name => List.lookup name linked) true frontend.length [] 0 body
   if framed then pure (.framed helpers.reverse entry)
   else
@@ -658,22 +660,22 @@ private def body_calls_in_scope (arities : Array Nat) : Command Source → Bool
 def check_frame_helpers (arities : Array Nat) : List (Helper (Command Source)) → Bool
   | [] => true
   | helper :: rest => returns_value helper.body && (check_commands helper.body &&
-    (body_calls_in_scope arities helper.body && check_frame_helpers (arities.push helper.arity) rest))
+    (body_calls_in_scope arities helper.body && check_frame_helpers arities rest))
 
 theorem checked_frame_returns (arities : Array Nat) (helpers : List (Helper (Command Source)))
     (accepted : check_frame_helpers arities helpers = true) (helper : Helper (Command Source))
     (member : helper ∈ helpers) : returns_value helper.body = true := by
-  induction helpers generalizing arities with
+  induction helpers with
   | nil => simp at member
   | cons first rest checked =>
     simp only [check_frame_helpers, Bool.and_eq_true] at accepted
     rcases List.mem_cons.mp member with equality | remaining
     · subst helper
       exact accepted.1
-    · exact checked (arities.push first.arity) accepted.2.2.2 remaining
+    · exact checked accepted.2.2.2 remaining
 
 def validates_framed_program (helpers : List (Helper (Command Source))) (body : Command Source) (generated : String) : Bool :=
-  check_frame_helpers #[] helpers && (check_commands body &&
+  check_frame_helpers (helpers.toArray.map Helper.arity) helpers && (check_commands body &&
     (body_calls_in_scope (helpers.toArray.map Helper.arity) body &&
       generated == render_framed_program (helpers.map lower_frame) (body.map lower)))
 
@@ -681,10 +683,10 @@ theorem framed_program_certificate_sound (helpers : List (Helper (Command Source
     (generated : String) (accepted : validates_framed_program helpers body generated = true) :
     generated = render_framed_program (helpers.map lower_frame) (body.map lower) ∧
       (∀ helper ∈ helpers, returns_value helper.body = true) ∧
-      (∀ status, (∃ fuel, target_exit (helpers.map lower_frame) (body.map lower) fuel = some status) ↔
-        ∃ fuel, source_exit helpers body fuel = some status) := by
+      (∀ status, (∃ fuel, recursive_target_exit (helpers.toArray.map lower_frame) (body.map lower) fuel = some status) ↔
+        ∃ fuel, recursive_source_exit helpers.toArray body fuel = some status) := by
   simp only [validates_framed_program, Bool.and_eq_true, beq_iff_eq] at accepted
-  exact ⟨accepted.2.2.2, checked_frame_returns #[] helpers accepted.1, framed_observations_correct helpers body⟩
+  exact ⟨accepted.2.2.2, checked_frame_returns _ helpers accepted.1, recursive_observations_correct helpers.toArray body⟩
 
 def validates_program (helpers : List (Helper Source)) (body : Command Source) (generated : String) : Bool :=
   check_helpers #[] helpers && (check_commands body &&
@@ -719,7 +721,7 @@ def validate_program (frontend generated : String) : Except String Unit := do
     unless validates_program helpers body generated do
       throw "emitted program differs from verified lowering"
   | .framed helpers body =>
-    unless check_frame_helpers #[] helpers do
+    unless check_frame_helpers (helpers.toArray.map Helper.arity) helpers do
       throw "closed helper can fall through or use an out-of-scope call"
     unless validates_framed_program helpers body generated do
       throw "emitted program differs from verified framed lowering"

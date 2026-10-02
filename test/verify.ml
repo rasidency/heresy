@@ -220,10 +220,10 @@ let () =
     ignore (success frontend ["-std=c11"; "-O1"; "test/frames.c"; "-o"; "build/framesref"]);
     check "closed helper frames isolate mutable locals across repeated calls"
       (run "build/frames" [] = (50, "", "") && run "build/framesref" [] = (50, "", ""));
-    let cycle = "build/cycle.c" in
-    write cycle "static unsigned long first(unsigned long);\nstatic unsigned long second(unsigned long n){return n?first(n-1UL):0UL;}\nstatic unsigned long first(unsigned long n){return n?second(n-1UL):0UL;}\nint main(void){return (int)first(2UL);}";
-    let code, _, errors = run compiler [cycle; "--closed"; "--check"] in
-    check "closed call linking rejects recursive helper cycles" (code <> 0 && contains errors "cyclic closed helper dependency");
+    ignore (success compiler ["test/recursive.c"; "--closed"; "--build"; "build/recursive"]);
+    ignore (success frontend ["-std=c11"; "-O1"; "test/recursive.c"; "-o"; "build/recursiveref"]);
+    check "closed calls preserve direct and mutual recursion"
+      (run "build/recursive" [] = (121, "", "") && run "build/recursiveref" [] = (121, "", ""));
     check "value copies preserve ownership and IEEE scalar behaviour"
       (contains values "copies 11 12 1 42 1 10\nmembers 28 42 -3\nieee 4b800000 1 8000000000000000 1 1 1 0 -3\n" &&
        contains values "decimal -00003.50 2.67 2 4 -0.000000       inf\nliveness 0 0\n");

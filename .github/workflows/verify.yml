@@ -29,7 +29,10 @@ jobs:
           lake exe certificate program /tmp/helpers.json /tmp/Helpers.hs &&
           "$FILCC" -std=c11 -fsyntax-only -Xclang -ast-dump=json test/frames.c > /tmp/frames.json &&
           dune exec --profile release -- heresy test/frames.c --closed -o /tmp/Frames.hs &&
-          lake exe certificate program /tmp/frames.json /tmp/Frames.hs'
+          lake exe certificate program /tmp/frames.json /tmp/Frames.hs &&
+          "$FILCC" -std=c11 -fsyntax-only -Xclang -ast-dump=json test/recursive.c > /tmp/recursive.json &&
+          dune exec --profile release -- heresy test/recursive.c --closed -o /tmp/Recursive.hs &&
+          lake exe certificate program /tmp/recursive.json /tmp/Recursive.hs'
       - run: >-
           docker run --rm --network none heresy sh -c
           'dune exec --profile release tools/release.exe -- /tmp/first &&
