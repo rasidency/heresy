@@ -8,7 +8,7 @@ abbrev PartialCalls := Nat → List Int → Option Int
 
 def no_partial_calls : PartialCalls := fun _ _ => none
 
-private def collect_arguments : List (Option α) → Option (List α)
+def collect_arguments : List (Option α) → Option (List α)
   | [] => some []
   | first :: rest => do
     let value ← first
@@ -39,7 +39,7 @@ private theorem option_bind_extends (before after : Option α) (first second : �
     subst after
     exact next value
 
-private theorem collect_extends (arguments : List α) (before after : α → Option β)
+theorem collect_extends (arguments : List α) (before after : α → Option β)
     (refinement : ∀ argument ∈ arguments, OptionExtends (before argument) (after argument)) :
     OptionExtends (collect_arguments (arguments.map before)) (collect_arguments (arguments.map after)) := by
   induction arguments with
@@ -331,7 +331,7 @@ theorem sparse_frame_binds (values : List Int) :
   funext index
   simp [initialise_frame_read, arguments_view]
 
-private def frame_result : CommandOutcome state → Option Int
+def frame_result : CommandOutcome state → Option Int
   | .returned value => some value
   | .next _ => none
 

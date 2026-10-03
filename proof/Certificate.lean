@@ -1,5 +1,5 @@
 import Lean.Data.Json
-import Execution
+import Semantics
 
 set_option warningAsError true
 
@@ -684,9 +684,9 @@ theorem framed_program_certificate_sound (helpers : List (Helper (Command Source
     generated = render_framed_program (helpers.map lower_frame) (body.map lower) ∧
       (∀ helper ∈ helpers, returns_value helper.body = true) ∧
       (∀ status, (∃ fuel, recursive_target_exit (helpers.toArray.map lower_frame) (body.map lower) fuel = some status) ↔
-        ∃ fuel, recursive_source_exit helpers.toArray body fuel = some status) := by
+        source_observes_exit helpers.toArray body status) := by
   simp only [validates_framed_program, Bool.and_eq_true, beq_iff_eq] at accepted
-  exact ⟨accepted.2.2.2, checked_frame_returns _ helpers accepted.1, recursive_observations_correct helpers.toArray body⟩
+  exact ⟨accepted.2.2.2, checked_frame_returns _ helpers accepted.1, recursive_target_refines helpers.toArray body⟩
 
 def validates_program (helpers : List (Helper Source)) (body : Command Source) (generated : String) : Bool :=
   check_helpers #[] helpers && (check_commands body &&
