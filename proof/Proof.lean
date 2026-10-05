@@ -864,6 +864,78 @@ theorem invalidation_preserves_other (memory : Memory) (capability ident : Nat)
     (different : ident ≠ capability) : invalidate memory capability ident = memory ident := by
   simp only [invalidate, different, ↓reduceIte]
 
+def offset_pointer (pointer : Pointer) (displacement : Int) : Pointer :=
+  ⟨pointer.capability, unsigned 64 (pointer.address + displacement)⟩
+
+theorem offset_pointer_compose (pointer : Pointer) (first second : Int) :
+    offset_pointer (offset_pointer pointer first) second = offset_pointer pointer (first + second) := by
+  simp only [offset_pointer, unsigned, Int.emod_add_emod, Int.add_assoc]
+
+theorem offset_pointer_exact (pointer : Pointer) (displacement : Int)
+    (lower : 0 ≤ pointer.address + displacement) (upper : pointer.address + displacement < modulus 64) :
+    offset_pointer pointer displacement = ⟨pointer.capability, pointer.address + displacement⟩ := by
+  unfold offset_pointer
+  rw [unsigned_preserves_bits 64 _ lower upper]
+
+theorem offset_pointer_preserves_allocation (memory : Memory) (pointer : Pointer) (displacement : Int)
+    (count : Nat) (object : Object) (observed : checked memory (offset_pointer pointer displacement) count = some object) :
+    memory pointer.capability = some object :=
+  (checked_sound memory (offset_pointer pointer displacement) count object observed).1
+
+theorem offset_pointer_after_free (memory : Memory) (pointer : Pointer) (displacement : Int) (count : Nat) :
+    checked (invalidate memory pointer.capability) (offset_pointer pointer displacement) count = none :=
+  invalidation_rejects_aliases memory pointer.capability (offset_pointer pointer displacement) count rfl
+
+theorem offset_pointer_access (memory : Memory) (pointer : Pointer) (displacement : Int) (count : Nat)
+    (object : Object) (found : memory pointer.capability = some object)
+    (lower : 0 ≤ pointer.address + displacement) (upper : pointer.address + displacement < modulus 64) :
+    checked memory (offset_pointer pointer displacement) count = some object ↔
+      accessible object (pointer.address + displacement) count := by
+  have exact_address := offset_pointer_exact pointer displacement lower upper
+  by_cases span : accessible object (pointer.address + displacement) count
+  · simp [exact_address, checked, found, span]
+  · simp [exact_address, checked, found, span]
+
+def reported_pointer_bound (memory : Memory) (pointer : Pointer) (upper : Bool) : Option Pointer :=
+  (memory pointer.capability).map fun object =>
+    ⟨pointer.capability, object.base + (if upper && object.live then (object.size : Int) else 0)⟩
+
+theorem reported_upper_access (memory : Memory) (pointer : Pointer) (object : Object)
+    (found : memory pointer.capability = some object) (live : object.live = true) :
+    ∃ upper, reported_pointer_bound memory pointer true = some upper ∧
+      checked memory upper 0 = some object ∧ ∀ count, 0 < count → checked memory upper count = none := by
+  let upper : Pointer := ⟨pointer.capability, object.base + object.size⟩
+  have base_le : object.base ≤ upper.address := by dsimp [upper]; omega
+  refine ⟨upper, by simp [reported_pointer_bound, found, live, upper], ?_, ?_⟩
+  · have valid : accessible object upper.address 0 := by
+      simp [accessible, live, upper] at base_le ⊢
+      exact base_le
+    simp [checked, upper, found, show accessible object (object.base + object.size) 0 from valid]
+  · intro count positive
+    have denied : ¬ accessible object upper.address count := by
+      intro span
+      have size := span.2.2.2
+      dsimp [upper] at size
+      omega
+    simp [checked, upper, found, show ¬ accessible object (object.base + object.size) count from denied]
+
+def pointer_difference (width : Nat) (is_signed : Bool) (stride : Int) (left right : Pointer) : Option Int :=
+  if stride = 0 then none else
+    let steps := (left.address - right.address).tdiv stride
+    some (if is_signed then signed width steps else unsigned width steps)
+
+theorem pointer_stride_difference (pointer : Pointer) (width : Nat) (is_signed : Bool) (stride left right : Int)
+    (nonzero : stride ≠ 0)
+    (left_lower : 0 ≤ pointer.address + left * stride) (left_upper : pointer.address + left * stride < modulus 64)
+    (right_lower : 0 ≤ pointer.address + right * stride) (right_upper : pointer.address + right * stride < modulus 64) :
+    pointer_difference width is_signed stride (offset_pointer pointer (left * stride)) (offset_pointer pointer (right * stride)) =
+      some (if is_signed then signed width (left - right) else unsigned width (left - right)) := by
+  rw [offset_pointer_exact pointer _ left_lower left_upper, offset_pointer_exact pointer _ right_lower right_upper]
+  have difference : pointer.address + left * stride - (pointer.address + right * stride) = (left - right) * stride := by
+    rw [Int.sub_mul]
+    omega
+  simp only [pointer_difference, nonzero, ↓reduceIte, difference, Int.mul_tdiv_cancel _ nonzero]
+
 inductive ReleaseAddress where
   | null | data (pointer : Pointer) | other
 
@@ -1735,6 +1807,11 @@ end Heresy
 #print axioms Heresy.checked_refines
 #print axioms Heresy.checked_offset_fits
 #print axioms Heresy.invalidation_rejects_aliases
+#print axioms Heresy.offset_pointer_compose
+#print axioms Heresy.offset_pointer_preserves_allocation
+#print axioms Heresy.offset_pointer_after_free
+#print axioms Heresy.reported_upper_access
+#print axioms Heresy.pointer_stride_difference
 #print axioms Heresy.release_data_sound
 #print axioms Heresy.release_data_complete
 #print axioms Heresy.release_alias_fault

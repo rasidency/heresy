@@ -268,6 +268,33 @@ def validates_access (generated : String) : Bool :=
     "checked _ _ = panic \"memory access requires a data pointer\""]
   [lookup, check].all sections.contains
 
+def validates_pointer_arithmetic (generated : String) : Bool :=
+  let offsets := String.intercalate "\n" [
+    "offset :: Integer -> Value -> Value",
+    "offset n (Pointer cap raw) = Pointer cap (normalise 64 False (raw + n))",
+    "offset n (Function raw name) = Function (normalise 64 False (raw + n)) name",
+    "offset n (Stream ident raw) = Stream ident (normalise 64 False (raw + n))",
+    "offset _ v = v"]
+  let arithmetic := String.intercalate "\n" [
+    "  in case op of",
+    "    \"+\" -> case (a, b) of",
+    "      (_, Number _) | addressed a -> Right (offset (y * stride) a)",
+    "      (Number _, _) | addressed b -> Right (offset (x * stride) b)",
+    "      _ -> arithmetic (x + y)",
+    "    \"-\" -> case (a, b) of",
+    "      (_, Number _) | addressed a -> Right (offset (negate y * stride) a)",
+    "      _ | addressed a && addressed b -> if stride == 0 then Left \"zero pointer stride\" else wrap ((x - y) `quot` stride)",
+    "      _ -> arithmetic (x - y)"]
+  let bounds := String.intercalate "\n" [
+    "builtin name [Pointer capability _] | name == \"zgetlower\" || name == \"zgetupper\" =",
+    "  case capability of",
+    "    NoCapability -> pure nullPointer",
+    "    _ -> do",
+    "      object <- readObject capability",
+    "      pure (Pointer capability (base object + if name == \"zgetupper\" && live object then toInteger (extent object) else 0))"]
+  (generated.splitOn "\n\n").contains offsets &&
+    (generated.splitOn arithmetic).length == 2 && (generated.splitOn bounds).length == 2
+
 def validates_release (generated : String) : Bool :=
   let sections := generated.splitOn "\n\n"
   let publish := String.intercalate "\n" [
@@ -743,6 +770,8 @@ def main (arguments : List String) : IO UInt32 := do
     let generated ← IO.FS.readFile haskell
     if !Heresy.validates_access generated then
       IO.eprintln "memory access differs from the model"; pure 1
+    else if !Heresy.validates_pointer_arithmetic generated then
+      IO.eprintln "pointer arithmetic differs from the model"; pure 1
     else if !Heresy.validates_release generated then
       IO.eprintln "memory release differs from the model"; pure 1
     else if !Heresy.validates_allocation generated then
@@ -753,7 +782,7 @@ def main (arguments : List String) : IO UInt32 := do
       IO.eprintln "scalar memory differs from the model"; pure 1
     else if !Heresy.validates_freeze generated then
       IO.eprintln "read-only transition differs from the model"; pure 1
-    else IO.println "checked allocation, access, release, copy, scalar and read-only equations"; pure 0
+    else IO.println "checked allocation, access, pointer arithmetic, release, copy, scalar and read-only equations"; pure 0
   | ["program", ast, haskell] =>
     match Heresy.validate_program (← IO.FS.readFile ast) (← IO.FS.readFile haskell) with
     | .ok () => IO.println "checked emitted closed program and exit status"; pure 0
