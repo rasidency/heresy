@@ -4,6 +4,7 @@
   (proof/Proof.lean as proof/Proof.lean)
   (proof/Execution.lean as proof/Execution.lean)
   (proof/Semantics.lean as proof/Semantics.lean)
+  (proof/Synchronisation.lean as proof/Synchronisation.lean)
   (proof/Certificate.lean as proof/Certificate.lean)
   (assets/pipeline.svg as assets/pipeline.svg)
   (assets/capability.svg as assets/capability.svg)))

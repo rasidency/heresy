@@ -1,5 +1,6 @@
 import Lean.Data.Json
 import Semantics
+import Synchronisation
 
 set_option warningAsError true
 
@@ -294,6 +295,88 @@ def validates_pointer_arithmetic (generated : String) : Bool :=
     "      pure (Pointer capability (base object + if name == \"zgetupper\" && live object then toInteger (extent object) else 0))"]
   (generated.splitOn "\n\n").contains offsets &&
     (generated.splitOn arithmetic).length == 2 && (generated.splitOn bounds).length == 2
+
+def validates_synchronisation (generated : String) : Bool :=
+  let sections := generated.splitOn "\n\n"
+  let update := String.intercalate "\n" [
+    "changeSync :: Int -> Value -> Synchronisation -> (Synchronisation -> R (Synchronisation, a)) -> R a",
+    "changeSync width pointer initial change = do",
+    "  (ident, object, displacement) <- checked width pointer",
+    "  when (number pointer `mod` 8 /= 0) (panic \"unaligned pthread object\")",
+    "  when (readOnly object) (panic \"pthread operation on read-only memory\")",
+    "  let cell = M.findWithDefault initial displacement (synchronisation object)",
+    "  (updated, value) <- change cell",
+    "  current <- readObject ident",
+    "  writeObject ident (current { synchronisation = M.insert displacement updated (synchronisation current) })",
+    "  pure value"]
+  let acquire := String.intercalate "\n" [
+    "acquireMutex :: Bool -> Value -> R Value",
+    "acquireMutex tryOnly pointer = do",
+    "  caller <- gets (number . currentThread)",
+    "  waiter <- liftIO newEmptyMVar",
+    "  result <- locked $ changeSync mutexWidth pointer emptyMutex $ \\cell ->",
+    "    case cell of",
+    "      Mutex Nothing waiting -> pure (Mutex (Just caller) waiting, Left 0)",
+    "      Mutex (Just _) _ | tryOnly -> pure (cell, Left 16)",
+    "      Mutex (Just owner) waiting",
+    "        | owner == caller -> pure (cell, Left 35)",
+    "        | otherwise -> pure (Mutex (Just owner) (waiting Q.|> (caller, waiter)), Right waiter)",
+    "      _ -> pure (cell, Left 22)",
+    "  case result of",
+    "    Left status -> pure (Number status)",
+    "    Right signal -> liftIO (takeMVar signal) >> pure (Number 0)"]
+  let release := String.intercalate "\n" [
+    "releaseMutex :: Value -> R (Either Integer (Maybe (MVar ())))",
+    "releaseMutex pointer = do",
+    "  caller <- gets (number . currentThread)",
+    "  changeSync mutexWidth pointer emptyMutex $ \\cell ->",
+    "    case cell of",
+    "      Mutex (Just owner) waiting | owner == caller ->",
+    "        case Q.viewl waiting of",
+    "          Q.EmptyL -> pure (emptyMutex, Right Nothing)",
+    "          (next, waiter) Q.:< remaining -> pure (Mutex (Just next) remaining, Right (Just waiter))",
+    "      Mutex _ _ -> pure (cell, Left 1)",
+    "      _ -> pure (cell, Left 22)"]
+  let handoff := String.intercalate "\n" [
+    "finishRelease :: Either Integer (Maybe (MVar ())) -> R Value",
+    "finishRelease result = case result of",
+    "  Left status -> pure (Number status)",
+    "  Right signal -> liftIO (mapM_ (\\waiter -> putMVar waiter ()) signal) >> pure (Number 0)"]
+  let await := String.intercalate "\n" [
+    "waitCondition :: Value -> Value -> R Value",
+    "waitCondition condition mutex",
+    "  | number condition == number mutex = pure (Number 22)",
+    "  | otherwise = do",
+    "      waiter <- liftIO newEmptyMVar",
+    "      released <- locked $ changeSync conditionWidth condition emptyCondition $ \\cell ->",
+    "        case cell of",
+    "          Condition waiting -> do",
+    "            result <- releaseMutex mutex",
+    "            case result of",
+    "              Left _ -> pure (cell, result)",
+    "              Right _ -> pure (Condition (waiting Q.|> waiter), result)",
+    "          _ -> pure (cell, Left 22)",
+    "      case released of",
+    "        Left status -> pure (Number status)",
+    "        Right _ -> do",
+    "          void (finishRelease released)",
+    "          liftIO (takeMVar waiter)",
+    "          acquireMutex False mutex"]
+  let signal := String.intercalate "\n" [
+    "notifyCondition :: Bool -> Value -> R Value",
+    "notifyCondition allWaiters pointer = do",
+    "  result <- locked $ changeSync conditionWidth pointer emptyCondition $ \\cell ->",
+    "    case cell of",
+    "      Condition waiting",
+    "        | allWaiters -> pure (emptyCondition, Just waiting)",
+    "        | otherwise -> case Q.viewl waiting of",
+    "            Q.EmptyL -> pure (cell, Just Q.empty)",
+    "            waiter Q.:< remaining -> pure (Condition remaining, Just (Q.singleton waiter))",
+    "      _ -> pure (cell, Nothing)",
+    "  case result of",
+    "    Nothing -> pure (Number 22)",
+    "    Just signals -> liftIO (mapM_ (\\waiter -> putMVar waiter ()) signals) >> pure (Number 0)"]
+  [update, acquire, release, handoff, await, signal].all sections.contains
 
 def validates_release (generated : String) : Bool :=
   let sections := generated.splitOn "\n\n"
@@ -782,7 +865,9 @@ def main (arguments : List String) : IO UInt32 := do
       IO.eprintln "scalar memory differs from the model"; pure 1
     else if !Heresy.validates_freeze generated then
       IO.eprintln "read-only transition differs from the model"; pure 1
-    else IO.println "checked allocation, access, pointer arithmetic, release, copy, scalar and read-only equations"; pure 0
+    else if !Heresy.validates_synchronisation generated then
+      IO.eprintln "synchronisation differs from the model"; pure 1
+    else IO.println "checked memory and synchronisation equations"; pure 0
   | ["program", ast, haskell] =>
     match Heresy.validate_program (← IO.FS.readFile ast) (← IO.FS.readFile haskell) with
     | .ok () => IO.println "checked emitted closed program and exit status"; pure 0
