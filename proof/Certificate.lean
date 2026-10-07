@@ -296,6 +296,72 @@ def validates_pointer_arithmetic (generated : String) : Bool :=
   (generated.splitOn "\n\n").contains offsets &&
     (generated.splitOn arithmetic).length == 2 && (generated.splitOn bounds).length == 2
 
+def validates_argument_slots (generated : String) : Bool :=
+  let sections := generated.splitOn "\n\n"
+  let size := String.intercalate "\n" [
+    "slotSize :: Int -> Integer",
+    "slotSize size = ((toInteger size + 7) `div` 8) * 8"]
+  let alignment := String.intercalate "\n" [
+    "addSlot :: Integer -> CType -> (Integer, Integer)",
+    "addSlot from ty =",
+    "  let alignment = case ty of",
+    "        FloatingType 80 -> 16",
+    "        ComplexType 80 -> 16",
+    "        AggregateType _ a -> max 8 (toInteger a)",
+    "        _ -> 8",
+    "  in alignedSlot from ty alignment"]
+  let placement := String.intercalate "\n" [
+    "alignedSlot :: Integer -> CType -> Integer -> (Integer, Integer)",
+    "alignedSlot from ty alignment =",
+    "  let start = ((from + alignment - 1) `div` alignment) * alignment",
+    "  in (start, start + slotSize (widthOf ty))"]
+  let area := String.intercalate "\n" [
+    "argumentArea :: [Value] -> R Value",
+    "argumentArea values = do",
+    "  let slot value = case value of",
+    "        Aggregate size alignment _ _ -> (AggregateType size alignment, value)",
+    "        Extended _ -> (FloatingType 80, value)",
+    "        Complex width _ _ -> (ComplexType width, value)",
+    "        Wide _ -> (IntegerType 128 False, value)",
+    "        _ | addressed value -> (PointerType, value)",
+    "          | otherwise -> (IntegerType 64 False, value)",
+    "      slots = map slot values",
+    "      offsets = scanl (\\index (ty, _) -> snd (addSlot index ty)) 0 slots",
+    "  size <- hostSize (last offsets)",
+    "  area <- allocate \"argument\" size",
+    "  forM_ (zip offsets slots) $ \\(index, (ty, value)) ->",
+    "    void (store ty (offset (fst (addSlot index ty)) area) value)",
+    "  freeze (pure area)",
+    "  pure area"]
+  let named := String.intercalate "\n" [
+    "vaStart :: Value -> [CType] -> R Value -> R Value",
+    "vaStart area named list = do",
+    "  pointer <- list",
+    "  let start = foldl (\\index ty -> snd (addSlot index ty)) 0 named",
+    "  store PointerType pointer (offset start area) >> pure (Number 0)"]
+  let fetch := String.intercalate "\n" [
+    "vaArg :: CType -> R Value -> R Value",
+    "vaArg ty list = do",
+    "  pointer <- list",
+    "  cursor <- load PointerType pointer",
+    "  let (start, next) = case ty of",
+    "        IntegerType 128 _ -> alignedSlot (number cursor) ty 16",
+    "        _ -> addSlot (number cursor) ty",
+    "  value <- load ty (offset (start - number cursor) cursor)",
+    "  void (store PointerType pointer (offset (next - number cursor) cursor))",
+    "  pure value"]
+  let available := String.intercalate "\n" [
+    "vaAvailable :: R Value -> R Value",
+    "vaAvailable list = do",
+    "  cursor <- list >>= load PointerType",
+    "  case cursor of",
+    "    Pointer NoCapability _ -> pure (boolean False)",
+    "    Pointer capability raw -> do",
+    "      object <- readObject capability",
+    "      pure (boolean (live object && raw >= base object && raw + 8 <= base object + toInteger (extent object)))",
+    "    _ -> pure (boolean False)"]
+  [size, alignment, placement, area, named, fetch, available].all sections.contains
+
 def validates_synchronisation (generated : String) : Bool :=
   let sections := generated.splitOn "\n\n"
   let update := String.intercalate "\n" [
@@ -867,7 +933,9 @@ def main (arguments : List String) : IO UInt32 := do
       IO.eprintln "read-only transition differs from the model"; pure 1
     else if !Heresy.validates_synchronisation generated then
       IO.eprintln "synchronisation differs from the model"; pure 1
-    else IO.println "checked memory and synchronisation equations"; pure 0
+    else if !Heresy.validates_argument_slots generated then
+      IO.eprintln "argument slot layout differs from the model"; pure 1
+    else IO.println "checked memory, argument slots and synchronisation equations"; pure 0
   | ["program", ast, haskell] =>
     match Heresy.validate_program (← IO.FS.readFile ast) (← IO.FS.readFile haskell) with
     | .ok () => IO.println "checked emitted closed program and exit status"; pure 0

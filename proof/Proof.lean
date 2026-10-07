@@ -1328,6 +1328,89 @@ theorem aligned_slot_valid (cursor width alignment : Nat) (positive : 0 < alignm
   rw [Nat.mul_comm alignment] at split
   exact ⟨by omega, by omega, aligned, Nat.add_le_add_left covers _⟩
 
+structure ArgumentSlot where
+  width : Nat
+  alignment : Nat
+
+def next_argument_slot (cursor : Nat) (slot : ArgumentSlot) : Nat :=
+  (aligned_slot cursor slot.width slot.alignment).2
+
+def argument_cursor (cursor : Nat) (slots : List ArgumentSlot) : Nat :=
+  slots.foldl next_argument_slot cursor
+
+theorem argument_cursor_append (cursor : Nat) (named extra : List ArgumentSlot) :
+    argument_cursor cursor (named ++ extra) = argument_cursor (argument_cursor cursor named) extra := by
+  exact List.foldl_append
+
+theorem argument_cursor_monotone (cursor : Nat) (slots : List ArgumentSlot)
+    (valid : ∀ slot ∈ slots, 0 < slot.alignment) : cursor ≤ argument_cursor cursor slots := by
+  induction slots generalizing cursor with
+  | nil => exact Nat.le_refl _
+  | cons slot rest later =>
+    have alignment := valid slot (by simp)
+    have placement := aligned_slot_valid cursor slot.width slot.alignment alignment
+    have local_bound : cursor ≤ next_argument_slot cursor slot :=
+      Nat.le_trans placement.1 (Nat.le_trans (Nat.le_add_right _ _) placement.2.2.2)
+    exact Nat.le_trans local_bound (later (next_argument_slot cursor slot) (fun item present => valid item (by simp [present])))
+
+theorem argument_payload_within_area (cursor : Nat) (earlier later : List ArgumentSlot) (slot : ArgumentSlot)
+    (valid : ∀ item ∈ slot :: later, 0 < item.alignment) :
+    let before := argument_cursor cursor earlier
+    let start := (aligned_slot before slot.width slot.alignment).1
+    before ≤ start ∧ start + slot.width ≤ argument_cursor cursor (earlier ++ slot :: later) := by
+  rw [argument_cursor_append]
+  have placement := aligned_slot_valid (argument_cursor cursor earlier) slot.width slot.alignment (valid slot (by simp))
+  exact ⟨placement.1, Nat.le_trans placement.2.2.2
+    (argument_cursor_monotone (next_argument_slot (argument_cursor cursor earlier) slot) later
+      (fun item present => valid item (by simp [present])))⟩
+
+def variadic_access (cursor : Nat) (slot : ArgumentSlot) (wide : Bool) : Nat × Nat :=
+  aligned_slot cursor slot.width (if wide then 16 else slot.alignment)
+
+theorem ordinary_variadic_slot (cursor : Nat) (slot : ArgumentSlot) :
+    variadic_access cursor slot false = aligned_slot cursor slot.width slot.alignment := rfl
+
+theorem aligned_slot_relative_to_base (base cursor width alignment : Nat) (positive : 0 < alignment)
+    (aligned : alignment ∣ base) :
+    aligned_slot (base + cursor) width alignment =
+      let (start, finish) := aligned_slot cursor width alignment
+      (base + start, base + finish) := by
+  obtain ⟨blocks, rfl⟩ := aligned
+  have shifted : alignment * blocks + cursor + alignment - 1 =
+      alignment * blocks + (cursor + alignment - 1) := by omega
+  simp only [aligned_slot, shifted, Nat.mul_add_div positive, Nat.add_mul, Nat.mul_comm blocks alignment]
+  rw [Nat.add_assoc]
+
+theorem wide_variadic_cursor (cursor : Nat) (aligned : cursor % 8 = 0) :
+    let (start, next) := variadic_access cursor ⟨16, 8⟩ true
+    start = (if cursor % 16 = 0 then cursor else cursor + 8) ∧ next = start + 16 := by
+  simp only [variadic_access, if_true, aligned_slot, slot_size]
+  constructor
+  · split <;> omega
+  · trivial
+
+theorem variadic_read_within_bounds (memory : Memory) (cursor : Pointer) (object : Object)
+    (stride : ArgumentSlot) (wide : Bool) (found : memory cursor.capability = some object)
+    (live : object.live = true) :
+    let start := (variadic_access cursor.address.toNat stride wide).1
+    object.base ≤ start → (start : Int) + stride.width ≤ object.base + object.size → (start : Int) < modulus 64 →
+    checked memory (offset_pointer cursor ((start : Int) - cursor.address)) stride.width = some object := by
+  intro start lower upper address_fits
+  have raw : cursor.address + ((start : Int) - cursor.address) = start := by omega
+  apply (offset_pointer_access memory cursor _ _ object found (by omega) (by omega)).mpr
+  rw [raw]
+  exact ⟨live, lower, by omega, by omega⟩
+
+theorem variadic_available_checks_word (memory : Memory) (cursor : Pointer) (object : Object)
+    (found : memory cursor.capability = some object) :
+    (object.live = true ∧ object.base ≤ cursor.address ∧ cursor.address + 8 ≤ object.base + object.size) ↔
+      checked memory cursor 8 = some object := by
+  have span : accessible object cursor.address 8 ↔
+      object.live = true ∧ object.base ≤ cursor.address ∧ cursor.address + 8 ≤ object.base + object.size := by
+    cases live : object.live <;> simp [accessible, live] <;> omega
+  rw [← span]
+  by_cases valid : accessible object cursor.address 8 <;> simp [checked, found, valid]
+
 structure AllocationCounter where
   ident : Nat
   cursor : Nat
@@ -1835,6 +1918,11 @@ end Heresy
 #print axioms Heresy.next_variadic_span
 #print axioms Heresy.argument_extent_covers_slots
 #print axioms Heresy.aligned_slot_valid
+#print axioms Heresy.argument_payload_within_area
+#print axioms Heresy.wide_variadic_cursor
+#print axioms Heresy.aligned_slot_relative_to_base
+#print axioms Heresy.variadic_read_within_bounds
+#print axioms Heresy.variadic_available_checks_word
 #print axioms Heresy.allocation_plan_sound
 #print axioms Heresy.allocation_plans_disjoint
 #print axioms Heresy.array_span_at
