@@ -1718,6 +1718,42 @@ theorem computed_jump_matches_symbol (symbols : String → Option Int) (targets 
       symbols name = some raw ∧ targets name = some next := by
   by_cases authentic : symbols name = some raw <;> simp [computed_jump, authentic]
 
+inductive CallRoute where
+  | definition (slot : Nat)
+  | builtin (name : String)
+
+def runtime_call_route (symbols : String → Option Int) (definitions : String → Option Nat)
+    (candidate : Option (Int × String)) : Option CallRoute :=
+  match candidate with
+  | none => none
+  | some (raw, name) =>
+    if symbols name = some raw then
+      some (match definitions name with
+        | some slot => .definition slot
+        | none => .builtin name)
+    else none
+
+theorem runtime_call_definition (symbols : String → Option Int) (definitions : String → Option Nat)
+    (raw : Int) (name : String) (slot : Nat) :
+    runtime_call_route symbols definitions (some (raw, name)) = some (.definition slot) ↔
+      symbols name = some raw ∧ definitions name = some slot := by
+  by_cases accepted : symbols name = some raw
+  · cases found : definitions name <;> simp [runtime_call_route, accepted, found]
+  · simp [runtime_call_route, accepted]
+
+theorem runtime_call_builtin (symbols : String → Option Int) (definitions : String → Option Nat)
+    (raw : Int) (name external_name : String) :
+    runtime_call_route symbols definitions (some (raw, name)) = some (.builtin external_name) ↔
+      symbols name = some raw ∧ definitions name = none ∧ name = external_name := by
+  by_cases accepted : symbols name = some raw
+  · cases found : definitions name <;> simp [runtime_call_route, accepted, found]
+  · simp [runtime_call_route, accepted]
+
+theorem marshalled_integer_cast (width : Nat) (is_signed : Bool) (value : Int) :
+    (if is_signed then signed width (unsigned width value) else unsigned width (unsigned width value)) =
+      if is_signed then signed width value else unsigned width value := by
+  cases is_signed <;> simp [signed, unsigned_idempotent]
+
 def intmap_shadow_copy (source destination : Int → Option α)
     (source_offset destination_offset count slot : Int) : Option α :=
   if count = 0 then destination slot
@@ -1935,6 +1971,9 @@ end Heresy
 #print axioms Heresy.guarded_dispatch_reaches
 #print axioms Heresy.guarded_dispatch_has_action
 #print axioms Heresy.computed_jump_matches_symbol
+#print axioms Heresy.runtime_call_definition
+#print axioms Heresy.runtime_call_builtin
+#print axioms Heresy.marshalled_integer_cast
 #print axioms Heresy.shadow_copy_refines
 #print axioms Heresy.payload_copy_refines
 #print axioms Heresy.atomic_copy_refines

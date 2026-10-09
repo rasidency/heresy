@@ -362,6 +362,40 @@ def validates_argument_slots (generated : String) : Bool :=
     "    _ -> pure (boolean False)"]
   [size, alignment, placement, area, named, fetch, available].all sections.contains
 
+def validates_invocation (generated : String) : Bool :=
+  let sections := generated.splitOn "\n\n"
+  let route := String.intercalate "\n" [
+    "invoke :: Maybe CType -> R Value -> [R Value] -> R Value",
+    "invoke expected callee arguments = do",
+    "  target <- callee",
+    "  values <- sequence arguments",
+    "  result <- case target of",
+    "    Function raw name -> do",
+    "      canonical <- gets (S.lookup name . symbols)",
+    "      unless (canonical == Just raw) (panic \"call through an invalid function pointer\")",
+    "      defined <- gets (S.lookup name . functions)",
+    "      case defined of",
+    "        Just action -> action values",
+    "        Nothing -> do"]
+  let cast := String.intercalate "\n" [
+    "cast :: CType -> Value -> Value",
+    "cast (IntegerType w s) v = Number (normalise w s (number v))"]
+  let marshal := String.intercalate "\n" [
+    "marshal :: CType -> Value -> Value",
+    "marshal (IntegerType 128 _) value = Wide (normalise 128 False (number value))",
+    "marshal (IntegerType width _) value = Number (normalise width False (number value))"]
+  let result := String.intercalate "\n" [
+    "    _ -> panic \"call through an invalid function pointer\"",
+    "  case (expected, result) of",
+    "    (Nothing, _) -> pure (Number 0)",
+    "    (Just _, NoValue) -> panic \"callee returned no value to a non-void callsite\"",
+    "    (Just (AggregateType size _), Aggregate actual _ _ _) | size == actual -> pure result",
+    "    (Just (AggregateType _ _), _) -> panic \"callee returned an incompatible aggregate value\"",
+    "    (Just _, Aggregate _ _ _ _) -> panic \"callee returned an aggregate to a scalar callsite\"",
+    "    (Just ty, value) -> pure (cast ty value)"]
+  [route, cast, marshal].all (fun equation => (generated.splitOn equation).length == 2) &&
+    sections.any (fun block => block.startsWith route && block.endsWith result)
+
 def validates_synchronisation (generated : String) : Bool :=
   let sections := generated.splitOn "\n\n"
   let update := String.intercalate "\n" [
@@ -935,7 +969,9 @@ def main (arguments : List String) : IO UInt32 := do
       IO.eprintln "synchronisation differs from the model"; pure 1
     else if !Heresy.validates_argument_slots generated then
       IO.eprintln "argument slot layout differs from the model"; pure 1
-    else IO.println "checked memory, argument slots and synchronisation equations"; pure 0
+    else if !Heresy.validates_invocation generated then
+      IO.eprintln "call routing differs from the model"; pure 1
+    else IO.println "checked memory, calls and synchronisation equations"; pure 0
   | ["program", ast, haskell] =>
     match Heresy.validate_program (← IO.FS.readFile ast) (← IO.FS.readFile haskell) with
     | .ok () => IO.println "checked emitted closed program and exit status"; pure 0
