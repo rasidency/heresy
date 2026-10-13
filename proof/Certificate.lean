@@ -121,10 +121,151 @@ private def read_expression (lookup_helper : HelperScope) (lookup_slot : String 
       .invoke slot <$> arguments.mapM (read_expression lookup_helper lookup_slot depth)
     | _, _ => throw "unsupported kernel expression"
 
-private def kernel_symbol (name : String) : String :=
+private def hex_binding (stem name : String) : String :=
   let digits := "0123456789abcdef".toList.toArray
   name.toUTF8.toList.foldl (fun symbol byte =>
-    (symbol.push digits[byte.toNat / 16]!).push digits[byte.toNat % 16]!) "k_"
+    (symbol.push digits[byte.toNat / 16]!).push digits[byte.toNat % 16]!) (stem ++ "_")
+
+private def kernel_symbol := hex_binding "k"
+
+private def haskell_quote (name : String) : String :=
+  "\"" ++ name.toUTF8.toList.foldl (fun result byte =>
+    result ++ match byte.toNat with
+      | 9 => "\\t"
+      | 10 => "\\n"
+      | 13 => "\\r"
+      | 34 => "\\\""
+      | 92 => "\\\\"
+      | n => if 32 ≤ n && n ≤ 126 then String.singleton (Char.ofNat n) else "\\" ++ toString n ++ "\\&") "" ++ "\""
+
+private def source_declaration (node : Json) : Bool :=
+  let origin := json_field node "loc"
+  let expansion := json_field origin "expansionLoc"
+  let location := if expansion == .null then origin else expansion
+  json_field location "offset" != .null && json_field location "includedFrom" == .null
+
+private def unit_namespace (count index : Nat) : String :=
+  if count > 1 then "unit:" ++ toString index ++ ":" else ""
+
+private def unit_entries (unit_name : String) (tree : Json) : List (String × String) :=
+  let functions := (child_nodes tree).filter (fun node => source_declaration node && field_text node "kind" == "FunctionDecl")
+  let internal := (functions.filter (fun node => field_text node "storageClass" == "static")).map (field_text · "name")
+  (functions.filter (fun node => (child_nodes node).any (fun body => field_text body "kind" == "CompoundStmt"))).map
+    (fun node =>
+      let name := field_text node "name"
+      let key := if internal.contains name then unit_name ++ name else name
+      (key, hex_binding "f" key))
+
+def link_entries (trees : List Json) : List (String × String) :=
+  (trees.zipIdx).flatMap (fun (tree, index) => unit_entries (unit_namespace trees.length index) tree)
+
+inductive LinkAction where
+  | allocate (unit : Nat)
+  | initialise (unit : Nat)
+
+def link_schedule (count : Nat) : List LinkAction :=
+  (List.range count).map .allocate ++ (List.range count).map .initialise
+
+theorem link_schedule_order (count : Nat) :
+    (link_schedule count).take count = (List.range count).map .allocate ∧
+    (link_schedule count).drop count = (List.range count).map .initialise := by
+  simp [link_schedule]
+
+private def render_phase (count : Nat) (phase : String) : String :=
+  let action (stem : String) (unit : Nat) :=
+    let unit_name := unit_namespace count unit
+    stem ++ phase ++ if unit_name.isEmpty then "" else "_" ++ hex_binding "unit" unit_name
+  let actions := (link_schedule count).map (fun
+    | .allocate unit => action "allocate" unit
+    | .initialise unit => action "initialise" unit)
+  "(do { " ++ String.intercalate "; " actions ++ " })"
+
+private def link_prefix (entries : List (String × String)) : String :=
+  let bindings := entries.map (fun (key, handler) => "(" ++ haskell_quote key ++ ", " ++ handler ++ ")")
+  "main = execute [" ++ String.intercalate ", " bindings ++ "] ["
+
+private def link_labels (text : String) : Bool :=
+  text.isEmpty || (text.splitOn ", ").all (fun label =>
+    match label.splitOn "\"" with
+    | ["", value, ""] => value.startsWith "label:" && value.toList.all (fun c =>
+      c.isAlphanum || c == '_' || c == '$' || c == ':' || c == '\\' || c == '&')
+    | _ => false)
+
+private def render_link_line (entries : List (String × String)) (count : Nat) (labels parallel : String) : String :=
+  link_prefix entries ++ labels ++ "] " ++ parallel ++ render_phase count "Globals" ++ " " ++ render_phase count "Thread"
+
+private def check_link_line (entries : List (String × String)) (count : Nat) (line : String) : Bool :=
+  match line.splitOn (link_prefix entries) with
+  | ["", tail] =>
+    match tail.splitOn "] " with
+    | [labels, _] => link_labels labels &&
+      (["False ", "True "].any (fun parallel => line == render_link_line entries count labels parallel))
+    | _ => false
+  | _ => false
+
+def validates_linkage (trees : List Json) (generated : String) : Bool :=
+  let entries := link_entries trees
+  let lines := generated.splitOn "\n"
+  decide (entries.map Prod.fst).Nodup && (entries.map Prod.fst).contains "main" &&
+    entries.all (fun (_, handler) => (lines.filter (· == handler ++ " :: [Value] -> R Value")).length == 1) &&
+    match lines.filter (·.startsWith "main =") with
+    | [line] => check_link_line entries trees.length line
+    | _ => false
+
+private theorem unique_lookup (bindings : List (String × String))
+    (unique : (bindings.map Prod.fst).Nodup) (key handler : String) (found : (key, handler) ∈ bindings) :
+    bindings.lookup key = some handler := by
+  induction bindings with
+  | nil => simp at found
+  | cons first rest ih =>
+    obtain ⟨name, body⟩ := first
+    simp only [List.map_cons, List.nodup_cons] at unique
+    rcases List.mem_cons.mp found with equal | later
+    · cases equal
+      exact List.lookup_cons_self
+    · have different : key ≠ name := by
+        intro same
+        exact unique.1 (same ▸ List.mem_map_of_mem later)
+      simp [List.lookup_cons, beq_eq_false_iff_ne.mpr different, ih unique.2 later]
+
+theorem linkage_certificate_routes (trees : List Json) (generated : String)
+    (accepted : validates_linkage trees generated = true) (key handler : String)
+    (definition : (key, handler) ∈ link_entries trees) : (link_entries trees).lookup key = some handler := by
+  apply unique_lookup _ _ _ _ definition
+  simp only [validates_linkage, Bool.and_eq_true, decide_eq_true_eq] at accepted
+  exact accepted.1.1.1
+
+theorem linkage_certificate_line (trees : List Json) (generated : String)
+    (accepted : validates_linkage trees generated = true) :
+    ∃ labels parallel, link_labels labels = true ∧ parallel ∈ ["False ", "True "] ∧
+      render_link_line (link_entries trees) trees.length labels parallel ∈ generated.splitOn "\n" := by
+  simp only [validates_linkage, Bool.and_eq_true] at accepted
+  have checked := accepted.2
+  split at checked
+  next line selected =>
+    unfold check_link_line at checked
+    split at checked
+    next tail _ =>
+      split at checked
+      next labels _ _ =>
+        rw [Bool.and_eq_true] at checked
+        obtain ⟨labels_ok, rendered⟩ := checked
+        obtain ⟨parallel, member, same⟩ := List.any_eq_true.mp rendered
+        refine ⟨labels, parallel, labels_ok, member, ?_⟩
+        rw [← beq_iff_eq.mp same]
+        have member : line ∈ (generated.splitOn "\n").filter (·.startsWith "main =") := by
+          rw [selected]
+          simp
+        exact (List.mem_filter.mp member).1
+      next => contradiction
+    next => contradiction
+  next => contradiction
+
+def validate_linkage (frontends : List String) (generated : String) : Except String Nat := do
+  let trees ← frontends.mapM Json.parse
+  unless validates_linkage trees generated do
+    throw "emitted function table or initialisation schedule differs from the typed translation units"
+  pure (link_entries trees).length
 
 private def kernel_source (node : Json) (depth : Nat) (lookup_helper : HelperScope := fun _ => none) :
     Except String (Source × Nat) := do
@@ -942,9 +1083,16 @@ end Heresy
 #print axioms Heresy.program_certificate_sound
 #print axioms Heresy.framed_program_certificate_sound
 #print axioms Heresy.certified_helper_uses_bound_arguments
+#print axioms Heresy.link_schedule_order
+#print axioms Heresy.linkage_certificate_routes
+#print axioms Heresy.linkage_certificate_line
 
 def main (arguments : List String) : IO UInt32 := do
   match arguments with
+  | "linkage" :: haskell :: ast :: rest =>
+    match Heresy.validate_linkage (← (ast :: rest).mapM (fun (path : String) => IO.FS.readFile path)) (← IO.FS.readFile haskell) with
+    | .ok count => IO.println s!"checked {count} linked function bindings and both initialisation schedules"; pure 0
+    | .error message => IO.eprintln message; pure 1
   | ["dispatch", haskell] =>
     match Heresy.validate_dispatches (← IO.FS.readFile haskell) with
     | .ok count => IO.println s!"checked dispatch equations and {count} emitted control-flow graph(s)"; pure 0
@@ -983,5 +1131,5 @@ def main (arguments : List String) : IO UInt32 := do
     | .ok count => IO.println s!"checked {count} emitted integer kernel(s)"; pure 0
     | .error message => IO.eprintln message; pure 1
   | _ =>
-    IO.eprintln "usage: certificate [program] AST.json Module.hs | certificate (dispatch|memory) Module.hs"
+    IO.eprintln "usage: certificate [program] AST.json Module.hs | certificate (dispatch|memory) Module.hs | certificate linkage Module.hs AST.json ..."
     pure 2

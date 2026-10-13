@@ -18,6 +18,11 @@ jobs:
           dune exec --profile release -- heresy test/values.c -o /tmp/Values.hs &&
           lake exe certificate dispatch /tmp/Values.hs &&
           lake exe certificate memory /tmp/Values.hs &&
+          "$FILCC" -std=c11 -fsyntax-only -Xclang -ast-dump=json test/linkage/entry.c > /tmp/entry.json &&
+          "$FILCC" -std=c11 -fsyntax-only -Xclang -ast-dump=json test/linkage/worker.c > /tmp/worker.json &&
+          dune exec --profile release -- heresy test/linkage/entry.c test/linkage/worker.c -o /tmp/Linkage.hs &&
+          lake exe certificate linkage /tmp/Linkage.hs /tmp/entry.json /tmp/worker.json &&
+          ! lake exe certificate linkage /tmp/Linkage.hs /tmp/worker.json /tmp/entry.json &&
           "$FILCC" -std=c11 -fsyntax-only -Xclang -ast-dump=json test/closed.c > /tmp/closed.json &&
           dune exec --profile release -- heresy test/closed.c --closed -o /tmp/Closed.hs &&
           lake exe certificate program /tmp/closed.json /tmp/Closed.hs &&
