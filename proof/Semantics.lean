@@ -401,8 +401,68 @@ theorem recursive_target_refines (helpers : Procedures) (body : Command Source) 
       source_observes_exit helpers body status :=
   (recursive_observations_correct helpers body status).trans (recursive_source_adequate helpers body status)
 
+inductive ProcessOutcome where
+  | returned (value : Int)
+  | finished (status : Int)
+  | transfer
+  | panic (message : String) (recent : List String) (tracing : Bool)
+
+inductive ProcessEvent where
+  | close (handle : Nat)
+  | flush_stdout
+  | stderr (text : String)
+  | exit (status : Int)
+  deriving DecidableEq
+
+def process_exit (value : Int) : ProcessOutcome := .finished (unsigned 8 value)
+
+def process_report : ProcessOutcome → List ProcessEvent
+  | .returned value => [.exit (unsigned 8 value)]
+  | .finished code => [.exit code]
+  | .transfer => [.stderr "heresy panic: control transfer escaped its function", .exit 70]
+  | .panic message recent tracing =>
+    [.stderr ("heresy panic: " ++ message)] ++
+    (if tracing || recent.isEmpty then [] else [.stderr (String.intercalate "\n" recent.reverse)]) ++ [.exit 70]
+
+def process_epilogue (handles : List Nat) (outcome : ProcessOutcome) : List ProcessEvent :=
+  handles.map .close ++ .flush_stdout :: process_report outcome
+
+theorem process_return (handles : List Nat) (value : Int) :
+    process_epilogue handles (.returned value) = process_epilogue handles (process_exit (signed 32 value)) := by
+  simp [process_epilogue, process_exit, process_report, exit_status_truncation]
+
+theorem process_closes_then_flushes (handles : List Nat) (outcome : ProcessOutcome) :
+    (process_epilogue handles outcome).take (handles.length + 1) = handles.map .close ++ [.flush_stdout] ∧
+    (process_epilogue handles outcome).drop (handles.length + 1) = process_report outcome := by
+  simp [process_epilogue, List.take_append, List.drop_append]
+  exact List.take_of_length_le (by simp)
+
+theorem process_exit_is_final (handles : List Nat) (outcome : ProcessOutcome) :
+    ∃ status earlier, process_epilogue handles outcome = earlier ++ [.exit status] ∧
+      ∀ code, ProcessEvent.exit code ∉ earlier := by
+  cases outcome with
+  | returned value =>
+    exact ⟨unsigned 8 value, handles.map .close ++ [.flush_stdout], by simp [process_epilogue, process_report, List.append_assoc],
+      by simp⟩
+  | finished status =>
+    exact ⟨status, handles.map .close ++ [.flush_stdout], by simp [process_epilogue, process_report, List.append_assoc],
+      by simp⟩
+  | transfer =>
+    exact ⟨70, handles.map .close ++ [.flush_stdout, .stderr "heresy panic: control transfer escaped its function"],
+      by simp [process_epilogue, process_report, List.append_assoc], by simp⟩
+  | panic message recent tracing =>
+    by_cases immediate : (tracing || recent.isEmpty) = true
+    · exact ⟨70, handles.map .close ++ [.flush_stdout, .stderr ("heresy panic: " ++ message)],
+        by simp [process_epilogue, process_report, immediate, List.append_assoc], by simp⟩
+    · exact ⟨70, handles.map .close ++ [.flush_stdout, .stderr ("heresy panic: " ++ message),
+          .stderr (String.intercalate "\n" recent.reverse)],
+        by simp [process_epilogue, process_report, immediate, List.append_assoc], by simp⟩
+
 end Heresy
 
 #print axioms Heresy.approximation_sound
 #print axioms Heresy.approximation_complete
 #print axioms Heresy.recursive_target_refines
+#print axioms Heresy.process_return
+#print axioms Heresy.process_closes_then_flushes
+#print axioms Heresy.process_exit_is_final

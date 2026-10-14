@@ -1077,6 +1077,30 @@ def validate_program (frontend generated : String) : Except String Unit := do
     unless validates_framed_program helpers body generated do
       throw "emitted program differs from verified framed lowering"
 
+def validates_process (generated : String) : Bool :=
+  let transformer := String.intercalate "\n" [
+    "newtype R a = R { unR :: ExceptT Fault (StateT World IO) a }",
+    "  deriving (Functor, Applicative, Monad, MonadIO, MonadState World, MonadError Fault)",
+    "",
+    "runWorld :: World -> R a -> IO (Either Fault a, World)",
+    "runWorld world action = runStateT (runExceptT (unR action)) world"]
+  let finish := "builtin \"exit\" [code] = throwError (Finish (fromInteger (number code `mod` 256)))"
+  let epilogue := String.intercalate "\n" [
+    "  outcome <- E.try (runWorld initial action)",
+    "  let (result, final) = either (\\fault -> (Left fault, initial)) id outcome",
+    "  handles <- snd <$> readIORef table",
+    "  forM_ (M.elems handles) (void . tryIOError . hClose)",
+    "  hFlush stdout",
+    "  case result of",
+    "    Right value -> let code = fromInteger (number value `mod` 256) in exitWith (if code == 0 then ExitSuccess else ExitFailure code)",
+    "    Left (Finish code) -> exitWith (if code == 0 then ExitSuccess else ExitFailure code)",
+    "    Left (Transfer _) -> hPutStrLn stderr \"heresy panic: control transfer escaped its function\" >> exitWith (ExitFailure 70)",
+    "    Left (Panic message) -> do",
+    "      hPutStrLn stderr (\"heresy panic: \" ++ message)",
+    "      unless (enabled || null (recent final)) $ hPutStrLn stderr (intercalate \"\\n\" (reverse (recent final)))",
+    "      exitWith (ExitFailure 70)"]
+  [transformer, finish, epilogue].all (fun equation => (generated.splitOn ("\n" ++ equation ++ "\n")).length == 2)
+
 end Heresy
 
 #print axioms Heresy.kernel_certificate_sound
@@ -1097,6 +1121,11 @@ def main (arguments : List String) : IO UInt32 := do
     match Heresy.validate_dispatches (← IO.FS.readFile haskell) with
     | .ok count => IO.println s!"checked dispatch equations and {count} emitted control-flow graph(s)"; pure 0
     | .error message => IO.eprintln message; pure 1
+  | ["process", haskell] =>
+    if Heresy.validates_process (← IO.FS.readFile haskell) then
+      IO.println "checked process termination and cleanup equations"; pure 0
+    else
+      IO.eprintln "process termination or cleanup differs from the model"; pure 1
   | ["memory", haskell] =>
     let generated ← IO.FS.readFile haskell
     if !Heresy.validates_access generated then
@@ -1131,5 +1160,5 @@ def main (arguments : List String) : IO UInt32 := do
     | .ok count => IO.println s!"checked {count} emitted integer kernel(s)"; pure 0
     | .error message => IO.eprintln message; pure 1
   | _ =>
-    IO.eprintln "usage: certificate [program] AST.json Module.hs | certificate (dispatch|memory) Module.hs | certificate linkage Module.hs AST.json ..."
+    IO.eprintln "usage: certificate [program] AST.json Module.hs | certificate (dispatch|memory|process) Module.hs | certificate linkage Module.hs AST.json ..."
     pure 2
