@@ -1101,6 +1101,27 @@ def validates_process (generated : String) : Bool :=
     "      exitWith (ExitFailure 70)"]
   [transformer, finish, epilogue].all (fun equation => (generated.splitOn ("\n" ++ equation ++ "\n")).length == 2)
 
+private def validates_aggregate_memory (generated : String) : Bool :=
+  let load := "        AggregateType size alignment -> Aggregate size alignment (aggregateBytes displacement size (bytes object)) (aggregateShadow displacement size (shadow object))"
+  let store := String.intercalate "\n" [
+    "storeCell (AggregateType size _) pointer value@(Aggregate actual _ payload caps) | size == actual = do",
+    "  (ident, object, displacement) <- checked size pointer",
+    "  when (readOnly object) (panic \"write to read-only memory\")",
+    "  when (not (M.null caps) && number pointer `mod` 8 /= 0) (panic \"unaligned aggregate pointer store\")",
+    "  let replace start count new old =",
+    "        let before = M.takeWhileAntitone (< start) old",
+    "            after = M.dropWhileAntitone (< start + count) old",
+    "        in M.unions [before, M.mapKeysMonotonic (+ start) new, after]",
+    "      firstWord = ((displacement + 7) `div` 8) * 8",
+    "      pastWords = max firstWord (displacement + size - 7)",
+    "      updated = replace displacement size payload (bytes object)",
+    "      retained = M.union (M.takeWhileAntitone (< firstWord) (shadow object)) (M.dropWhileAntitone (< pastWords) (shadow object))",
+    "      capabilities = M.union (M.mapKeysMonotonic (+ displacement) caps) retained",
+    "      modes = I.filter (\\i -> i < firstWord || i >= pastWords) (atomicSlots object)",
+    "  writeObject ident (object { bytes = updated, shadow = capabilities, atomicSlots = modes })",
+    "  pure value"]
+  [load, store].all (fun equation => (generated.splitOn ("\n" ++ equation ++ "\n")).length == 2)
+
 end Heresy
 
 #print axioms Heresy.kernel_certificate_sound
@@ -1138,6 +1159,8 @@ def main (arguments : List String) : IO UInt32 := do
       IO.eprintln "memory allocation differs from the model"; pure 1
     else if !Heresy.validates_copy generated then
       IO.eprintln "memory copy differs from the model"; pure 1
+    else if !Heresy.validates_aggregate_memory generated then
+      IO.eprintln "aggregate memory differs from the model"; pure 1
     else if !Heresy.validates_scalar_memory generated then
       IO.eprintln "scalar memory differs from the model"; pure 1
     else if !Heresy.validates_freeze generated then

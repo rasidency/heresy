@@ -191,6 +191,58 @@ theorem run_heap_failure_stops (step : HeapState → instruction → Except faul
     run_heap step state (op :: rest) = .error (state, why) := by
   simp [run_heap, failed]
 
+structure AggregateImage (α : Type) where
+  payload : Int → Option Int
+  shadow : Int → Option α
+
+def aggregate_slice (plane : Int → Option α) (start count index : Int) : Option α :=
+  if 0 ≤ index ∧ index < count then plane (start + index) else none
+
+def read_aggregate (planes : CopyPlanes α) (start count : Int) : AggregateImage α :=
+  ⟨aggregate_slice planes.payload start count, aggregate_slice planes.shadow start (max 0 (count - 7))⟩
+
+def write_aggregate (image : AggregateImage α) (destination : CopyPlanes α) (start count : Int) : CopyPlanes α :=
+  let first := ((start + 7) / 8) * 8
+  let past := max first (start + count - 7)
+  let caps := fun index => (image.shadow (index - start)).or
+    (if index < first ∨ past ≤ index then destination.shadow index else none)
+  ⟨intmap_payload_copy image.payload destination.payload 0 start count, caps,
+    fun index => decide (index < first ∨ past ≤ index) && destination.atomic index⟩
+
+theorem aggregate_reads_complete_words (planes : CopyPlanes α) (start count slot : Int) :
+    (read_aggregate planes start count).shadow slot =
+      if 0 ≤ slot ∧ slot + 8 ≤ count then planes.shadow (start + slot) else none := by
+  have slot_fits : (0 ≤ slot ∧ slot < max 0 (count - 7)) ↔ (0 ≤ slot ∧ slot + 8 ≤ count) := by omega
+  simp [read_aggregate, aggregate_slice, slot_fits]
+
+theorem aggregate_store_preserves_other_words (source destination : CopyPlanes α) (s d count index : Int)
+    (outside : index < d ∨ d + count < index + 8) (aligned : index % 8 = 0) :
+    let result := write_aggregate (read_aggregate source s count) destination d count
+    result.shadow index = destination.shadow index ∧ result.atomic index = destination.atomic index := by
+  have outside_rounded : index < ((d + 7) / 8) * 8 ∨ max (((d + 7) / 8) * 8) (d + count - 7) ≤ index := by omega
+  have no_shadow : ¬ (0 ≤ index - d ∧ index - d + 8 ≤ count) := by omega
+  dsimp only [write_aggregate]
+  rw [aggregate_reads_complete_words, if_neg no_shadow]
+  simp [outside_rounded]
+
+theorem aggregate_store_replaces_complete_words (source destination : CopyPlanes α) (s d count index : Int)
+    (inside : d ≤ index ∧ index + 8 ≤ d + count) (aligned : index % 8 = 0) :
+    let result := write_aggregate (read_aggregate source s count) destination d count
+    result.shadow index = source.shadow (s + (index - d)) ∧ result.atomic index = false := by
+  have inside_rounded : ¬ (index < ((d + 7) / 8) * 8 ∨ max (((d + 7) / 8) * 8) (d + count - 7) ≤ index) := by omega
+  have shadow_fits : 0 ≤ index - d ∧ index - d + 8 ≤ count := by omega
+  dsimp only [write_aggregate]
+  rw [aggregate_reads_complete_words, if_pos shadow_fits]
+  simp [inside_rounded]
+
+theorem aggregate_store_copies_payload (source destination : CopyPlanes α) (s d count index : Int) :
+    (write_aggregate (read_aggregate source s count) destination d count).payload index =
+      if d ≤ index ∧ index < d + count then source.payload (s + (index - d)) else destination.payload index := by
+  by_cases inside : d ≤ index ∧ index < d + count
+  · have relative : 0 ≤ index - d ∧ index - d < count := by omega
+    simp [write_aggregate, payload_copy_refines, read_aggregate, aggregate_slice, inside, relative]
+  · simp [write_aggregate, payload_copy_refines, inside]
+
 end Heresy
 
 #print axioms Heresy.heap_trace_allocated
@@ -199,3 +251,7 @@ end Heresy
 #print axioms Heresy.freeze_transition
 #print axioms Heresy.copy_transition
 #print axioms Heresy.run_heap_trace
+#print axioms Heresy.aggregate_reads_complete_words
+#print axioms Heresy.aggregate_store_preserves_other_words
+#print axioms Heresy.aggregate_store_replaces_complete_words
+#print axioms Heresy.aggregate_store_copies_payload
