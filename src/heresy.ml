@@ -2001,7 +2001,7 @@ let emit contexts =
   let parallel = ref false in
   List.iter (fun context ->
     List.iter (walk (fun node -> if kind node = "DeclRefExpr" && List.mem (callee_name node) thread_functions then
-      parallel := true)) context.functions) contexts;
+      parallel := true)) (context.functions @ context.globals)) contexts;
   add "main :: IO ()";
   let labels = List.concat_map (fun context -> Hashtbl.to_seq_values context.label_names |> List.of_seq) contexts |> List.sort String.compare in
   let phase name =

@@ -198,8 +198,8 @@ let () =
     ignore (success frontend (["-std=c11"; "-O1"] @ units @ ["-o"; "build/linkageref"]));
     ignore (success compiler (units @ ["--build"; "build/linkage"]));
     let linked = success "build/linkage" [] in
-    check "translation units share external storage and isolate internal symbols"
-      (linked = "linkage 4 18 42 18 9\n" && linked = success "build/linkageref" []);
+    check "translation units share external storage, isolate internal symbols and enable indirect pthread calls"
+      (linked = "linkage 4 18 42 18 9 1\n" && linked = success "build/linkageref" []);
     write "build/duplicate.c" "int shared = 1;";
     let code, _, errors = run compiler (units @ ["build/duplicate.c"; "--check"]) in
     check "linking rejects duplicate external definitions" (code <> 0 && contains errors "multiple definitions of shared");
