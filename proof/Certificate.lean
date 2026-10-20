@@ -147,10 +147,16 @@ private def source_declaration (node : Json) : Bool :=
 private def unit_namespace (count index : Nat) : String :=
   if count > 1 then "unit:" ++ toString index ++ ":" else ""
 
+private def unit_function_declarations (tree : Json) : List Json :=
+  (child_nodes tree).filter (fun node => source_declaration node && field_text node "kind" == "FunctionDecl")
+
+private def function_definitions (nodes : List Json) : List Json :=
+  nodes.filter (fun node => (child_nodes node).any (fun body => field_text body "kind" == "CompoundStmt"))
+
 private def unit_entries (unit_name : String) (tree : Json) : List (String × String) :=
-  let functions := (child_nodes tree).filter (fun node => source_declaration node && field_text node "kind" == "FunctionDecl")
+  let functions := unit_function_declarations tree
   let internal := (functions.filter (fun node => field_text node "storageClass" == "static")).map (field_text · "name")
-  (functions.filter (fun node => (child_nodes node).any (fun body => field_text body "kind" == "CompoundStmt"))).map
+  (function_definitions functions).map
     (fun node =>
       let name := field_text node "name"
       let key := if internal.contains name then unit_name ++ name else name
@@ -158,6 +164,53 @@ private def unit_entries (unit_name : String) (tree : Json) : List (String × St
 
 def link_entries (trees : List Json) : List (String × String) :=
   (trees.zipIdx).flatMap (fun (tree, index) => unit_entries (unit_namespace trees.length index) tree)
+
+private def object_definitions (tree : Json) : List Json :=
+  let candidates := (child_nodes tree).filter (fun node => source_declaration node && field_text node "kind" == "VarDecl" &&
+    (field_text node "storageClass" != "extern" || !(field_text node "init").isEmpty))
+  candidates.foldl (fun retained node =>
+    let name := field_text node "name"
+    if (field_text node "init").isEmpty &&
+        retained.any (fun previous => field_text previous "name" == name && !(field_text previous "init").isEmpty) then
+      retained
+    else node :: retained.filter (fun previous => field_text previous "name" != name)) []
+
+private def startup_nodes : Nat → Json → Except String (List Json)
+  | 0, _ => .error "incomplete traversal of a typed translation unit"
+  | depth + 1, node => do
+    let children := child_nodes node
+    let children := if field_text node "kind" == "GenericSelectionExpr" then
+        children.filter (fun child => json_field child "selected" == .bool true)
+      else if children.isEmpty then ((json_field node "array_filler").getArr?.toOption.getD #[]).toList.drop 1
+      else children
+    pure (node :: (← children.mapM (startup_nodes depth)).flatten)
+
+private def thread_reference (node : Json) : Bool :=
+  let names := ["pthread_create", "pthread_join", "pthread_self", "pthread_equal", "pthread_mutex_init", "pthread_mutex_destroy",
+    "pthread_mutex_lock", "pthread_mutex_trylock", "pthread_mutex_unlock", "pthread_cond_init", "pthread_cond_destroy",
+    "pthread_cond_wait", "pthread_cond_signal", "pthread_cond_broadcast"]
+  let target := json_field node "referencedDecl"
+  field_text node "kind" == "DeclRefExpr" && field_text target "kind" == "FunctionDecl" && names.contains (field_text target "name")
+
+structure LinkStartup where
+  parallel : Bool
+  labels : List String
+
+private def unit_startup (unit_name : String) (depth : Nat) (tree : Json) : Except String LinkStartup := do
+  let functions ← (function_definitions (unit_function_declarations tree)).mapM (fun node =>
+    (field_text node "name", ·) <$> startup_nodes depth node)
+  let objects ← (object_definitions tree).mapM (startup_nodes depth)
+  let labels : List (String × String) := functions.foldl (fun labels (name, nodes) =>
+    nodes.foldl (fun labels node =>
+      let ident := field_text node "labelDeclId"
+      if field_text node "kind" == "AddrLabelExpr" && !(labels.any (fun entry => entry.1 == ident)) then
+        (ident, "label:" ++ unit_name ++ name ++ ":" ++ toString labels.length) :: labels
+      else labels) labels) []
+  pure ⟨(functions.any (fun (_, nodes) => nodes.any thread_reference)) || (objects.any (·.any thread_reference)), labels.map Prod.snd⟩
+
+def link_startup (units : List (Nat × Json)) : Except String LinkStartup := do
+  let plans ← units.zipIdx.mapM (fun ((depth, tree), index) => unit_startup (unit_namespace units.length index) depth tree)
+  pure ⟨plans.any (·.parallel), (plans.flatMap LinkStartup.labels).mergeSort (· ≤ ·)⟩
 
 inductive LinkAction where
   | allocate (unit : Nat)
@@ -180,37 +233,19 @@ private def render_phase (count : Nat) (phase : String) : String :=
     | .initialise unit => action "initialise" unit)
   "(do { " ++ String.intercalate "; " actions ++ " })"
 
-private def link_prefix (entries : List (String × String)) : String :=
+private def render_link_line (entries : List (String × String)) (count : Nat) (startup : LinkStartup) : String :=
   let bindings := entries.map (fun (key, handler) => "(" ++ haskell_quote key ++ ", " ++ handler ++ ")")
-  "main = execute [" ++ String.intercalate ", " bindings ++ "] ["
+  let labels := String.intercalate ", " (startup.labels.map haskell_quote)
+  let parallel := if startup.parallel then "True " else "False "
+  "main = execute [" ++ String.intercalate ", " bindings ++ "] [" ++ labels ++ "] " ++ parallel ++
+    render_phase count "Globals" ++ " " ++ render_phase count "Thread"
 
-private def link_labels (text : String) : Bool :=
-  text.isEmpty || (text.splitOn ", ").all (fun label =>
-    match label.splitOn "\"" with
-    | ["", value, ""] => value.startsWith "label:" && value.toList.all (fun c =>
-      c.isAlphanum || c == '_' || c == '$' || c == ':' || c == '\\' || c == '&')
-    | _ => false)
-
-private def render_link_line (entries : List (String × String)) (count : Nat) (labels parallel : String) : String :=
-  link_prefix entries ++ labels ++ "] " ++ parallel ++ render_phase count "Globals" ++ " " ++ render_phase count "Thread"
-
-private def check_link_line (entries : List (String × String)) (count : Nat) (line : String) : Bool :=
-  match line.splitOn (link_prefix entries) with
-  | ["", tail] =>
-    match tail.splitOn "] " with
-    | [labels, _] => link_labels labels &&
-      (["False ", "True "].any (fun parallel => line == render_link_line entries count labels parallel))
-    | _ => false
-  | _ => false
-
-def validates_linkage (trees : List Json) (generated : String) : Bool :=
+def validates_linkage (trees : List Json) (startup : LinkStartup) (generated : String) : Bool :=
   let entries := link_entries trees
   let lines := generated.splitOn "\n"
   decide (entries.map Prod.fst).Nodup && (entries.map Prod.fst).contains "main" &&
     entries.all (fun (_, handler) => (lines.filter (· == handler ++ " :: [Value] -> R Value")).length == 1) &&
-    match lines.filter (·.startsWith "main =") with
-    | [line] => check_link_line entries trees.length line
-    | _ => false
+    (lines.filter (·.startsWith "main =")) == [render_link_line entries trees.length startup]
 
 private theorem unique_lookup (bindings : List (String × String))
     (unique : (bindings.map Prod.fst).Nodup) (key handler : String) (found : (key, handler) ∈ bindings) :
@@ -228,44 +263,49 @@ private theorem unique_lookup (bindings : List (String × String))
         exact unique.1 (same ▸ List.mem_map_of_mem later)
       simp [List.lookup_cons, beq_eq_false_iff_ne.mpr different, ih unique.2 later]
 
-theorem linkage_certificate_routes (trees : List Json) (generated : String)
-    (accepted : validates_linkage trees generated = true) (key handler : String)
+theorem linkage_certificate_routes (trees : List Json) (startup : LinkStartup) (generated : String)
+    (accepted : validates_linkage trees startup generated = true) (key handler : String)
     (definition : (key, handler) ∈ link_entries trees) : (link_entries trees).lookup key = some handler := by
   apply unique_lookup _ _ _ _ definition
   simp only [validates_linkage, Bool.and_eq_true, decide_eq_true_eq] at accepted
   exact accepted.1.1.1
 
-theorem linkage_certificate_line (trees : List Json) (generated : String)
-    (accepted : validates_linkage trees generated = true) :
-    ∃ labels parallel, link_labels labels = true ∧ parallel ∈ ["False ", "True "] ∧
-      render_link_line (link_entries trees) trees.length labels parallel ∈ generated.splitOn "\n" := by
+theorem linkage_certificate_line (trees : List Json) (startup : LinkStartup) (generated : String)
+    (accepted : validates_linkage trees startup generated = true) :
+    render_link_line (link_entries trees) trees.length startup ∈ generated.splitOn "\n" := by
   simp only [validates_linkage, Bool.and_eq_true] at accepted
-  have checked := accepted.2
-  split at checked
-  next line selected =>
-    unfold check_link_line at checked
-    split at checked
-    next tail _ =>
-      split at checked
-      next labels _ _ =>
-        rw [Bool.and_eq_true] at checked
-        obtain ⟨labels_ok, rendered⟩ := checked
-        obtain ⟨parallel, member, same⟩ := List.any_eq_true.mp rendered
-        refine ⟨labels, parallel, labels_ok, member, ?_⟩
-        rw [← beq_iff_eq.mp same]
-        have member : line ∈ (generated.splitOn "\n").filter (·.startsWith "main =") := by
-          rw [selected]
-          simp
-        exact (List.mem_filter.mp member).1
-      next => contradiction
-    next => contradiction
-  next => contradiction
+  have member : render_link_line (link_entries trees) trees.length startup ∈
+      (generated.splitOn "\n").filter (·.startsWith "main =") := by
+    rw [beq_iff_eq.mp accepted.2]
+    simp
+  exact (List.mem_filter.mp member).1
 
-def validate_linkage (frontends : List String) (generated : String) : Except String Nat := do
-  let trees ← frontends.mapM Json.parse
-  unless validates_linkage trees generated do
-    throw "emitted function table or initialisation schedule differs from the typed translation units"
-  pure (link_entries trees).length
+def validate_linkage (frontends : List String) (generated : String) : Except String Nat :=
+  match frontends.mapM Json.parse with
+  | .error message => .error message
+  | .ok trees =>
+    match link_startup ((frontends.map (·.utf8ByteSize + 1)).zip trees) with
+    | .error message => .error message
+    | .ok startup =>
+      if validates_linkage trees startup generated then .ok (link_entries trees).length
+      else .error "emitted function table or startup differs from the typed translation units"
+
+theorem linkage_validation_sound (frontends : List String) (generated : String) (count : Nat)
+    (accepted : validate_linkage frontends generated = .ok count) :
+    ∃ trees startup, frontends.mapM Json.parse = .ok trees ∧
+      link_startup ((frontends.map (·.utf8ByteSize + 1)).zip trees) = .ok startup ∧
+      count = (link_entries trees).length ∧
+      render_link_line (link_entries trees) trees.length startup ∈ generated.splitOn "\n" := by
+  cases parsed : frontends.mapM Json.parse with
+  | error message => simp [validate_linkage, parsed] at accepted
+  | ok trees =>
+    cases planned : link_startup ((frontends.map (·.utf8ByteSize + 1)).zip trees) with
+    | error message => simp [validate_linkage, parsed, planned] at accepted
+    | ok startup =>
+      by_cases valid : validates_linkage trees startup generated = true
+      · simp [validate_linkage, parsed, planned, valid] at accepted
+        exact ⟨trees, startup, rfl, planned, accepted.symm, linkage_certificate_line _ _ _ valid⟩
+      · simp [validate_linkage, parsed, planned, valid] at accepted
 
 private def kernel_source (node : Json) (depth : Nat) (lookup_helper : HelperScope := fun _ => none) :
     Except String (Source × Nat) := do
@@ -1131,12 +1171,13 @@ end Heresy
 #print axioms Heresy.link_schedule_order
 #print axioms Heresy.linkage_certificate_routes
 #print axioms Heresy.linkage_certificate_line
+#print axioms Heresy.linkage_validation_sound
 
 def main (arguments : List String) : IO UInt32 := do
   match arguments with
   | "linkage" :: haskell :: ast :: rest =>
     match Heresy.validate_linkage (← (ast :: rest).mapM (fun (path : String) => IO.FS.readFile path)) (← IO.FS.readFile haskell) with
-    | .ok count => IO.println s!"checked {count} linked function bindings and both initialisation schedules"; pure 0
+    | .ok count => IO.println s!"checked {count} linked function bindings, label symbols and startup"; pure 0
     | .error message => IO.eprintln message; pure 1
   | ["dispatch", haskell] =>
     match Heresy.validate_dispatches (← IO.FS.readFile haskell) with
