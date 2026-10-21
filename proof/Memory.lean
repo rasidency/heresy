@@ -243,6 +243,61 @@ theorem aggregate_store_copies_payload (source destination : CopyPlanes α) (s d
     simp [write_aggregate, payload_copy_refines, read_aggregate, aggregate_slice, inside, relative]
   · simp [write_aggregate, payload_copy_refines, inside]
 
+inductive TransferMode where
+  | load (target destination : Pointer)
+  | store (target source : Pointer)
+  | exchange (target source destination : Pointer)
+
+def atomic_transfer (read : HeapState → Bool → Pointer → Except fault α)
+    (write : HeapState → Bool → Pointer → α → Except fault HeapState)
+    (state : HeapState) : TransferMode → Except (HeapState × fault) HeapState :=
+  let observed := fun atomic pointer next => match read state atomic pointer with
+    | .ok value => next value
+    | .error why => .error (state, why)
+  let commit := fun heap (atomic, pointer, value) => write heap atomic pointer value
+  fun mode => match mode with
+  | .load target destination => observed true target fun old =>
+    run_heap commit state [(false, destination, old)]
+  | .store target source => observed false source fun desired =>
+    run_heap commit state [(true, target, desired)]
+  | .exchange target source destination => observed false source fun desired =>
+    observed true target fun old =>
+      run_heap commit state [(true, target, desired), (false, destination, old)]
+
+theorem atomic_transfer_heap_trace (read : HeapState → Bool → Pointer → Except fault α)
+    (write : HeapState → Bool → Pointer → α → Except fault HeapState)
+    (sound : ∀ heap atomic pointer value after, write heap atomic pointer value = .ok after → HeapTransition heap after)
+    (state : HeapState) (mode : TransferMode) :
+    HeapTrace state (stopped_heap (atomic_transfer read write state mode)) := by
+  let commit (heap : HeapState) (op : Bool × Pointer × α) := write heap op.1 op.2.1 op.2.2
+  have valid (ops : List (Bool × Pointer × α)) :=
+    run_heap_trace commit (fun heap op after applied => sound heap op.1 op.2.1 op.2.2 after applied) state ops
+  cases mode with
+  | load target destination =>
+    cases seen : read state true target with
+    | error why => simpa [atomic_transfer, seen, stopped_heap] using (HeapTrace.start (state := state))
+    | ok old => simpa [atomic_transfer, seen] using valid [(false, destination, old)]
+  | store target source =>
+    cases seen : read state false source with
+    | error why => simpa [atomic_transfer, seen, stopped_heap] using (HeapTrace.start (state := state))
+    | ok desired => simpa [atomic_transfer, seen] using valid [(true, target, desired)]
+  | exchange target source destination =>
+    cases seen : read state false source with
+    | error why => simpa [atomic_transfer, seen, stopped_heap] using (HeapTrace.start (state := state))
+    | ok desired =>
+      cases previous : read state true target with
+      | error why => simpa [atomic_transfer, seen, previous, stopped_heap] using (HeapTrace.start (state := state))
+      | ok old =>
+        simpa [atomic_transfer, seen, previous] using valid [(true, target, desired), (false, destination, old)]
+
+theorem exchange_retains_first_write_on_fault (read : HeapState → Bool → Pointer → Except fault α)
+    (write : HeapState → Bool → Pointer → α → Except fault HeapState)
+    (before middle : HeapState) (source target destination : Pointer) (old desired : α) (why : fault)
+    (read_source : read before false source = .ok desired) (read_target : read before true target = .ok old)
+    (stored : write before true target desired = .ok middle) (failed : write middle false destination old = .error why) :
+    atomic_transfer read write before (.exchange target source destination) = .error (middle, why) := by
+  simp [atomic_transfer, read_source, read_target, run_heap, stored, failed]
+
 end Heresy
 
 #print axioms Heresy.heap_trace_allocated
@@ -255,3 +310,5 @@ end Heresy
 #print axioms Heresy.aggregate_store_preserves_other_words
 #print axioms Heresy.aggregate_store_replaces_complete_words
 #print axioms Heresy.aggregate_store_copies_payload
+#print axioms Heresy.atomic_transfer_heap_trace
+#print axioms Heresy.exchange_retains_first_write_on_fault

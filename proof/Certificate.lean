@@ -1162,6 +1162,26 @@ private def validates_aggregate_memory (generated : String) : Bool :=
     "  pure value"]
   [load, store].all (fun equation => (generated.splitOn ("\n" ++ equation ++ "\n")).length == 2)
 
+private def validates_atomic_transfer (generated : String) : Bool :=
+  let transfer := String.intercalate "\n" [
+    "atomicTransfer :: String -> CType -> R Value -> [R Value] -> R Value",
+    "atomicTransfer op ty target operands = do",
+    "  pointer <- target",
+    "  values <- sequence operands",
+    "  let ordinary = plainType ty",
+    "  locked $ do",
+    "    _ <- case (op, values) of",
+    "      (\"load\", [_, destination]) -> loadCell ty pointer >>= storeCell ordinary destination",
+    "      (\"store\", [_, source]) -> loadCell ordinary source >>= storeCell ty pointer",
+    "      (\"exchange\", [_, source, destination]) -> do",
+    "        desired <- loadCell ordinary source",
+    "        old <- loadCell ty pointer",
+    "        void (storeCell ty pointer desired)",
+    "        storeCell ordinary destination old",
+    "      _ -> panic \"invalid atomic transfer operands\"",
+    "    pure (Number 0)"]
+  (generated.splitOn "\n\n").contains transfer
+
 end Heresy
 
 #print axioms Heresy.kernel_certificate_sound
@@ -1202,6 +1222,8 @@ def main (arguments : List String) : IO UInt32 := do
       IO.eprintln "memory copy differs from the model"; pure 1
     else if !Heresy.validates_aggregate_memory generated then
       IO.eprintln "aggregate memory differs from the model"; pure 1
+    else if !Heresy.validates_atomic_transfer generated then
+      IO.eprintln "atomic transfer differs from the model"; pure 1
     else if !Heresy.validates_scalar_memory generated then
       IO.eprintln "scalar memory differs from the model"; pure 1
     else if !Heresy.validates_freeze generated then
