@@ -1718,12 +1718,12 @@ theorem computed_jump_matches_symbol (symbols : String → Option Int) (targets 
       symbols name = some raw ∧ targets name = some next := by
   by_cases authentic : symbols name = some raw <;> simp [computed_jump, authentic]
 
-inductive CallRoute where
-  | definition (slot : Nat)
+inductive CallRoute (α : Type) where
+  | definition (handler : α)
   | builtin (name : String)
 
-def runtime_call_route (symbols : String → Option Int) (definitions : String → Option Nat)
-    (candidate : Option (Int × String)) : Option CallRoute :=
+def runtime_call_route (symbols : String → Option Int) (definitions : String → Option α)
+    (candidate : Option (Int × String)) : Option (CallRoute α) :=
   match candidate with
   | none => none
   | some (raw, name) =>
@@ -1733,15 +1733,15 @@ def runtime_call_route (symbols : String → Option Int) (definitions : String �
         | none => .builtin name)
     else none
 
-theorem runtime_call_definition (symbols : String → Option Int) (definitions : String → Option Nat)
-    (raw : Int) (name : String) (slot : Nat) :
+theorem runtime_call_definition (symbols : String → Option Int) (definitions : String → Option α)
+    (raw : Int) (name : String) (slot : α) :
     runtime_call_route symbols definitions (some (raw, name)) = some (.definition slot) ↔
       symbols name = some raw ∧ definitions name = some slot := by
   by_cases accepted : symbols name = some raw
   · cases found : definitions name <;> simp [runtime_call_route, accepted, found]
   · simp [runtime_call_route, accepted]
 
-theorem runtime_call_builtin (symbols : String → Option Int) (definitions : String → Option Nat)
+theorem runtime_call_builtin (symbols : String → Option Int) (definitions : String → Option α)
     (raw : Int) (name external_name : String) :
     runtime_call_route symbols definitions (some (raw, name)) = some (.builtin external_name) ↔
       symbols name = some raw ∧ definitions name = none ∧ name = external_name := by

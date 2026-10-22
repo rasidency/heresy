@@ -240,12 +240,30 @@ private def render_link_line (entries : List (String × String)) (count : Nat) (
   "main = execute [" ++ String.intercalate ", " bindings ++ "] [" ++ labels ++ "] " ++ parallel ++
     render_phase count "Globals" ++ " " ++ render_phase count "Thread"
 
+private def validates_link_runtime (generated : String) : Bool :=
+  let gate := "  gate <- if parallel then Just <$> newMVar () else pure Nothing"
+  let setup := String.intercalate "\n" [
+    "      initial = World counter [] S.empty S.empty (S.fromList entries) codes \"startup\" 0 [] False False table gate threads owner nullPointer initThread",
+    "      action = do",
+    "        initialiser",
+    "        when parallel $ do",
+    "          handle <- allocate \"thread\" 0",
+    "          modify' (\\w -> w { currentThread = handle })",
+    "        initThread"]
+  let entry := String.intercalate "\n" [
+    "        mainFunction <- gets (S.lookup \"main\" . functions)",
+    "        case mainFunction of",
+    "          Nothing -> panic \"no main function\"",
+    "          Just f -> f [Number (toInteger (length strings)), argv]"]
+  [gate, setup, entry].all (fun equation => (generated.splitOn ("\n" ++ equation ++ "\n")).length == 2)
+
 def validates_linkage (trees : List Json) (startup : LinkStartup) (generated : String) : Bool :=
   let entries := link_entries trees
   let lines := generated.splitOn "\n"
   decide (entries.map Prod.fst).Nodup && (entries.map Prod.fst).contains "main" &&
     entries.all (fun (_, handler) => (lines.filter (· == handler ++ " :: [Value] -> R Value")).length == 1) &&
-    (lines.filter (·.startsWith "main =")) == [render_link_line entries trees.length startup]
+    (validates_link_runtime generated &&
+      (lines.filter (·.startsWith "main =")) == [render_link_line entries trees.length startup])
 
 private theorem unique_lookup (bindings : List (String × String))
     (unique : (bindings.map Prod.fst).Nodup) (key handler : String) (found : (key, handler) ∈ bindings) :
@@ -270,13 +288,26 @@ theorem linkage_certificate_routes (trees : List Json) (startup : LinkStartup) (
   simp only [validates_linkage, Bool.and_eq_true, decide_eq_true_eq] at accepted
   exact accepted.1.1.1
 
+theorem certified_definition_authentication (trees : List Json) (startup : LinkStartup) (generated : String)
+    (accepted : validates_linkage trees startup generated = true) (symbols : String → Option Int)
+    (raw : Int) (key handler : String) (definition : (key, handler) ∈ link_entries trees) :
+    runtime_call_route symbols ((link_entries trees).reverse.lookup ·) (some (raw, key)) = some (.definition handler) ↔
+      symbols key = some raw := by
+  simp only [validates_linkage, Bool.and_eq_true, decide_eq_true_eq] at accepted
+  have distinct : ((link_entries trees).reverse.map Prod.fst).Nodup := by
+    rw [List.map_reverse]
+    exact (List.reverse_perm _).symm.nodup accepted.1.1.1
+  have found := unique_lookup _ distinct key handler (List.mem_reverse.mpr definition)
+  rw [runtime_call_definition, found]
+  simp
+
 theorem linkage_certificate_line (trees : List Json) (startup : LinkStartup) (generated : String)
     (accepted : validates_linkage trees startup generated = true) :
     render_link_line (link_entries trees) trees.length startup ∈ generated.splitOn "\n" := by
   simp only [validates_linkage, Bool.and_eq_true] at accepted
   have member : render_link_line (link_entries trees) trees.length startup ∈
       (generated.splitOn "\n").filter (·.startsWith "main =") := by
-    rw [beq_iff_eq.mp accepted.2]
+    rw [beq_iff_eq.mp accepted.2.2]
     simp
   exact (List.mem_filter.mp member).1
 
@@ -1190,6 +1221,7 @@ end Heresy
 #print axioms Heresy.certified_helper_uses_bound_arguments
 #print axioms Heresy.link_schedule_order
 #print axioms Heresy.linkage_certificate_routes
+#print axioms Heresy.certified_definition_authentication
 #print axioms Heresy.linkage_certificate_line
 #print axioms Heresy.linkage_validation_sound
 
