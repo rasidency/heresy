@@ -551,6 +551,12 @@ def validates_argument_slots (generated : String) : Bool :=
     "  pointer <- list",
     "  let start = foldl (\\index ty -> snd (addSlot index ty)) 0 named",
     "  store PointerType pointer (offset start area) >> pure (Number 0)"]
+  let copied := String.intercalate "\n" [
+    "vaCopy :: R Value -> R Value -> R Value",
+    "vaCopy destination source = do",
+    "  pointer <- destination",
+    "  cursor <- source >>= load PointerType",
+    "  store PointerType pointer cursor >> pure (Number 0)"]
   let fetch := String.intercalate "\n" [
     "vaArg :: CType -> R Value -> R Value",
     "vaArg ty list = do",
@@ -572,7 +578,7 @@ def validates_argument_slots (generated : String) : Bool :=
     "      object <- readObject capability",
     "      pure (boolean (live object && raw >= base object && raw + 8 <= base object + toInteger (extent object)))",
     "    _ -> pure (boolean False)"]
-  [size, alignment, placement, area, named, fetch, available].all sections.contains
+  [size, alignment, placement, area, named, copied, fetch, available].all sections.contains
 
 def validates_invocation (generated : String) : Bool :=
   let sections := generated.splitOn "\n\n"
@@ -1213,6 +1219,33 @@ private def validates_atomic_transfer (generated : String) : Bool :=
     "    pure (Number 0)"]
   (generated.splitOn "\n\n").contains transfer
 
+private def validates_pointer_memory (generated : String) : Bool :=
+  let width := "widthOf PointerType = 8"
+  let checked_load := String.intercalate "\n" [
+    "loadCell declared pointer = do",
+    "  let ty = case declared of AtomicType inner -> inner; other -> other",
+    "  (ident, object, displacement) <- checked (widthOf declared) pointer",
+    "  when (ty == PointerType && number pointer `mod` 8 /= 0) (panic \"unaligned pointer load\")",
+    "  let raw = readScalar displacement (widthOf ty) (bytes object)"]
+  let load := String.intercalate "\n" [
+    "        PointerType -> case M.lookup displacement (shadow object) of",
+    "          Just stored | declared == AtomicType PointerType && I.member displacement (atomicSlots object) -> stored",
+    "          Just (Pointer cap _) -> Pointer cap raw",
+    "          Just (Function _ name) -> Function raw name",
+    "          Just (Stream streamId _) -> Stream streamId raw",
+    "          _ -> Pointer NoCapability raw"]
+  let checked_store := String.intercalate "\n" [
+    "storeCell declared pointer value = do",
+    "  let ty = case declared of AtomicType inner -> inner; other -> other",
+    "  (ident, object, displacement) <- checked (widthOf declared) pointer",
+    "  when (readOnly object) (panic \"write to read-only memory\")",
+    "  when (ty == PointerType && number pointer `mod` 8 /= 0) (panic \"unaligned pointer store\")",
+    "  let converted = cast ty value"]
+  let store := String.intercalate "\n" [
+    "      updated = writeScalar displacement (widthOf ty) raw (bytes object)",
+    "      caps = if ty == PointerType then M.insert displacement converted (shadow object) else shadow object"]
+  [width, checked_load, load, checked_store, store].all (fun equation => (generated.splitOn ("\n" ++ equation ++ "\n")).length == 2)
+
 end Heresy
 
 #print axioms Heresy.kernel_certificate_sound
@@ -1258,6 +1291,8 @@ def main (arguments : List String) : IO UInt32 := do
       IO.eprintln "atomic transfer differs from the model"; pure 1
     else if !Heresy.validates_scalar_memory generated then
       IO.eprintln "scalar memory differs from the model"; pure 1
+    else if !Heresy.validates_pointer_memory generated then
+      IO.eprintln "pointer memory differs from the model"; pure 1
     else if !Heresy.validates_freeze generated then
       IO.eprintln "read-only transition differs from the model"; pure 1
     else if !Heresy.validates_synchronisation generated then

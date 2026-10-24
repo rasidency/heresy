@@ -298,6 +298,89 @@ theorem exchange_retains_first_write_on_fault (read : HeapState → Bool → Poi
     atomic_transfer read write before (.exchange target source destination) = .error (middle, why) := by
   simp [atomic_transfer, read_source, read_target, run_heap, stored, failed]
 
+inductive PointerWordFault where
+  | access (fault : AccessFault)
+  | unaligned
+  | readonly
+
+def data_pointer_word (object : Object) (slot : Nat) : Option Nat × Int :=
+  (object.shadow slot, little_endian_read 8 (fun i => object.bytes (slot + i)))
+
+def write_pointer_word (object : Object) (slot : Nat) (value : Pointer) : Object :=
+  { integer_store object slot 8 value.address with
+    shadow := fun index => if index = slot then some value.capability else object.shadow index }
+
+theorem data_pointer_word_roundtrip (object : Object) (slot : Nat) (value : Pointer) :
+    data_pointer_word (write_pointer_word object slot value) slot =
+      (some value.capability, unsigned 64 value.address) := by
+  simp [data_pointer_word, write_pointer_word, integer_store_load_roundtrip]
+
+theorem data_pointer_word_preserves_disjoint (object : Object) (stored observed : Nat) (value : Pointer)
+    (disjoint : stored + 8 ≤ observed ∨ observed + 8 ≤ stored) :
+    data_pointer_word (write_pointer_word object stored value) observed = data_pointer_word object observed := by
+  have different : observed ≠ stored := by omega
+  apply Prod.ext
+  · simp [data_pointer_word, write_pointer_word, different]
+  · unfold data_pointer_word little_endian_read
+    apply congrArg List.sum
+    apply List.map_congr_left
+    intro i present
+    have inside := List.mem_range.mp present
+    change (integer_store object stored 8 value.address).bytes (observed + i) * 256 ^ i =
+      object.bytes (observed + i) * 256 ^ i
+    rw [integer_store_preserves_other _ _ _ _ _ (by omega)]
+
+theorem copied_variadic_cursor_keeps_position (object : Object) (original copied : Nat) (cursor : Pointer)
+    (slot : ArgumentSlot) (wide : Bool) (disjoint : original + 8 ≤ copied ∨ copied + 8 ≤ original) :
+    let next := (variadic_access cursor.address.toNat slot wide).2
+    let snapshot := write_pointer_word object copied cursor
+    let advanced := write_pointer_word snapshot original (offset_pointer cursor ((next : Int) - cursor.address))
+    data_pointer_word advanced copied = (some cursor.capability, unsigned 64 cursor.address) := by
+  dsimp only
+  rw [data_pointer_word_preserves_disjoint _ _ _ _ disjoint, data_pointer_word_roundtrip]
+
+def read_data_pointer_word (memory : Memory) (pointer : Pointer) : Except PointerWordFault (Option Nat × Int) :=
+  match runtime_checked memory (some pointer) 8 with
+  | .error why => .error (.access why)
+  | .ok (object, slot) =>
+    if pointer.address % 8 = 0 then .ok (data_pointer_word object slot) else .error .unaligned
+
+def store_data_pointer_word (state : HeapState) (pointer value : Pointer) : Except PointerWordFault HeapState :=
+  match runtime_checked state.objects (some pointer) 8 with
+  | .error why => .error (.access why)
+  | .ok (object, slot) =>
+    if object.readonly then .error .readonly
+    else if pointer.address % 8 = 0 then
+      .ok { state with objects := replace_object state.objects pointer.capability (write_pointer_word object slot value) }
+    else .error .unaligned
+
+theorem data_pointer_store_refines (state next : HeapState) (pointer value : Pointer)
+    (stored : store_data_pointer_word state pointer value = .ok next) :
+    HeapTransition state next ∧ read_data_pointer_word next.objects pointer =
+      .ok (some value.capability, unsigned 64 value.address) := by
+  cases access : runtime_checked state.objects (some pointer) 8 with
+  | error why => simp [store_data_pointer_word, access] at stored
+  | ok word =>
+    obtain ⟨object, slot⟩ := word
+    by_cases readonly : object.readonly = true
+    · simp [store_data_pointer_word, access, readonly] at stored
+    by_cases aligned : pointer.address % 8 = 0
+    · simp [store_data_pointer_word, access, readonly, aligned] at stored
+      subst next
+      have ⟨checked_word, displacement⟩ := (checked_refines state.objects pointer 8 slot object).mp access
+      have ⟨found, valid⟩ := checked_sound state.objects pointer 8 object checked_word
+      let updated := write_pointer_word object slot value
+      have found_updated : replace_object state.objects pointer.capability updated pointer.capability = some updated := by
+        simp [replace_object]
+      have checked_updated : runtime_checked (replace_object state.objects pointer.capability updated) (some pointer) 8 =
+          .ok (updated, slot) := by
+        apply (checked_refines _ pointer 8 slot updated).mpr
+        exact ⟨by simp only [checked, found_updated, if_pos (show accessible updated pointer.address 8 from valid)], displacement⟩
+      refine ⟨.replace found rfl, ?_⟩
+      change read_data_pointer_word (replace_object state.objects pointer.capability updated) pointer = _
+      simp [read_data_pointer_word, checked_updated, aligned, updated, data_pointer_word_roundtrip]
+    · simp [store_data_pointer_word, access, readonly, aligned] at stored
+
 end Heresy
 
 #print axioms Heresy.heap_trace_allocated
@@ -312,3 +395,6 @@ end Heresy
 #print axioms Heresy.aggregate_store_copies_payload
 #print axioms Heresy.atomic_transfer_heap_trace
 #print axioms Heresy.exchange_retains_first_write_on_fault
+#print axioms Heresy.data_pointer_store_refines
+#print axioms Heresy.data_pointer_word_preserves_disjoint
+#print axioms Heresy.copied_variadic_cursor_keeps_position
