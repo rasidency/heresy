@@ -101,20 +101,26 @@ theorem heap_trace_preserves_dead (before after : HeapState) (trace : HeapTrace 
   | step earlier transition preserved =>
     exact heap_transition_preserves_dead _ _ transition (heap_trace_allocated _ _ earlier allocated) ident preserved
 
-theorem released_alias_stays_dead (before after : HeapState) (released : Pointer) (alias : Pointer)
-    (allocated : before.allocated) (same : alias.capability = released.capability)
+theorem released_identity_stays_dead (before after : HeapState) (released : Pointer)
+    (allocated : before.allocated)
     (heap : Nat → Bool) (next : Memory)
     (success : runtime_release before.objects heap (.data released) = .ok next)
-    (trace : HeapTrace { before with objects := next } after) (displacement count : Int) :
-    runtime_checked after.objects (some (offset_pointer alias displacement)) count = .error .dead := by
+    (trace : HeapTrace { before with objects := next } after) : dead_at after.objects released.capability := by
   obtain ⟨object, access, _, _, rfl⟩ := release_data_sound before.objects next heap released success
   have found := (checked_sound before.objects released 0 object access).1
   have released_step : HeapTransition before { before with objects := invalidate before.objects released.capability } :=
     .release found
   have dead : dead_at (invalidate before.objects released.capability) released.capability :=
     ⟨{ object with live := false, bytes := fun _ => 0, shadow := fun _ => none }, by simp [invalidate, found], rfl⟩
-  obtain ⟨last, last_lookup, last_live⟩ := heap_trace_preserves_dead _ _ trace
-    (heap_transition_allocated before _ released_step allocated) released.capability dead
+  exact heap_trace_preserves_dead _ _ trace (heap_transition_allocated before _ released_step allocated) released.capability dead
+
+theorem released_alias_stays_dead (before after : HeapState) (released : Pointer) (alias : Pointer)
+    (allocated : before.allocated) (same : alias.capability = released.capability)
+    (heap : Nat → Bool) (next : Memory)
+    (success : runtime_release before.objects heap (.data released) = .ok next)
+    (trace : HeapTrace { before with objects := next } after) (displacement count : Int) :
+    runtime_checked after.objects (some (offset_pointer alias displacement)) count = .error .dead := by
+  obtain ⟨last, last_lookup, last_live⟩ := released_identity_stays_dead before after released allocated heap next success trace
   simp [runtime_checked, offset_pointer, same, last_lookup, last_live]
 
 theorem guarded_store_transition (state : HeapState) (pointer : Pointer) (width : Nat) (value : Int)
@@ -381,6 +387,140 @@ theorem data_pointer_store_refines (state next : HeapState) (pointer value : Poi
       simp [read_data_pointer_word, checked_updated, aligned, updated, data_pointer_word_roundtrip]
     · simp [store_data_pointer_word, access, readonly, aligned] at stored
 
+inductive FileReadFault where
+  | access (fault : AccessFault)
+  | readonly
+
+structure FileReadRequest where
+  destination : Pointer
+  element_size : Nat
+  element_count : Nat
+
+def FileReadRequest.total (request : FileReadRequest) : Nat :=
+  request.element_size * request.element_count
+
+def file_read_destination (memory : Memory) (request : FileReadRequest) : Except FileReadFault (Object × Nat) :=
+  match runtime_checked memory (some request.destination) request.total with
+  | .error fault => .error (.access fault)
+  | .ok (object, displacement) =>
+    if object.readonly then .error .readonly else .ok (object, displacement)
+
+def file_read_begin (memory : Memory) (request : FileReadRequest) : Except FileReadFault (Option Nat) :=
+  if request.total = 0 then .ok none
+  else
+    match file_read_destination memory request with
+    | .error fault => .error fault
+    | .ok _ => .ok (some request.total)
+
+theorem file_read_requests_positive_span (memory : Memory) (request : FileReadRequest) (total : Nat)
+    (started : file_read_begin memory request = .ok (some total)) :
+    total = request.total ∧ 0 < total ∧ ∃ object displacement,
+      file_read_destination memory request = .ok (object, displacement) := by
+  by_cases empty : request.total = 0
+  · simp [file_read_begin, empty] at started
+  cases checked_word : file_read_destination memory request with
+  | error why => simp [file_read_begin, empty, checked_word] at started
+  | ok pair =>
+    obtain ⟨object, displacement⟩ := pair
+    have same : request.total = total := by simpa [file_read_begin, empty, checked_word] using started
+    exact ⟨same.symm, by omega, object, displacement, rfl⟩
+
+private def file_read_insert (state : Nat × (Nat → Int)) (byte : Int) : Nat × (Nat → Int) :=
+  (state.1 + 1, fun index => if index = state.1 then byte else state.2 index)
+
+def file_read_bytes (object : Object) (displacement : Nat) (payload : List Int) : Object :=
+  { object with bytes := (payload.foldl file_read_insert (displacement, object.bytes)).2 }
+
+private theorem file_read_payload (payload : List Int) (bytes : Nat → Int) (displacement index : Nat) :
+    (payload.foldl file_read_insert (displacement, bytes)).2 index =
+      if displacement ≤ index then payload[index - displacement]?.getD (bytes index) else bytes index := by
+  induction payload generalizing displacement bytes with
+  | nil => simp
+  | cons first rest ih =>
+    simp only [List.foldl_cons, file_read_insert, ih]
+    by_cases before : index < displacement
+    · have different : index ≠ displacement := by omega
+      simp [Nat.not_le.mpr before, different, show ¬displacement + 1 ≤ index by omega]
+    by_cases at_start : index = displacement
+    · subst index
+      simp [show ¬displacement + 1 ≤ displacement by omega]
+    have later : displacement + 1 ≤ index := by omega
+    have difference : index - displacement = (index - (displacement + 1)) + 1 := by omega
+    simp [later, Nat.le_of_lt (show displacement < index by omega), at_start, difference]
+
+structure FileReadResult where
+  heap : HeapState
+  consumed : Nat
+  result : Except FileReadFault Nat
+
+def file_read_finish (state : HeapState) (request : FileReadRequest) (payload : List Int) : FileReadResult :=
+  match file_read_destination state.objects request with
+  | .error fault => ⟨state, payload.length, .error fault⟩
+  | .ok (object, displacement) =>
+    let updated := file_read_bytes object displacement payload
+    ⟨{ state with objects := replace_object state.objects request.destination.capability updated },
+      payload.length, .ok (payload.length / request.element_size)⟩
+
+theorem file_read_finish_transition (state : HeapState) (request : FileReadRequest) (payload : List Int) :
+    HeapTransition state (file_read_finish state request payload).heap := by
+  cases access : runtime_checked state.objects (some request.destination) (request.total : Int) with
+  | error why => simpa [file_read_finish, file_read_destination, access] using (HeapTransition.observe (state := state))
+  | ok pair =>
+    obtain ⟨object, displacement⟩ := pair
+    by_cases readonly : object.readonly = true
+    · simpa [file_read_finish, file_read_destination, access, readonly] using (HeapTransition.observe (state := state))
+    · have checked_word := ((checked_refines state.objects request.destination request.total displacement object).mp access).1
+      have found := (checked_sound state.objects request.destination request.total object checked_word).1
+      simp only [file_read_finish, file_read_destination, access, readonly]
+      exact .replace found rfl
+
+theorem file_read_copies_partial_element (object : Object) (displacement : Nat) (payload : List Int) (index : Nat)
+    (inside : index < payload.length) :
+    (file_read_bytes object displacement payload).bytes (displacement + index) = payload[index] := by
+  simp [file_read_bytes, file_read_payload, List.getElem?_eq_getElem inside]
+
+theorem file_read_preserves_outside (object : Object) (displacement : Nat) (payload : List Int) (index : Nat)
+    (outside : index < displacement ∨ displacement + payload.length ≤ index) :
+    (file_read_bytes object displacement payload).bytes index = object.bytes index := by
+  by_cases after_start : displacement ≤ index
+  · have past : payload.length ≤ index - displacement := by omega
+    simp [file_read_bytes, file_read_payload, after_start, List.getElem?_eq_none past]
+  · simp [file_read_bytes, file_read_payload, after_start]
+
+theorem file_read_writes_within_allocation (state : HeapState) (request : FileReadRequest)
+    (object : Object) (displacement : Nat) (payload : List Int) (index : Nat)
+    (access : runtime_checked state.objects (some request.destination) request.total = .ok (object, displacement))
+    (fits : payload.length ≤ request.total) (outside : object.size ≤ index) :
+    (file_read_bytes object displacement payload).bytes index = object.bytes index := by
+  have ⟨checked_word, offset⟩ := (checked_refines state.objects request.destination request.total displacement object).mp access
+  have ⟨_, lower, upper⟩ := checked_span state.objects request.destination request.total object checked_word
+  apply file_read_preserves_outside
+  omega
+
+theorem file_read_short_count (state : HeapState) (request : FileReadRequest) (payload : List Int)
+    (fits : payload.length ≤ request.total)
+    (elements : Nat) (success : (file_read_finish state request payload).result = .ok elements) :
+    elements = payload.length / request.element_size ∧ elements ≤ request.element_count := by
+  cases checked_word : file_read_destination state.objects request with
+  | error why => simp [file_read_finish, checked_word] at success
+  | ok pair =>
+    obtain ⟨object, displacement⟩ := pair
+    have same : payload.length / request.element_size = elements := by simpa [file_read_finish, checked_word] using success
+    refine ⟨same.symm, ?_⟩
+    rw [← same]
+    apply Nat.div_le_of_le_mul
+    simpa [FileReadRequest.total, Nat.mul_comm] using fits
+
+theorem file_read_after_release (before after : HeapState) (request : FileReadRequest) (released : Pointer)
+    (allocated : before.allocated) (same : request.destination.capability = released.capability)
+    (owned : Nat → Bool) (next : Memory) (released_ok : runtime_release before.objects owned (.data released) = .ok next)
+    (trace : HeapTrace { before with objects := next } after) (payload : List Int) :
+    let result := file_read_finish after request payload
+    result.heap = after ∧ result.consumed = payload.length ∧ result.result = .error (.access .dead) := by
+  obtain ⟨last, found_last, liveness⟩ :=
+    released_identity_stays_dead before after released allocated owned next released_ok trace
+  simp [file_read_finish, file_read_destination, runtime_checked, same, found_last, liveness]
+
 end Heresy
 
 #print axioms Heresy.heap_trace_allocated
@@ -398,3 +538,9 @@ end Heresy
 #print axioms Heresy.data_pointer_store_refines
 #print axioms Heresy.data_pointer_word_preserves_disjoint
 #print axioms Heresy.copied_variadic_cursor_keeps_position
+#print axioms Heresy.file_read_finish_transition
+#print axioms Heresy.file_read_requests_positive_span
+#print axioms Heresy.file_read_copies_partial_element
+#print axioms Heresy.file_read_preserves_outside
+#print axioms Heresy.file_read_writes_within_allocation
+#print axioms Heresy.file_read_after_release

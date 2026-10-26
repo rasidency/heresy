@@ -1162,6 +1162,21 @@ def validates_process (generated : String) : Bool :=
     "runWorld :: World -> R a -> IO (Either Fault a, World)",
     "runWorld world action = runStateT (runExceptT (unR action)) world"]
   let finish := "builtin \"exit\" [code] = throwError (Finish (fromInteger (number code `mod` 256)))"
+  let file_read := String.intercalate "\n" [
+    "builtin \"fread\" [destination, size, count, value] = do",
+    "  total <- transferSize size count",
+    "  handle <- stream value",
+    "  if total == 0 then pure (Number 0) else do",
+    "    (_, object, _) <- checked total destination",
+    "    when (readOnly object) (panic \"file read into read-only memory\")",
+    "    payload <- io (B.hGet handle total)",
+    "    locked $ do",
+    "      (ident, updatedObject, displacement) <- checked total destination",
+    "      when (readOnly updatedObject) (panic \"file read into read-only memory\")",
+    "      let updated = B.foldl' (\\(i, m) byte -> (i + 1, M.insert i (toInteger (ord byte)) m)) (displacement, bytes updatedObject) payload",
+    "      writeObject ident (updatedObject { bytes = snd updated })",
+    "      event (\"read \" ++ show (B.length payload) ++ \" bytes into #\" ++ show ident)",
+    "    pure (Number (toInteger (B.length payload) `div` number size))"]
   let epilogue := String.intercalate "\n" [
     "  outcome <- E.try (runWorld initial action)",
     "  let (result, final) = either (\\fault -> (Left fault, initial)) id outcome",
@@ -1176,7 +1191,7 @@ def validates_process (generated : String) : Bool :=
     "      hPutStrLn stderr (\"heresy panic: \" ++ message)",
     "      unless (enabled || null (recent final)) $ hPutStrLn stderr (intercalate \"\\n\" (reverse (recent final)))",
     "      exitWith (ExitFailure 70)"]
-  [transformer, finish, epilogue].all (fun equation => (generated.splitOn ("\n" ++ equation ++ "\n")).length == 2)
+  [transformer, finish, file_read, epilogue].all (fun equation => (generated.splitOn ("\n" ++ equation ++ "\n")).length == 2)
 
 private def validates_aggregate_memory (generated : String) : Bool :=
   let load := "        AggregateType size alignment -> Aggregate size alignment (aggregateBytes displacement size (bytes object)) (aggregateShadow displacement size (shadow object))"
@@ -1270,9 +1285,9 @@ def main (arguments : List String) : IO UInt32 := do
     | .error message => IO.eprintln message; pure 1
   | ["process", haskell] =>
     if Heresy.validates_process (← IO.FS.readFile haskell) then
-      IO.println "checked process termination and cleanup equations"; pure 0
+      IO.println "checked file reads, process termination and cleanup equations"; pure 0
     else
-      IO.eprintln "process termination or cleanup differs from the model"; pure 1
+      IO.eprintln "file reads, process termination or cleanup differ from the model"; pure 1
   | ["memory", haskell] =>
     let generated ← IO.FS.readFile haskell
     if !Heresy.validates_access generated then
