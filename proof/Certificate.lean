@@ -1214,7 +1214,7 @@ private def validates_aggregate_memory (generated : String) : Bool :=
     "  pure value"]
   [load, store].all (fun equation => (generated.splitOn ("\n" ++ equation ++ "\n")).length == 2)
 
-private def validates_atomic_transfer (generated : String) : Bool :=
+private def validates_atomic_memory (generated : String) : Bool :=
   let transfer := String.intercalate "\n" [
     "atomicTransfer :: String -> CType -> R Value -> [R Value] -> R Value",
     "atomicTransfer op ty target operands = do",
@@ -1232,7 +1232,37 @@ private def validates_atomic_transfer (generated : String) : Bool :=
     "        storeCell ordinary destination old",
     "      _ -> panic \"invalid atomic transfer operands\"",
     "    pure (Number 0)"]
-  (generated.splitOn "\n\n").contains transfer
+  let compare := String.intercalate "\n" [
+    "atomicCompare :: Bool -> CType -> R Value -> R Value -> R Value -> R Value -> R Value -> R Value",
+    "atomicCompare indirect ty target successOrder expected failureOrder desired = do",
+    "  pointer <- target",
+    "  void successOrder",
+    "  expectation <- expected",
+    "  void failureOrder",
+    "  desiredValue <- desired",
+    "  locked $ do",
+    "    let ordinary = plainType ty",
+    "        bits value = case value of Aggregate _ _ payload _ -> decodeBytes payload; _ -> number value",
+    "    replacement <- if indirect then loadCell ordinary desiredValue else pure desiredValue",
+    "    old <- loadCell ty pointer",
+    "    wanted <- loadCell ordinary expectation",
+    "    (_, object, _) <- checked (widthOf ty) pointer",
+    "    when (readOnly object) (panic \"write to read-only memory\")",
+    "    matches <- case (ty, old, wanted) of",
+    "      (AtomicAggregate _ _ AtomicCopy, Aggregate _ _ actual _, Aggregate _ _ expectedBytes _) ->",
+    "        pure (M.filter (/= 0) actual == M.filter (/= 0) expectedBytes)",
+    "      (AtomicAggregate width _ AtomicBytes, _, _) | width /= widthOf ordinary -> do",
+    "        observed <- loadCell (IntegerType (8 * width) False) pointer",
+    "        pure (number observed == bits wanted)",
+    "      _ -> pure (bits old == bits wanted)",
+    "    if matches then storeCell ty pointer replacement >> pure (boolean True) else do",
+    "      case ty of",
+    "        AtomicAggregate width _ AtomicBytes ->",
+    "          when (width == widthOf ordinary) $",
+    "            void (storeCell (IntegerType (8 * width) False) expectation (Number (bits old)))",
+    "        _ -> void (storeCell ordinary expectation old)",
+    "      pure (boolean False)"]
+  [transfer, compare].all (generated.splitOn "\n\n").contains
 
 private def validates_pointer_memory (generated : String) : Bool :=
   let width := "widthOf PointerType = 8"
@@ -1302,8 +1332,8 @@ def main (arguments : List String) : IO UInt32 := do
       IO.eprintln "memory copy differs from the model"; pure 1
     else if !Heresy.validates_aggregate_memory generated then
       IO.eprintln "aggregate memory differs from the model"; pure 1
-    else if !Heresy.validates_atomic_transfer generated then
-      IO.eprintln "atomic transfer differs from the model"; pure 1
+    else if !Heresy.validates_atomic_memory generated then
+      IO.eprintln "atomic memory differs from the model"; pure 1
     else if !Heresy.validates_scalar_memory generated then
       IO.eprintln "scalar memory differs from the model"; pure 1
     else if !Heresy.validates_pointer_memory generated then

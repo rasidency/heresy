@@ -304,6 +304,88 @@ theorem exchange_retains_first_write_on_fault (read : HeapState → Bool → Poi
     atomic_transfer read write before (.exchange target source destination) = .error (middle, why) := by
   simp [atomic_transfer, read_source, read_target, run_heap, stored, failed]
 
+inductive CompareMode where
+  | scalar
+  | copy
+  | bytes (width ordinary : Nat)
+
+structure CompareValues (α : Type) where
+  observed : α
+  replacement : α
+  observed_bits : Int
+  expected_bits : Int
+  promoted_bits : Int
+  payloads_equal : Bool
+
+inductive CompareWrite (α : Type) where
+  | target (value : α)
+  | expected (value : α)
+  | expected_bits (width : Nat) (value : Int)
+
+def compare_matches (mode : CompareMode) (values : CompareValues α) : Bool :=
+  match mode with
+  | .scalar => values.observed_bits == values.expected_bits
+  | .copy => values.payloads_equal
+  | .bytes width ordinary =>
+    (if width = ordinary then values.observed_bits else values.promoted_bits) == values.expected_bits
+
+def compare_write (mode : CompareMode) (values : CompareValues α) (equal : Bool) : Option (CompareWrite α) :=
+  if equal then some (.target values.replacement)
+  else match mode with
+  | .bytes width ordinary => if width = ordinary then some (.expected_bits width values.observed_bits) else none
+  | _ => some (.expected values.observed)
+
+def atomic_compare_exchange (check : HeapState → Except fault (CompareValues α))
+    (commit : HeapState → CompareWrite α → Except fault HeapState) (state : HeapState) (mode : CompareMode) :
+    Except fault (Bool × HeapState) :=
+  match check state with
+  | .error why => .error why
+  | .ok values =>
+    let equal := compare_matches mode values
+    match compare_write mode values equal with
+    | none => .ok (equal, state)
+    | some operation =>
+      match commit state operation with
+      | .error why => .error why
+      | .ok after => .ok (equal, after)
+
+theorem compare_exchange_transition (check : HeapState → Except fault (CompareValues α))
+    (commit : HeapState → CompareWrite α → Except fault HeapState)
+    (sound : ∀ state operation after, commit state operation = .ok after → HeapTransition state after)
+    (state after : HeapState) (mode : CompareMode) (result : Bool)
+    (success : atomic_compare_exchange check commit state mode = .ok (result, after)) : HeapTransition state after := by
+  cases observed : check state with
+  | error why => simp [atomic_compare_exchange, observed] at success
+  | ok values =>
+    cases chosen : compare_write mode values (compare_matches mode values) with
+    | none =>
+      simp [atomic_compare_exchange, observed, chosen] at success
+      exact success.2 ▸ .observe
+    | some operation =>
+      cases stored : commit state operation with
+      | error why => simp [atomic_compare_exchange, observed, chosen, stored] at success
+      | ok committed =>
+        simp [atomic_compare_exchange, observed, chosen, stored] at success
+        exact success.2 ▸ sound _ _ _ stored
+
+theorem promoted_compare_rejection_skips_write (check : HeapState → Except fault (CompareValues α))
+    (commit : HeapState → CompareWrite α → Except fault HeapState) (state : HeapState)
+    (values : CompareValues α) (width ordinary : Nat) (promoted : width ≠ ordinary)
+    (observed : check state = .ok values) (canonical : unsigned (8 * ordinary) values.expected_bits = values.expected_bits)
+    (padding : modulus (8 * ordinary) ≤ values.promoted_bits) :
+    atomic_compare_exchange check commit state (.bytes width ordinary) = .ok (false, state) := by
+  have different := promoted_atomic_rejects_nonzero_padding (8 * ordinary) values.promoted_bits values.expected_bits padding
+  unfold promoted_atomic_compare at different
+  rw [canonical] at different
+  simp [atomic_compare_exchange, observed, compare_matches, compare_write, promoted, different]
+
+theorem compare_exchange_commits_observed_on_scalar_mismatch (check : HeapState → Except fault (CompareValues α))
+    (commit : HeapState → CompareWrite α → Except fault HeapState) (state next : HeapState)
+    (values : CompareValues α) (observed : check state = .ok values)
+    (different : values.observed_bits ≠ values.expected_bits) (stored : commit state (.expected values.observed) = .ok next) :
+    atomic_compare_exchange check commit state .scalar = .ok (false, next) := by
+  simp [atomic_compare_exchange, observed, compare_matches, compare_write, beq_eq_false_iff_ne.mpr different, stored]
+
 inductive PointerWordFault where
   | access (fault : AccessFault)
   | unaligned
@@ -535,6 +617,9 @@ end Heresy
 #print axioms Heresy.aggregate_store_copies_payload
 #print axioms Heresy.atomic_transfer_heap_trace
 #print axioms Heresy.exchange_retains_first_write_on_fault
+#print axioms Heresy.compare_exchange_transition
+#print axioms Heresy.promoted_compare_rejection_skips_write
+#print axioms Heresy.compare_exchange_commits_observed_on_scalar_mismatch
 #print axioms Heresy.data_pointer_store_refines
 #print axioms Heresy.data_pointer_word_preserves_disjoint
 #print axioms Heresy.copied_variadic_cursor_keeps_position
