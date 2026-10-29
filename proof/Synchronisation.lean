@@ -161,9 +161,75 @@ theorem signal_is_available_before_the_receiver_runs (ticket : Nat) (waiting : L
       ticket ∈ (post_signal (select_signals state false) ticket).posted := by
   simp [select_signals, post_signal, first, choose_signals]
 
+def MutexQueue.valid (mutex : MutexQueue) : Prop :=
+  (mutex.waiting.map Prod.fst).Nodup ∧
+    match mutex.owner with
+    | none => mutex.waiting = []
+    | some owner => owner ∉ mutex.waiting.map Prod.fst
+
+theorem mutex_acquire_valid (try_only : Bool) (thread ticket : Nat) (mutex : MutexQueue)
+    (valid : mutex.valid) (fresh : thread ∉ mutex.waiting.map Prod.fst) :
+    (mutex_acquire try_only thread ticket mutex).1.valid := by
+  cases owner : mutex.owner with
+  | none =>
+    have empty : mutex.waiting = [] := by simpa [owner] using valid.2
+    simp [mutex_acquire, MutexQueue.valid, owner, empty]
+  | some current =>
+    have absent : current ∉ mutex.waiting.map Prod.fst := by simpa [owner] using valid.2
+    by_cases same : current = thread
+    · cases try_only <;> simpa [mutex_acquire, owner, same] using valid
+    · cases try_only
+      · simp [mutex_acquire, MutexQueue.valid, owner, same, absent, List.nodup_append, valid.1]
+        intro earlier queued present equal
+        subst earlier
+        exact fresh (List.mem_map_of_mem (show (thread, queued) ∈ mutex.waiting from present))
+      · simpa [mutex_acquire, owner] using valid
+
+theorem mutex_release_valid (thread : Nat) (mutex next : MutexQueue) (signal : Option Nat)
+    (valid : mutex.valid) (released : mutex_release thread mutex = some (next, signal)) : next.valid := by
+  have owns := mutex_release_requires_owner thread mutex next signal released
+  cases waiting : mutex.waiting with
+  | nil =>
+    simp [mutex_release, owns, waiting] at released
+    obtain ⟨rfl, _⟩ := released
+    simp [MutexQueue.valid]
+  | cons entry tail =>
+    obtain ⟨successor, ticket⟩ := entry
+    simp [mutex_release, owns, waiting] at released
+    obtain ⟨rfl, _⟩ := released
+    have nodup := valid.1
+    simp [MutexQueue.valid, waiting] at nodup ⊢
+    exact nodup.symm
+
+theorem mutex_handoff_reserves_ownership (owner successor ticket arriving new_ticket : Nat)
+    (waiting : List (Nat × Nat)) (later : successor ≠ arriving) :
+    let handoff := MutexQueue.mk (some successor) waiting
+    mutex_release owner ⟨some owner, (successor, ticket) :: waiting⟩ = some (handoff, some ticket) ∧
+      mutex_acquire true arriving new_ticket handoff = (handoff, .complete 16) ∧
+      mutex_acquire false arriving new_ticket handoff =
+        (⟨some successor, waiting ++ [(arriving, new_ticket)]⟩, .wait new_ticket) := by
+  exact ⟨mutex_release_handoff owner successor ticket waiting,
+    busy_try_lock_preserves_queue arriving new_ticket successor waiting,
+    waiting_lock_preserves_owner arriving new_ticket successor waiting later⟩
+
+theorem condition_enrolment_survives_handoff (thread ticket : Nat) (previous updated : MutexQueue)
+    (queue : SignalQueue) (waiting : List Nat) (signal : Option Nat) (after : SignalQueue)
+    (valid : previous.valid)
+    (enrolled : condition_enroll thread ticket previous queue.waiting = some (updated, waiting, signal))
+    (steps : SignalTrace ticket { queue with waiting } after) :
+    updated.valid ∧ after.contains ticket := by
+  obtain ⟨released, _, pending⟩ := condition_enroll_releases_and_keeps_ticket thread ticket
+    previous updated queue.waiting waiting signal enrolled
+  exact ⟨mutex_release_valid thread previous updated signal valid released,
+    enrolment_survives_trace ticket _ after steps (.inl pending)⟩
+
 end Heresy
 
 #print axioms Heresy.condition_enroll_releases_and_keeps_ticket
 #print axioms Heresy.condition_and_mutex_updates_share_allocation
 #print axioms Heresy.enrolment_survives_trace
 #print axioms Heresy.signal_is_available_before_the_receiver_runs
+#print axioms Heresy.mutex_acquire_valid
+#print axioms Heresy.mutex_release_valid
+#print axioms Heresy.mutex_handoff_reserves_ownership
+#print axioms Heresy.condition_enrolment_survives_handoff
