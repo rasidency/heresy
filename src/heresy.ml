@@ -2124,6 +2124,30 @@ let json_string value =
   Buffer.add_char buffer '"';
   Buffer.contents buffer
 
+let json_tree tree =
+  let buffer = Buffer.create 4096 in
+  let add = Buffer.add_string buffer in
+  let separated emit values =
+    match values with
+    | [] -> ()
+    | first :: rest -> emit first; List.iter (fun value -> add ","; emit value) rest
+  in
+  let rec emit = function
+    | Json.Null -> add "null"
+    | Json.Bool true -> add "true"
+    | Json.Bool false -> add "false"
+    | Json.Number value -> add value
+    | Json.String value -> add (json_string value)
+    | Json.Array values -> add "["; separated emit values; add "]"
+    | Json.Object fields ->
+        add "{";
+        separated (fun (name, value) -> add (json_string name); add ":"; emit value) fields;
+        add "}"
+  in
+  emit tree;
+  add "\n";
+  Buffer.contents buffer
+
 let prepare_frontend source content dump =
   let layouts, tree = frontend_dump (dump []) in
   let bounds = Hashtbl.create 16 in
@@ -2540,11 +2564,12 @@ let emit_closed contexts trees =
   | _ -> raise (Error "closed compilation requires one translation unit")
 
 let main () =
-  let sources = ref [] and output = ref "" and executable = ref "" and report = ref false in
+  let sources = ref [] and output = ref "" and executable = ref "" and ast_directory = ref "" and report = ref false in
   let check = ref false and closed = ref false and timeout = ref 0. and ghc = ref "ghc" in
   let specs = [
     "-o", Arg.Set_string output, "FILE standalone generated Haskell";
     "--build", Arg.Set_string executable, "FILE executable output";
+    "--ast-dir", Arg.Set_string ast_directory, "DIRECTORY write the prepared typed ASTs as numbered JSON files";
     "--check", Arg.Set check, " validate the supported language subset without writing output";
     "--closed", Arg.Set closed, " lower a closed integer program for whole-program certification";
     "--explain", Arg.Set report, " report lowering decisions";
@@ -2552,10 +2577,11 @@ let main () =
     "--ghc", Arg.Set_string ghc, "PROGRAM select GHC 9.6.7";
     "--version", Arg.Unit (fun () -> Printf.printf "Heresy %s (Fil-C 0.687 -> Haskell)\n" Runtime.version; exit 0), " show compiler version"
   ] in
-  Arg.parse specs (fun path -> sources := path :: !sources) "heresy input.c [other.c ...] [-o Main.hs] [--build executable] [--check] [--explain]";
+  Arg.parse specs (fun path -> sources := path :: !sources) "heresy input.c [other.c ...] [-o Main.hs] [--build executable] [--ast-dir directory] [--check] [--explain]";
   if !sources = [] then raise (Error "a Fil-C input file is required");
   if not (Float.is_finite !timeout) || !timeout < 0. then raise (Error "timeout must be finite and nonnegative");
-  if !check && (!output <> "" || !executable <> "") then raise (Error "--check cannot be combined with -o or --build");
+  if !check && (!output <> "" || !executable <> "" || !ast_directory <> "") then
+    raise (Error "--check cannot be combined with -o, --build or --ast-dir");
   let sources = List.rev_map Unix.realpath !sources in
   if List.length (List.sort_uniq String.compare sources) <> List.length sources then raise (Error "duplicate input file");
   List.iter (fun source ->
@@ -2591,9 +2617,16 @@ let main () =
   if !output = "" then output := Filename.concat "build" (String.capitalize_ascii (Filename.remove_extension (Filename.basename source)) ^ ".hs");
   let output = output_path !output in
   if List.exists (same_file output) sources then raise (Error "output would overwrite an input source");
+  let executable = if !executable = "" then None else Some (output_path !executable) in
+  Option.iter (fun executable ->
+    if List.exists (same_file executable) (output :: sources) then raise (Error "executable would overwrite a source file")) executable;
+  let asts = if !ast_directory = "" then [] else
+    List.mapi (fun index tree ->
+      let path = output_path (Filename.concat !ast_directory (string_of_int index ^ ".json")) in
+      if List.exists (same_file path) (output :: (Option.to_list executable @ sources)) then
+        raise (Error "typed AST would overwrite another input or output file");
+      path, tree) trees in
   let build executable =
-    let executable = output_path executable in
-    if List.exists (same_file executable) sources || same_file executable output then raise (Error "executable would overwrite a source file");
     if String.trim (capture !ghc ["--numeric-version"]) <> "9.6.7" then raise (Error "GHC 9.6.7 is required");
     let workspace = temporary_directory (Filename.dirname executable) in
     Fun.protect ~finally:(fun () -> remove workspace) (fun () ->
@@ -2617,9 +2650,10 @@ let main () =
       atomic_write output generated;
       Unix.rename target executable)
   in
-  if !executable = "" then atomic_write output generated else build !executable;
+  (match executable with None -> atomic_write output generated | Some path -> build path);
+  List.iter (fun (path, tree) -> atomic_write path (json_tree tree)) asts;
   Printf.printf "Compiled %s -> %s\n" listed (Filename.basename output);
-  if !executable <> "" then Printf.printf "Built %s with GHC\n" (Filename.basename !executable);
+  Option.iter (fun path -> Printf.printf "Built %s with GHC\n" (Filename.basename path)) executable;
   if !report then List.iter explain contexts
   end
 
