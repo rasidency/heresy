@@ -1162,6 +1162,34 @@ def validates_process (generated : String) : Bool :=
     "runWorld :: World -> R a -> IO (Either Fault a, World)",
     "runWorld world action = runStateT (runExceptT (unR action)) world"]
   let finish := "builtin \"exit\" [code] = throwError (Finish (fromInteger (number code `mod` 256)))"
+  let stream_seed := "  table <- newIORef (1, M.empty)"
+  let stream_lookup := String.intercalate "\n" [
+    "stream :: Value -> R Handle",
+    "stream (Stream ident raw) = do",
+    "  unless (raw == 4611686018427387904 + toInteger ident) (panic \"closed or invalid file stream\")",
+    "  table <- gets streamTable >>= liftIO . readIORef",
+    "  let handle = M.lookup ident (snd table)",
+    "  maybe (panic \"closed or invalid file stream\") pure handle",
+    "stream _ = panic \"file operation requires a valid stream\""]
+  let register := String.intercalate "\n" [
+    "  opened <- liftIO (tryIOError (openBinaryFile name selected))",
+    "  case opened of",
+    "    Left _ -> pure nullPointer",
+    "    Right handle -> do",
+    "      entry <- liftIO $ atomicModifyIORef' table $ \\old@(ident, entries) ->",
+    "        if toInteger ident >= 4611686018427387904 then (old, Nothing)",
+    "        else ((ident + 1, M.insert ident handle entries), Just ident)",
+    "      ident <- case entry of",
+    "        Nothing -> io (hClose handle) >> panic \"stream identity space exhausted\"",
+    "        Just available -> pure available",
+    "      pure (Stream ident (4611686018427387904 + toInteger ident))"]
+  let close := String.intercalate "\n" [
+    "builtin \"fclose\" [value@(Stream ident _)] = do",
+    "  handle <- stream value",
+    "  io (hClose handle)",
+    "  table <- gets streamTable",
+    "  liftIO $ atomicModifyIORef' table $ \\(next, entries) -> ((next, M.delete ident entries), ())",
+    "  pure (Number 0)"]
   let file_read := String.intercalate "\n" [
     "builtin \"fread\" [destination, size, count, value] = do",
     "  total <- transferSize size count",
@@ -1191,7 +1219,8 @@ def validates_process (generated : String) : Bool :=
     "      hPutStrLn stderr (\"heresy panic: \" ++ message)",
     "      unless (enabled || null (recent final)) $ hPutStrLn stderr (intercalate \"\\n\" (reverse (recent final)))",
     "      exitWith (ExitFailure 70)"]
-  [transformer, finish, file_read, epilogue].all (fun equation => (generated.splitOn ("\n" ++ equation ++ "\n")).length == 2)
+  [transformer, finish, stream_seed, stream_lookup, register, close, file_read, epilogue].all
+    (fun equation => (generated.splitOn ("\n" ++ equation ++ "\n")).length == 2)
 
 private def validates_aggregate_memory (generated : String) : Bool :=
   let load := "        AggregateType size alignment -> Aggregate size alignment (aggregateBytes displacement size (bytes object)) (aggregateShadow displacement size (shadow object))"
@@ -1315,9 +1344,9 @@ def main (arguments : List String) : IO UInt32 := do
     | .error message => IO.eprintln message; pure 1
   | ["process", haskell] =>
     if Heresy.validates_process (← IO.FS.readFile haskell) then
-      IO.println "checked file reads, process termination and cleanup equations"; pure 0
+      IO.println "checked stream operations, process termination and cleanup equations"; pure 0
     else
-      IO.eprintln "file reads, process termination or cleanup differ from the model"; pure 1
+      IO.eprintln "stream operations, process termination or cleanup differ from the model"; pure 1
   | ["memory", haskell] =>
     let generated ← IO.FS.readFile haskell
     if !Heresy.validates_access generated then

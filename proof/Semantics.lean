@@ -458,6 +458,124 @@ theorem process_exit_is_final (handles : List Nat) (outcome : ProcessOutcome) :
           .stderr (String.intercalate "\n" recent.reverse)],
         by simp [process_epilogue, process_report, immediate, List.append_assoc], by simp⟩
 
+structure StreamToken where
+  ident : Nat
+  address : Int
+
+structure StreamTable (α : Type) where
+  next : Nat
+  handles : Nat → Option α
+
+def stream_address (ident : Nat) : Int := 4611686018427387904 + ident
+
+def stream_lookup (table : StreamTable α) (token : StreamToken) : Option α :=
+  if token.address = stream_address token.ident then table.handles token.ident else none
+
+def register_stream (table : StreamTable α) (handle : α) : Option (StreamToken × StreamTable α) :=
+  if table.next < 4611686018427387904 then
+    let key := table.next
+    some (⟨key, stream_address key⟩, ⟨key + 1, fun ident => if ident = key then some handle else table.handles ident⟩)
+  else none
+
+def unregister_stream (table : StreamTable α) (token : StreamToken) : Option (StreamTable α) :=
+  match stream_lookup table token with
+  | none => none
+  | some _ => some { table with handles := fun ident => if ident = token.ident then none else table.handles ident }
+
+def StreamTable.valid (table : StreamTable α) : Prop :=
+  ∀ ident handle, table.handles ident = some handle → ident < table.next
+
+theorem registered_stream_address_range (table after : StreamTable α) (handle : α) (token : StreamToken)
+    (registered : register_stream table handle = some (token, after)) :
+    token.address = stream_address token.ident ∧
+      4611686018427387904 ≤ token.address ∧ token.address < 9223372036854775808 := by
+  by_cases fits : table.next < 4611686018427387904
+  · simp [register_stream, fits] at registered
+    obtain ⟨rfl, _⟩ := registered
+    change _ ∧ 4611686018427387904 ≤ stream_address table.next ∧ stream_address table.next < 9223372036854775808
+    exact ⟨rfl, by unfold stream_address; omega, by unfold stream_address; omega⟩
+  · simp [register_stream, fits] at registered
+
+inductive StreamStep : StreamTable α → StreamTable α → Prop where
+  | opened : register_stream before handle = some (token, after) → StreamStep before after
+  | closed : unregister_stream before token = some after → StreamStep before after
+
+theorem stream_step_preserves_valid (before after : StreamTable α) (step : StreamStep before after)
+    (valid : before.valid) : after.valid := by
+  intro ident handle found
+  cases step with
+  | opened registered =>
+    by_cases fits : before.next < 4611686018427387904
+    · simp [register_stream, fits] at registered
+      obtain ⟨_, rfl⟩ := registered
+      by_cases allocated : ident = before.next
+      · simp [allocated]
+      · have earlier := valid ident handle (by simpa [allocated] using found)
+        exact Nat.lt_succ_of_lt earlier
+    · simp [register_stream, fits] at registered
+  | closed unregistered =>
+    rename_i token
+    cases lookup : stream_lookup before token with
+    | none => simp [unregister_stream, lookup] at unregistered
+    | some previous =>
+      simp [unregister_stream, lookup] at unregistered
+      subst after
+      by_cases erased : ident = token.ident
+      · simp [erased] at found
+      · exact valid ident handle (by simpa [erased] using found)
+
+theorem stream_step_preserves_retired (before after : StreamTable α) (step : StreamStep before after)
+    (ident : Nat) (retired : ident < before.next ∧ before.handles ident = none) :
+    ident < after.next ∧ after.handles ident = none := by
+  cases step with
+  | opened registered =>
+    by_cases fits : before.next < 4611686018427387904
+    · simp [register_stream, fits] at registered
+      obtain ⟨_, rfl⟩ := registered
+      exact ⟨Nat.lt_succ_of_lt retired.1, by simp [Nat.ne_of_lt retired.1, retired.2]⟩
+    · simp [register_stream, fits] at registered
+  | closed unregistered =>
+    rename_i token
+    cases found : stream_lookup before token with
+    | none => simp [unregister_stream, found] at unregistered
+    | some handle =>
+      simp [unregister_stream, found] at unregistered
+      subst after
+      exact ⟨retired.1, by simp [retired.2]⟩
+
+inductive StreamTrace : StreamTable α → StreamTable α → Prop where
+  | start : StreamTrace state state
+  | step : StreamTrace before middle → StreamStep middle after → StreamTrace before after
+
+theorem stream_trace_valid (after : StreamTable α)
+    (trace : StreamTrace ⟨1, fun _ => none⟩ after) : after.valid := by
+  induction trace with
+  | start => intro ident handle found; contradiction
+  | step _ action earlier => exact stream_step_preserves_valid _ _ action earlier
+
+theorem closed_stream_stays_invalid (before closed after : StreamTable α) (token alias : StreamToken)
+    (valid : before.valid) (same : alias.ident = token.ident) (success : unregister_stream before token = some closed)
+    (trace : StreamTrace closed after) : stream_lookup after alias = none := by
+  have initially_retired : token.ident < closed.next ∧ closed.handles token.ident = none := by
+    cases found : stream_lookup before token with
+    | none => simp [unregister_stream, found] at success
+    | some handle =>
+      have looked_up : before.handles token.ident = some handle := by
+        unfold stream_lookup at found
+        split at found <;> simp_all
+      simp [unregister_stream, found] at success
+      subst closed
+      exact ⟨valid _ _ looked_up, by simp⟩
+  have still_retired : token.ident < after.next ∧ after.handles token.ident = none := by
+    induction trace with
+    | start => exact initially_retired
+    | step _ action earlier => exact stream_step_preserves_retired _ _ action _ earlier
+  simp [stream_lookup, same, still_retired.2]
+
+theorem wrong_stream_address_is_rejected (table : StreamTable α) (token : StreamToken)
+    (invalid : token.address ≠ stream_address token.ident) : stream_lookup table token = none := by
+  simp [stream_lookup, invalid]
+
 end Heresy
 
 #print axioms Heresy.approximation_sound
@@ -466,3 +584,7 @@ end Heresy
 #print axioms Heresy.process_return
 #print axioms Heresy.process_closes_then_flushes
 #print axioms Heresy.process_exit_is_final
+#print axioms Heresy.closed_stream_stays_invalid
+#print axioms Heresy.wrong_stream_address_is_rejected
+#print axioms Heresy.stream_trace_valid
+#print axioms Heresy.registered_stream_address_range
