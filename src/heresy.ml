@@ -2569,7 +2569,7 @@ let main () =
   let specs = [
     "-o", Arg.Set_string output, "FILE standalone generated Haskell";
     "--build", Arg.Set_string executable, "FILE executable output";
-    "--ast-dir", Arg.Set_string ast_directory, "DIRECTORY write the prepared typed ASTs as numbered JSON files";
+    "--ast-dir", Arg.Set_string ast_directory, "DIRECTORY write numbered typed ASTs and compile the standalone module if building";
     "--check", Arg.Set check, " validate the supported language subset without writing output";
     "--closed", Arg.Set closed, " lower a closed integer program for whole-program certification";
     "--explain", Arg.Set report, " report lowering decisions";
@@ -2637,7 +2637,7 @@ let main () =
         let code = Process.run ~timeout:!timeout !ghc args in
         if code <> 0 then raise (Error ("GHC exited with status " ^ string_of_int code))
       in
-      if !closed then begin
+      if !closed || !ast_directory <> "" then begin
         write main generated;
         run (options @ ["-outputdir"; workspace; main; "-o"; target])
       end else begin

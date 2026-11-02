@@ -20,8 +20,9 @@ jobs:
           lake exe certificate memory /tmp/Values.hs &&
           lake exe certificate process /tmp/Values.hs &&
           lake exe certificate linkage /tmp/Values.hs /tmp/values/0.json &&
-          dune exec --profile release -- heresy test/linkage/entry.c test/linkage/worker.c -o /tmp/Linkage.hs --ast-dir /tmp/units &&
+          dune exec --profile release -- heresy test/linkage/entry.c test/linkage/worker.c -o /tmp/Linkage.hs --ast-dir /tmp/units --build /tmp/linked &&
           lake exe certificate linkage /tmp/Linkage.hs /tmp/units/0.json /tmp/units/1.json &&
+          test "$(/tmp/linked)" = "linkage 4 18 42 18 9 1" &&
           ! lake exe certificate linkage /tmp/Linkage.hs /tmp/units/1.json /tmp/units/0.json &&
           sed "/^main = execute/s/] True (/] False (/" /tmp/Linkage.hs > /tmp/Disabled.hs &&
           ! lake exe certificate linkage /tmp/Disabled.hs /tmp/units/0.json /tmp/units/1.json &&
