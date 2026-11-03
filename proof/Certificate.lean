@@ -930,7 +930,7 @@ private def order_helpers (helpers : List Json) (source_depth : Nat) : Except St
     seen ← visit_helper definitions source_depth (helpers.length + 1) seen (field_text definition "name")
   pure (seen.reversed.reverse, seen.recursive)
 
-private inductive ClosedProgram where
+inductive ClosedProgram where
   | direct (helpers : List (Helper Source)) (body : Command Source)
   | framed (helpers : List (Helper (Command Source))) (body : Command Source)
 
@@ -939,7 +939,7 @@ private def single_return (block : Json) : Bool :=
   | [statement] => field_text statement "kind" == "ReturnStmt" && (child_nodes statement).length == 1
   | _ => false
 
-private def closed_source (frontend : String) : Except String ClosedProgram := do
+def closed_source (frontend : String) : Except String ClosedProgram := do
   let tree ← Json.parse frontend
   unless field_text tree "kind" == "TranslationUnitDecl" do
     throw "expected a translation unit"
@@ -1143,16 +1143,73 @@ theorem certified_helper_uses_bound_arguments (helpers : List (Helper Source)) (
   simp only [validates_program, Bool.and_eq_true] at accepted
   exact lowered_helper_uses_bound_arguments helpers accepted.1 slot helper found inputs other bound_arguments
 
-def validate_program (frontend generated : String) : Except String Unit := do
-  match ← closed_source frontend with
+def validate_program (frontend generated : String) : Except String Unit :=
+  match closed_source frontend with
+  | .error message => .error message
+  | .ok (.direct helpers body) =>
+    if validates_program helpers body generated then .ok ()
+    else .error "emitted program differs from verified lowering"
+  | .ok (.framed helpers body) =>
+    if !check_frame_helpers (helpers.toArray.map Helper.arity) helpers then
+      .error "closed helper can fall through or use an out-of-scope call"
+    else if validates_framed_program helpers body generated then .ok ()
+    else .error "emitted program differs from verified framed lowering"
+
+def ClosedProgram.haskell : ClosedProgram → String
+  | .direct helpers body => render_program (helpers.map Helper.lower) (body.map lower)
+  | .framed helpers body => render_framed_program (helpers.map lower_frame) (body.map lower)
+
+def ClosedProgram.filc_exit : ClosedProgram → Int → Prop
+  | .direct helpers body => source_observes_with (link_helpers source_eval_with 0 helpers no_calls) body
+  | .framed helpers body => source_observes_exit helpers.toArray body
+
+def ClosedProgram.haskell_exit : ClosedProgram → Int → Prop
   | .direct helpers body =>
-    unless validates_program helpers body generated do
-      throw "emitted program differs from verified lowering"
-  | .framed helpers body =>
-    unless check_frame_helpers (helpers.toArray.map Helper.arity) helpers do
-      throw "closed helper can fall through or use an out-of-scope call"
-    unless validates_framed_program helpers body generated do
-      throw "emitted program differs from verified framed lowering"
+    target_observes_with (link_helpers target_eval_with 0 (helpers.map Helper.lower) no_calls) (body.map lower)
+  | .framed helpers body => fun status =>
+    ∃ fuel, recursive_target_exit (helpers.toArray.map lower_frame) (body.map lower) fuel = some status
+
+theorem checked_closed_source (frontend generated : String) (accepted : validate_program frontend generated = .ok ()) :
+    ∃ program, closed_source frontend = .ok program ∧ generated = program.haskell := by
+  cases parsed : closed_source frontend with
+  | error why => simp [validate_program, parsed] at accepted
+  | ok program =>
+    refine ⟨program, rfl, ?_⟩
+    cases program with
+    | direct helpers body =>
+      by_cases valid : validates_program helpers body generated = true
+      · simp only [validates_program, Bool.and_eq_true, beq_iff_eq] at valid
+        exact valid.2.2.2
+      · simp [validate_program, parsed, valid] at accepted
+    | framed helpers body =>
+      by_cases checked : check_frame_helpers (helpers.toArray.map Helper.arity) helpers = true
+      · by_cases valid : validates_framed_program helpers body generated = true
+        · exact (framed_program_certificate_sound helpers body generated valid).1
+        · simp at checked
+          simp [validate_program, parsed, checked, valid] at accepted
+      · have rejected := Bool.eq_false_iff.mpr checked
+        simp at rejected
+        simp [validate_program, parsed, rejected] at accepted
+
+theorem closed_executable_exit_refines (input : Input) (artifact : Executable) (json generated : String)
+    (frontend : Input → Except String String) (ghc : String → Except String Executable)
+    (native_exit : Input → Int → Prop) (executable_exit : Executable → Int → Prop)
+    (dumped : frontend input = .ok json) (built : ghc generated = .ok artifact)
+    (certified : validate_program json generated = .ok ())
+    (frontend_adequate : ∀ program : ClosedProgram, frontend input = .ok json → closed_source json = .ok program →
+      ∀ status, native_exit input status ↔ program.filc_exit status)
+    (ghc_host_adequate : ∀ program : ClosedProgram, ghc program.haskell = .ok artifact →
+      ∀ status, executable_exit artifact status ↔ program.haskell_exit status) :
+    ∀ status, executable_exit artifact status ↔ native_exit input status := by
+  obtain ⟨program, parsed, rendered⟩ := checked_closed_source json generated certified
+  have target := ghc_host_adequate program (rendered ▸ built)
+  have source := frontend_adequate program dumped parsed
+  intro status
+  have model : program.haskell_exit status ↔ program.filc_exit status := by
+    cases program with
+    | direct helpers body => exact linked_program_correct helpers body status
+    | framed helpers body => exact recursive_target_refines helpers.toArray body status
+  exact (target status).trans (model.trans (source status).symm)
 
 def validates_process (generated : String) : Bool :=
   let transformer := String.intercalate "\n" [
@@ -1325,6 +1382,7 @@ end Heresy
 #print axioms Heresy.kernel_certificate_sound
 #print axioms Heresy.program_certificate_sound
 #print axioms Heresy.framed_program_certificate_sound
+#print axioms Heresy.closed_executable_exit_refines
 #print axioms Heresy.certified_helper_uses_bound_arguments
 #print axioms Heresy.link_schedule_order
 #print axioms Heresy.linkage_certificate_routes
