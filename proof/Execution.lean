@@ -553,6 +553,374 @@ theorem recursive_observations_correct (helpers : Array (Helper (Command Source)
       ∃ fuel, recursive_source_exit helpers body fuel = some status := by
   simp only [recursive_exit_correct]
 
+inductive LoopPhase where
+  | test
+  | body
+  | advance
+
+def LoopPhase.block : LoopPhase → Nat
+  | .test => 0
+  | .body => 1
+  | .advance => 2
+
+inductive LoopFlow (value : Type) where
+  | next
+  | continue
+  | stop
+  | returned (result : value)
+
+structure LoopActions (state fault value : Type) where
+  test : state → Except fault Bool × state
+  body : state → Except fault (LoopFlow value) × state
+  advance : state → Except fault Unit × state
+
+abbrev LoopResult (fault value : Type) := Except fault (Option value)
+
+inductive LoopEvaluates (actions : LoopActions state fault value) :
+    LoopPhase → state → LoopResult fault value → state → Prop where
+  | test_fault : actions.test initial = (.error why, final) → LoopEvaluates actions .test initial (.error why) final
+  | test_false : actions.test initial = (.ok false, final) → LoopEvaluates actions .test initial (.ok none) final
+  | test_true : actions.test initial = (.ok true, next) → LoopEvaluates actions .body next result final →
+      LoopEvaluates actions .test initial result final
+  | body_fault : actions.body initial = (.error why, final) → LoopEvaluates actions .body initial (.error why) final
+  | body_break : actions.body initial = (.ok .stop, final) → LoopEvaluates actions .body initial (.ok none) final
+  | body_return : actions.body initial = (.ok (.returned returned), final) →
+      LoopEvaluates actions .body initial (.ok (some returned)) final
+  | body_next : actions.body initial = (.ok .next, next) → LoopEvaluates actions .advance next result final →
+      LoopEvaluates actions .body initial result final
+  | body_continue : actions.body initial = (.ok .continue, next) → LoopEvaluates actions .advance next result final →
+      LoopEvaluates actions .body initial result final
+  | advance_fault : actions.advance initial = (.error why, final) → LoopEvaluates actions .advance initial (.error why) final
+  | advance_next : actions.advance initial = (.ok (), next) → LoopEvaluates actions .test next result final →
+      LoopEvaluates actions .advance initial result final
+
+def loop_blocks (actions : LoopActions state fault value) : Blocks state (LoopResult fault value) :=
+  fun index initial => match index with
+  | 0 => some (match actions.test initial with
+    | (.error why, final) => .stop (.error why) final
+    | (.ok false, final) => .stop (.ok none) final
+    | (.ok true, next) => .jump LoopPhase.body.block next)
+  | 1 => some (match actions.body initial with
+    | (.error why, final) => .stop (.error why) final
+    | (.ok .stop, final) => .stop (.ok none) final
+    | (.ok (.returned returned), final) => .stop (.ok (some returned)) final
+    | (.ok .next, next) | (.ok .continue, next) => .jump LoopPhase.advance.block next)
+  | 2 => some (match actions.advance initial with
+    | (.error why, final) => .stop (.error why) final
+    | (.ok (), next) => .jump LoopPhase.test.block next)
+  | _ => none
+
+private theorem loop_evaluation_compiles (actions : LoopActions state fault value) (phase : LoopPhase)
+    (initial final : state) (result : LoopResult fault value) (execution : LoopEvaluates actions phase initial result final) :
+    Terminates (loop_blocks actions) phase.block initial result final := by
+  induction execution with
+  | test_fault observed => exact .stop (by simp [loop_blocks, LoopPhase.block, observed])
+  | test_false observed => exact .stop (by simp [loop_blocks, LoopPhase.block, observed])
+  | test_true observed _ later => exact .jump (by simp [loop_blocks, LoopPhase.block, observed]) later
+  | body_fault observed => exact .stop (by simp [loop_blocks, LoopPhase.block, observed])
+  | body_break observed => exact .stop (by simp [loop_blocks, LoopPhase.block, observed])
+  | body_return observed => exact .stop (by simp [loop_blocks, LoopPhase.block, observed])
+  | body_next observed _ later => exact .jump (by simp [loop_blocks, LoopPhase.block, observed]) later
+  | body_continue observed _ later => exact .jump (by simp [loop_blocks, LoopPhase.block, observed]) later
+  | advance_fault observed => exact .stop (by simp [loop_blocks, LoopPhase.block, observed])
+  | advance_next observed _ later => exact .jump (by simp [loop_blocks, LoopPhase.block, observed]) later
+
+private theorem loop_dispatch_reflects (actions : LoopActions state fault value) (entry : Nat)
+    (initial final : state) (result : LoopResult fault value)
+    (execution : Terminates (loop_blocks actions) entry initial result final) :
+    ∀ phase, phase.block = entry → LoopEvaluates actions phase initial result final := by
+  induction execution with
+  | @stop entry initial result final edge =>
+    rintro phase rfl
+    cases phase with
+    | test =>
+      cases observed : actions.test initial with
+      | mk outcome after =>
+        cases outcome with
+        | error why =>
+          simp [loop_blocks, LoopPhase.block, observed] at edge
+          obtain ⟨rfl, rfl⟩ := edge
+          exact .test_fault observed
+        | ok condition =>
+          cases condition <;> simp [loop_blocks, LoopPhase.block, observed] at edge
+          obtain ⟨rfl, rfl⟩ := edge
+          exact .test_false observed
+    | body =>
+      cases observed : actions.body initial with
+      | mk outcome after =>
+        cases outcome with
+        | error why =>
+          simp [loop_blocks, LoopPhase.block, observed] at edge
+          obtain ⟨rfl, rfl⟩ := edge
+          exact .body_fault observed
+        | ok flow =>
+          cases flow <;> simp [loop_blocks, LoopPhase.block, observed] at edge
+          · obtain ⟨rfl, rfl⟩ := edge
+            exact .body_break observed
+          · obtain ⟨rfl, rfl⟩ := edge
+            exact .body_return observed
+    | advance =>
+      cases observed : actions.advance initial with
+      | mk outcome after =>
+        cases outcome with
+        | error why =>
+          simp [loop_blocks, LoopPhase.block, observed] at edge
+          obtain ⟨rfl, rfl⟩ := edge
+          exact .advance_fault observed
+        | ok _ => simp [loop_blocks, LoopPhase.block, observed] at edge
+  | @jump entry initial target after result final edge _ later =>
+    rintro phase rfl
+    cases phase with
+    | test =>
+      cases observed : actions.test initial with
+      | mk outcome state =>
+        cases outcome with
+        | error why => simp [loop_blocks, LoopPhase.block, observed] at edge
+        | ok condition =>
+          cases condition <;> simp [loop_blocks, LoopPhase.block, observed] at edge
+          obtain ⟨rfl, rfl⟩ := edge
+          exact .test_true observed (later .body rfl)
+    | body =>
+      cases observed : actions.body initial with
+      | mk outcome state =>
+        cases outcome with
+        | error why => simp [loop_blocks, LoopPhase.block, observed] at edge
+        | ok flow =>
+          cases flow <;> simp [loop_blocks, LoopPhase.block, observed] at edge
+          · obtain ⟨rfl, rfl⟩ := edge
+            exact .body_next observed (later .advance rfl)
+          · obtain ⟨rfl, rfl⟩ := edge
+            exact .body_continue observed (later .advance rfl)
+    | advance =>
+      cases observed : actions.advance initial with
+      | mk outcome state =>
+        cases outcome with
+        | error why => simp [loop_blocks, LoopPhase.block, observed] at edge
+        | ok done =>
+          cases done
+          simp [loop_blocks, LoopPhase.block, observed] at edge
+          obtain ⟨rfl, rfl⟩ := edge
+          exact .advance_next observed (later .test rfl)
+
+theorem loop_dispatch_preserves_execution (actions : LoopActions state fault value) (phase : LoopPhase)
+    (initial final : state) (result : LoopResult fault value) :
+    Terminates (loop_blocks actions) phase.block initial result final ↔ LoopEvaluates actions phase initial result final :=
+  ⟨fun execution => loop_dispatch_reflects actions _ _ _ _ execution phase rfl,
+    loop_evaluation_compiles actions phase initial final result⟩
+
+def loop_graph (phase : LoopPhase) : DispatchGraph := ⟨phase.block, [[1], [2], [0]]⟩
+
+def loop_actions (actions : LoopActions state fault value) : List (state → Option (Transfer state (LoopResult fault value))) :=
+  [loop_blocks actions 0, loop_blocks actions 1, loop_blocks actions 2]
+
+private theorem loop_guard_preserves_blocks (actions : LoopActions state fault value) (phase : LoopPhase) :
+    guarded_blocks (loop_graph phase) (loop_actions actions) = loop_blocks actions := by
+  funext index initial
+  cases index with
+  | zero =>
+    cases tested : actions.test initial with
+    | mk outcome after =>
+      cases outcome with
+      | error _ => simp [guarded_blocks, loop_graph, loop_actions, loop_blocks, tested]
+      | ok result => cases result <;> simp [guarded_blocks, loop_graph, loop_actions, loop_blocks, LoopPhase.block, tested]
+  | succ index =>
+    cases index with
+    | zero =>
+      cases evaluated : actions.body initial with
+      | mk outcome after =>
+        cases outcome with
+        | error _ => simp [guarded_blocks, loop_graph, loop_actions, loop_blocks, evaluated]
+        | ok flow => cases flow <;> simp [guarded_blocks, loop_graph, loop_actions, loop_blocks, LoopPhase.block, evaluated]
+    | succ index =>
+      cases index with
+      | zero =>
+        cases advanced : actions.advance initial with
+        | mk outcome after =>
+          cases outcome with
+          | error _ => simp [guarded_blocks, loop_graph, loop_actions, loop_blocks, advanced]
+          | ok done => cases done; simp [guarded_blocks, loop_graph, loop_actions, loop_blocks, LoopPhase.block, advanced]
+      | succ index => simp [guarded_blocks, loop_graph, loop_actions, loop_blocks]
+
+theorem guarded_loop_preserves_execution (actions : LoopActions state fault value) (phase : LoopPhase)
+    (initial final : state) (result : LoopResult fault value) :
+    (∃ fuel, run_blocks (guarded_blocks (loop_graph phase) (loop_actions actions)) fuel (loop_graph phase).entry initial =
+      some (result, final)) ↔ LoopEvaluates actions phase initial result final := by
+  rw [loop_guard_preserves_blocks]
+  exact (run_blocks_correct (loop_blocks actions) phase.block initial final result).trans
+    (loop_dispatch_preserves_execution actions phase initial final result)
+
+def RelatedAction (related : source → target → Prop) (left : source → outcome × source)
+    (right : target → outcome × target) : Prop :=
+  ∀ before initial, related before initial →
+    (left before).1 = (right initial).1 ∧ related (left before).2 (right initial).2
+
+structure RelatedLoopActions (related : source → target → Prop) (left : LoopActions source fault value)
+    (right : LoopActions target fault value) : Prop where
+  test : RelatedAction related left.test right.test
+  body : RelatedAction related left.body right.body
+  advance : RelatedAction related left.advance right.advance
+
+private theorem RelatedAction.advance (related : source → target → Prop) {left : source → outcome × source}
+    {right : target → outcome × target} (corresponds : RelatedAction related left right)
+    {before after : source} {initial : target} {result : outcome} (paired : related before initial)
+    (executed : left before = (result, after)) :
+    ∃ next, right initial = (result, next) ∧ related after next := by
+  have crossed := corresponds before initial paired
+  rw [executed] at crossed
+  exact ⟨(right initial).2, Prod.ext crossed.1.symm rfl, crossed.2⟩
+
+private theorem RelatedAction.swap {related : source → target → Prop} {left : source → outcome × source}
+    {right : target → outcome × target} (corresponds : RelatedAction related left right) :
+    RelatedAction (fun target source => related source target) right left := by
+  intro initial before paired
+  have crossed := corresponds before initial paired
+  exact ⟨crossed.1.symm, crossed.2⟩
+
+def bind_action (first : state → Except fault α × state)
+    (rest : α → state → Except fault β × state) (initial : state) : Except fault β × state :=
+  match first initial with
+  | (.error why, final) => (.error why, final)
+  | (.ok value, next) => rest value next
+
+private theorem RelatedAction.bind {related : source → target → Prop}
+    {left : source → Except fault α × source} {right : target → Except fault α × target}
+    {then_left : α → source → Except fault β × source} {then_right : α → target → Except fault β × target}
+    (first : RelatedAction related left right) (rest : ∀ value, RelatedAction related (then_left value) (then_right value)) :
+    RelatedAction related (bind_action left then_left) (bind_action right then_right) := by
+  intro before initial paired
+  cases executed : left before with
+  | mk result after =>
+    obtain ⟨next, matched, paired⟩ := first.advance related paired executed
+    cases result with
+    | error why => simpa [bind_action, executed, matched] using paired
+    | ok value => simpa [bind_action, executed, matched] using rest value after next paired
+
+def branch_action (test : state → Except fault Bool × state)
+    (yes no : state → Except fault value × state) : state → Except fault value × state :=
+  bind_action test (fun result => if result then yes else no)
+
+theorem related_branch_preserves_execution {related : source → target → Prop}
+    {source_test : source → Except fault Bool × source} {target_test : target → Except fault Bool × target}
+    {source_yes source_no : source → Except fault value × source} {target_yes target_no : target → Except fault value × target}
+    (tests : RelatedAction related source_test target_test) (yes : RelatedAction related source_yes target_yes)
+    (no : RelatedAction related source_no target_no) :
+    RelatedAction related (branch_action source_test source_yes source_no) (branch_action target_test target_yes target_no) := by
+  apply tests.bind
+  intro result
+  cases result
+  · exact no
+  · exact yes
+
+def logic_action (conjunction : Bool) (left right : state → Except fault Bool × state) :
+    state → Except fault Bool × state :=
+  bind_action left (fun result => if result = conjunction then right else fun state => (.ok (!conjunction), state))
+
+theorem related_logic_preserves_execution {related : source → target → Prop} (conjunction : Bool)
+    {source_left source_right : source → Except fault Bool × source} {target_left target_right : target → Except fault Bool × target}
+    (left : RelatedAction related source_left target_left) (right : RelatedAction related source_right target_right) :
+    RelatedAction related (logic_action conjunction source_left source_right) (logic_action conjunction target_left target_right) := by
+  apply left.bind
+  intro result
+  by_cases evaluates : result = conjunction
+  · simpa [evaluates] using right
+  · intro before initial paired
+    simpa [evaluates] using paired
+
+def chain_actions : List (state → Except fault (LoopFlow value) × state) → state → Except fault (LoopFlow value) × state
+  | [] => fun initial => (.ok .next, initial)
+  | action :: rest => bind_action action (fun
+    | .next => chain_actions rest
+    | flow => fun initial => (.ok flow, initial))
+
+theorem related_chain_preserves_execution (related : source → target → Prop)
+    (actions : List ((source → Except fault (LoopFlow value) × source) × (target → Except fault (LoopFlow value) × target)))
+    (corresponds : ∀ action ∈ actions, RelatedAction related action.1 action.2) :
+    RelatedAction related (chain_actions (actions.map Prod.fst)) (chain_actions (actions.map Prod.snd)) := by
+  induction actions with
+  | nil => intro before initial paired; exact ⟨rfl, paired⟩
+  | cons first rest induction_rest =>
+    have head := corresponds first (by simp)
+    have tail := induction_rest (fun action included => corresponds action (List.mem_cons_of_mem _ included))
+    apply head.bind
+    intro flow
+    cases flow
+    · exact tail
+    all_goals intro before initial paired; exact ⟨rfl, paired⟩
+
+theorem related_loop_actions_preserve_execution (related : source → target → Prop)
+    (left : LoopActions source fault value) (right : LoopActions target fault value)
+    (actions : RelatedLoopActions related left right) (phase : LoopPhase) (before after : source)
+    (result : LoopResult fault value) (execution : LoopEvaluates left phase before result after) :
+    ∀ initial, related before initial → ∃ final, LoopEvaluates right phase initial result final ∧ related after final := by
+  induction execution with
+  | test_fault observed =>
+    intro initial paired
+    obtain ⟨after, tested, paired⟩ := actions.test.advance related paired observed
+    exact ⟨after, .test_fault tested, paired⟩
+  | test_false observed =>
+    intro initial paired
+    obtain ⟨after, tested, paired⟩ := actions.test.advance related paired observed
+    exact ⟨after, .test_false tested, paired⟩
+  | test_true observed _ later =>
+    intro initial paired
+    obtain ⟨next, tested, paired⟩ := actions.test.advance related paired observed
+    obtain ⟨final, finished, matched⟩ := later next paired
+    exact ⟨final, .test_true tested finished, matched⟩
+  | body_fault observed =>
+    intro initial paired
+    obtain ⟨after, executed, paired⟩ := actions.body.advance related paired observed
+    exact ⟨after, .body_fault executed, paired⟩
+  | body_break observed =>
+    intro initial paired
+    obtain ⟨after, executed, paired⟩ := actions.body.advance related paired observed
+    exact ⟨after, .body_break executed, paired⟩
+  | body_return observed =>
+    intro initial paired
+    obtain ⟨after, executed, paired⟩ := actions.body.advance related paired observed
+    exact ⟨after, .body_return executed, paired⟩
+  | body_next observed _ later =>
+    intro initial paired
+    obtain ⟨next, executed, paired⟩ := actions.body.advance related paired observed
+    obtain ⟨final, finished, matched⟩ := later next paired
+    exact ⟨final, .body_next executed finished, matched⟩
+  | body_continue observed _ later =>
+    intro initial paired
+    obtain ⟨next, executed, paired⟩ := actions.body.advance related paired observed
+    obtain ⟨final, finished, matched⟩ := later next paired
+    exact ⟨final, .body_continue executed finished, matched⟩
+  | advance_fault observed =>
+    intro initial paired
+    obtain ⟨after, advanced, paired⟩ := actions.advance.advance related paired observed
+    exact ⟨after, .advance_fault advanced, paired⟩
+  | advance_next observed _ later =>
+    intro initial paired
+    obtain ⟨next, advanced, paired⟩ := actions.advance.advance related paired observed
+    obtain ⟨final, finished, matched⟩ := later next paired
+    exact ⟨final, .advance_next advanced finished, matched⟩
+
+theorem guarded_loop_preserves_observations (related : source → target → Prop)
+    (left : LoopActions source fault value) (right : LoopActions target fault value)
+    (actions : RelatedLoopActions related left right) (phase : LoopPhase) (before : source) (initial : target)
+    (paired : related before initial) (observe_source : source → observation) (observe_target : target → observation)
+    (agrees : ∀ source target, related source target → observe_source source = observe_target target)
+    (result : LoopResult fault value) (observed : observation) :
+    (∃ fuel final, run_blocks (guarded_blocks (loop_graph phase) (loop_actions right)) fuel phase.block initial =
+      some (result, final) ∧ observe_target final = observed) ↔
+    ∃ after, LoopEvaluates left phase before result after ∧ observe_source after = observed := by
+  constructor
+  · rintro ⟨fuel, final, executed, visible⟩
+    have finished := (guarded_loop_preserves_execution right phase initial final result).mp ⟨fuel, executed⟩
+    have converse : RelatedLoopActions (fun target source => related source target) right left :=
+      ⟨actions.test.swap, actions.body.swap, actions.advance.swap⟩
+    obtain ⟨after, evaluated, matched⟩ :=
+      related_loop_actions_preserve_execution _ right left converse phase _ _ _ finished before paired
+    exact ⟨after, evaluated, (agrees after final matched).trans visible⟩
+  · rintro ⟨after, evaluated, visible⟩
+    obtain ⟨final, finished, matched⟩ :=
+      related_loop_actions_preserve_execution related left right actions phase before after result evaluated initial paired
+    obtain ⟨fuel, executed⟩ := (guarded_loop_preserves_execution right phase initial final result).mpr finished
+    exact ⟨fuel, final, executed, (agrees after final matched).symm.trans visible⟩
+
 end Heresy
 
 #print axioms Heresy.framed_link_correct
@@ -564,3 +932,9 @@ end Heresy
 #print axioms Heresy.recursive_calls_correct
 #print axioms Heresy.recursive_source_exit_extends
 #print axioms Heresy.recursive_observations_correct
+#print axioms Heresy.loop_dispatch_preserves_execution
+#print axioms Heresy.guarded_loop_preserves_execution
+#print axioms Heresy.guarded_loop_preserves_observations
+#print axioms Heresy.related_branch_preserves_execution
+#print axioms Heresy.related_logic_preserves_execution
+#print axioms Heresy.related_chain_preserves_execution
