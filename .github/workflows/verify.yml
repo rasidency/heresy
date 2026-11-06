@@ -15,8 +15,12 @@ jobs:
           '"$FILCC" -std=c11 -fsyntax-only -Xclang -ast-dump=json examples/machine.c > /tmp/machine.json &&
           dune exec --profile release -- heresy examples/machine.c -o /tmp/Machine.hs &&
           lake exe certificate /tmp/machine.json /tmp/Machine.hs &&
+          sed "/^f_.* = at /s/(number a0)/0/" /tmp/Machine.hs > /tmp/ChangedKernel.hs &&
+          ! lake exe certificate /tmp/machine.json /tmp/ChangedKernel.hs &&
           dune exec --profile release -- heresy test/values.c -o /tmp/Values.hs --ast-dir /tmp/values &&
           lake exe certificate dispatch /tmp/Values.hs &&
+          sed "s/^      _ -> advance >> loop condition body advance$/      _ -> loop condition body advance/" /tmp/Values.hs > /tmp/ChangedLoop.hs &&
+          ! lake exe certificate dispatch /tmp/ChangedLoop.hs &&
           lake exe certificate memory /tmp/Values.hs &&
           lake exe certificate process /tmp/Values.hs &&
           lake exe certificate linkage /tmp/Values.hs /tmp/values/0.json &&

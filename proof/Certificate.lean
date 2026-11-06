@@ -370,11 +370,82 @@ private def has_normalisation : List String → Bool
         "  in if signed && bits >= modulus `div` 2 then bits - modulus else bits"]
     else has_normalisation rest
 
+private def kernel_entry_pattern (arity : Nat) : String :=
+  if arity = 0 then "_" else
+    "(" ++ String.intercalate " : " ((List.range arity).map (fun index => "a" ++ toString index) ++ ["_"]) ++ ")"
+
+private def kernel_entry_body (name : String) (arity : Nat) : String :=
+  let arguments := (List.range arity).map (fun index => "(number a" ++ toString index ++ ")")
+  " (marshal (IntegerType 64 False) <$> (pure (Number (" ++ kernel_symbol name ++ " " ++
+    String.intercalate " " arguments ++ "))))"
+
+private def kernel_location_tail : List Char → Bool
+  | ['"'] => true
+  | '"' :: _ => false
+  | '\\' :: _ :: rest => kernel_location_tail rest
+  | '\\' :: [] => false
+  | _ :: rest => kernel_location_tail rest
+  | [] => false
+
+private def kernel_entry_head (name : String) (arity : Nat) : String :=
+  hex_binding "f" name ++ " " ++ kernel_entry_pattern arity ++ " = at \""
+
+private def kernel_entry_equation (name : String) (arity : Nat) (line : String) : Bool :=
+  let head := kernel_entry_head name arity
+  let body := kernel_entry_body name arity
+  let location := (line.drop head.length).take (line.length - head.length - body.length)
+  kernel_location_tail location.toList && line == head ++ location ++ body
+
+private def kernel_entry_matches (lines : List String) (name : String) (arity : Nat) : Bool :=
+  let entry := hex_binding "f" name
+  let signature := entry ++ " :: [Value] -> R Value"
+  let fallback := entry ++ " _ = panic " ++ haskell_quote ("wrong argument count for " ++ name)
+  match lines.filter (·.startsWith (entry ++ " ")) with
+  | [declared, equation] => arity == 0 && declared == signature && kernel_entry_equation name arity equation
+  | [declared, equation, failed] => arity != 0 && declared == signature && kernel_entry_equation name arity equation && failed == fallback
+  | _ => false
+
+theorem checked_kernel_entry_equation (lines : List String) (name : String) (arity : Nat)
+    (accepted : kernel_entry_matches lines name arity = true) :
+    ∃ location : String, kernel_location_tail location.toList = true ∧
+      kernel_entry_head name arity ++ location ++ kernel_entry_body name arity ∈ lines := by
+  have found : ∃ equation ∈ lines, kernel_entry_equation name arity equation = true := by
+    unfold kernel_entry_matches at accepted
+    dsimp only at accepted
+    split at accepted
+    next declared equation selected =>
+      have member : equation ∈ lines.filter (·.startsWith (hex_binding "f" name ++ " ")) := by
+        rw [selected]
+        simp
+      simp only [Bool.and_eq_true] at accepted
+      exact ⟨equation, (List.mem_filter.mp member).1, accepted.2⟩
+    next declared equation failed selected =>
+      have member : equation ∈ lines.filter (·.startsWith (hex_binding "f" name ++ " ")) := by
+        rw [selected]
+        simp
+      simp only [Bool.and_eq_true] at accepted
+      exact ⟨equation, (List.mem_filter.mp member).1, accepted.1.2⟩
+    next => contradiction
+  obtain ⟨equation, present, checked⟩ := found
+  simp only [kernel_entry_equation, Bool.and_eq_true, beq_iff_eq] at checked
+  exact ⟨_, checked.1, checked.2 ▸ present⟩
+
+def kernel_return (target : Target) (arguments : Nat → Int) : Int := unsigned 64 (target_eval arguments target)
+
+theorem kernel_return_preserves_result (source : Source) (body : String) (arguments : Nat → Int)
+    (accepted : validates_kernel source body = true) :
+    ∃ target, body = render_target target ∧ kernel_return target arguments = unsigned 64 (source_eval arguments source) := by
+  obtain ⟨target, rendered, correct⟩ := kernel_certificate_sound source body accepted
+  exact ⟨target, rendered, congrArg (unsigned 64) (correct arguments)⟩
+
 def validate_kernels (frontend generated : String) : Except String Nat := do
   let tree ← Json.parse frontend
   let lines := generated.splitOn "\n"
   unless has_normalisation lines do
     throw "generated integer normalisation differs from the model"
+  unless lines.contains "number (Number n) = n" &&
+      lines.contains "marshal (IntegerType width _) value = Number (normalise width False (number value))" do
+    throw "generated integer entry conversion differs from the model"
   let declarations := lines.filter (·.startsWith "k_")
   let mut checked := 0
   for node in child_nodes tree do
@@ -393,6 +464,8 @@ def validate_kernels (frontend generated : String) : Except String Nat := do
           unless actual_signature == signature && equation.startsWith header &&
               validates_kernel source (equation.drop header.length) do
             throw ("kernel differs from verified lowering: " ++ name)
+          unless kernel_entry_matches lines name arity do
+            throw ("kernel entry differs from verified lowering: " ++ name)
           checked := checked + 1
         | _ => throw ("invalid kernel declarations for " ++ name)
   if checked == 0 || declarations.length != 2 * checked then
@@ -413,6 +486,46 @@ private def read_dispatch (row : String) : Except String DispatchGraph := do
 
 private def validates_dispatch_runtime (generated : String) : Bool :=
   let sections := generated.splitOn "\n\n"
+  let chain := String.intercalate "\n" [
+    "chain :: [R Flow] -> R Flow",
+    "chain [] = pure Next",
+    "chain (action : rest) = action >>= \\flow -> if flow == Next then chain rest else pure flow"]
+  let logic := String.intercalate "\n" [
+    "logic :: Bool -> R Value -> R Value -> R Value",
+    "logic conjunction left right = do",
+    "  a <- left",
+    "  if truth a == conjunction then boolean . truth <$> right else pure (boolean (not conjunction))"]
+  let branch := String.intercalate "\n" [
+    "branch :: R Value -> R Flow -> R Flow -> R Flow",
+    "branch condition yes no = condition >>= \\v -> if truth v then yes else no"]
+  let loop := String.intercalate "\n" [
+    "loop :: R Value -> R Flow -> R Value -> R Flow",
+    "loop condition body advance = do",
+    "  value <- condition",
+    "  if not (truth value) then pure Next else do",
+    "    result <- body",
+    "    case result of",
+    "      Return v -> pure (Return v)",
+    "      Break -> pure Next",
+    "      _ -> advance >> loop condition body advance"]
+  let postloop := String.intercalate "\n" [
+    "postloop :: R Flow -> R Value -> R Flow",
+    "postloop body condition = do",
+    "  result <- body",
+    "  case result of",
+    "    Return value -> pure (Return value)",
+    "    Break -> pure Next",
+    "    _ -> do",
+    "      value <- condition",
+    "      if truth value then postloop body condition else pure Next"]
+  let redirect := String.intercalate "\n" [
+    "redirectFlow :: Int -> Int -> R Flow -> R Flow",
+    "redirectFlow stop restart action = do",
+    "  result <- action",
+    "  case result of",
+    "    Break -> pure (Jump stop)",
+    "    Continue -> pure (Jump restart)",
+    "    _ -> pure result"]
   let dispatch := String.intercalate "\n" [
     "dispatch :: (Int, [[Int]]) -> [R Flow] -> R Flow",
     "dispatch (entry, edges) actions",
@@ -439,7 +552,7 @@ private def validates_dispatch_runtime (generated : String) : Bool :=
     "        Just target | canonical == Just raw -> pure (Jump target)",
     "        _ -> panic \"invalid computed jump target\"",
     "    _ -> panic \"invalid computed jump target\""]
-  [dispatch, computed].all sections.contains
+  [chain, logic, branch, loop, postloop, redirect, dispatch, computed].all sections.contains
 
 def validate_dispatches (generated : String) : Except String Nat := do
   unless validates_dispatch_runtime generated do
@@ -1380,6 +1493,8 @@ private def validates_pointer_memory (generated : String) : Bool :=
 end Heresy
 
 #print axioms Heresy.kernel_certificate_sound
+#print axioms Heresy.kernel_return_preserves_result
+#print axioms Heresy.checked_kernel_entry_equation
 #print axioms Heresy.program_certificate_sound
 #print axioms Heresy.framed_program_certificate_sound
 #print axioms Heresy.closed_executable_exit_refines
