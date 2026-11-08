@@ -21,6 +21,8 @@ jobs:
           lake exe certificate dispatch /tmp/Values.hs &&
           sed "s/^      _ -> advance >> loop condition body advance$/      _ -> loop condition body advance/" /tmp/Values.hs > /tmp/ChangedLoop.hs &&
           ! lake exe certificate dispatch /tmp/ChangedLoop.hs &&
+          sed -E "/^g_.* = /s/]\)$/, []])/" /tmp/Values.hs > /tmp/ChangedGraph.hs &&
+          ! lake exe certificate dispatch /tmp/ChangedGraph.hs &&
           lake exe certificate memory /tmp/Values.hs &&
           lake exe certificate process /tmp/Values.hs &&
           lake exe certificate linkage /tmp/Values.hs /tmp/values/0.json &&

@@ -526,6 +526,20 @@ private def validates_dispatch_runtime (generated : String) : Bool :=
     "    Break -> pure (Jump stop)",
     "    Continue -> pure (Jump restart)",
     "    _ -> pure result"]
+  let selection := String.intercalate "\n" [
+    "selection :: R Value -> [(Maybe (R Value, R Value), R Flow)] -> R Flow",
+    "selection condition entries = do",
+    "  value <- number <$> condition",
+    "  let search fallback [] = pure fallback",
+    "      search fallback remaining@((label, _) : rest) = case label of",
+    "        Nothing -> search (Just remaining) rest",
+    "        Just (lower, upper) -> do",
+    "          lo <- number <$> lower",
+    "          hi <- number <$> upper",
+    "          if lo <= value && value <= hi then pure (Just remaining) else search fallback rest",
+    "  selected <- search Nothing entries",
+    "  result <- maybe (pure Next) (chain . map snd) selected",
+    "  pure (if result == Break then Next else result)"]
   let dispatch := String.intercalate "\n" [
     "dispatch :: (Int, [[Int]]) -> [R Flow] -> R Flow",
     "dispatch (entry, edges) actions",
@@ -552,15 +566,67 @@ private def validates_dispatch_runtime (generated : String) : Bool :=
     "        Just target | canonical == Just raw -> pure (Jump target)",
     "        _ -> panic \"invalid computed jump target\"",
     "    _ -> panic \"invalid computed jump target\""]
-  [chain, logic, branch, loop, postloop, redirect, dispatch, computed].all sections.contains
+  [chain, logic, branch, loop, postloop, redirect, selection, dispatch, computed].all sections.contains
+
+private def push_dispatch_token (token : String) (tokens : List String) : List String :=
+  if token.isEmpty then tokens else token :: tokens
+
+private def dispatch_tokens : List Char → Bool → String → List String → List String
+  | [], _, word, tokens => (push_dispatch_token word tokens).reverse
+  | '\\' :: _ :: rest, true, word, tokens => dispatch_tokens rest true word tokens
+  | '"' :: rest, quoted, word, tokens =>
+    dispatch_tokens rest (!quoted) "" (if quoted then tokens else "literal" :: push_dispatch_token word tokens)
+  | ch :: rest, quoted, word, tokens =>
+    if quoted then dispatch_tokens rest true word tokens
+    else if ch.isAlphanum || ch == '_' || ch == '\'' then dispatch_tokens rest false (word.push ch) tokens
+    else if ch.isWhitespace then dispatch_tokens rest false "" (push_dispatch_token word tokens)
+    else dispatch_tokens rest false "" (String.singleton ch :: push_dispatch_token word tokens)
+
+private def closing_token : String → Option String
+  | "(" => some ")"
+  | "[" => some "]"
+  | "{" => some "}"
+  | _ => none
+
+private def dispatch_action_count : List String → List String → Nat → Bool → Option Nat
+  | [], _, _, _ => none
+  | "]" :: _, [], count, expected => if expected && count != 0 then none else some count
+  | "(" :: rest, [], count, true => dispatch_action_count rest [")"] (count + 1) false
+  | "," :: rest, [], count, false => dispatch_action_count rest [] count true
+  | _ :: _, [], _, _ => none
+  | token :: rest, expected :: nested, count, pending =>
+    if token == expected then dispatch_action_count rest nested count pending
+    else if [")", "]", "}"].contains token then none
+    else
+      match closing_token token with
+      | none => dispatch_action_count rest (expected :: nested) count pending
+      | some closing => dispatch_action_count rest (closing :: expected :: nested) count pending
+
+private def dispatch_calls : List String → Except String (List (String × Nat))
+  | "dispatch" :: name :: "[" :: rest => do
+    unless name.startsWith "g_" do throw "invalid dispatch graph reference"
+    let count ← require (dispatch_action_count rest [] 0 true) "invalid dispatch action list"
+    pure ((name, count) :: (← dispatch_calls rest))
+  | _ :: rest => dispatch_calls rest
+  | [] => pure []
+
+def validates_dispatch_counts (graphs calls : List (String × Nat)) : Bool :=
+  calls.length == graphs.length && graphs.all (fun graph => calls.contains graph)
+
+theorem checked_dispatch_counts (graphs calls : List (String × Nat))
+    (accepted : validates_dispatch_counts graphs calls = true) (name : String) (graph : DispatchGraph)
+    (declared : (name, graph.successors.length) ∈ graphs) :
+    (name, graph.successors.length) ∈ calls := by
+  simp [validates_dispatch_counts, List.all_eq_true] at accepted
+  exact accepted.2 name graph.successors.length declared
 
 def validate_dispatches (generated : String) : Except String Nat := do
   unless validates_dispatch_runtime generated do
     throw "dispatch runtime differs from the model"
-  let lines := (generated.splitOn "\n").filter (·.startsWith "g_")
-  let mut names : List String := []
+  let lines := generated.splitOn "\n"
+  let mut graphs : List (String × Nat) := []
   let mut signatures : List String := []
-  for line in lines do
+  for line in lines.filter (·.startsWith "g_") do
     let signature := " :: (Int, [[Int]])"
     if line.endsWith signature then
       signatures := line.take (line.length - signature.length) :: signatures
@@ -570,11 +636,16 @@ def validate_dispatches (generated : String) : Except String Nat := do
         let graph ← read_dispatch row
         unless valid_dispatch graph do
           throw ("dispatch target outside its graph: " ++ name)
-        names := name :: names
+        graphs := (name, graph.successors.length) :: graphs
       | _ => throw "invalid dispatch declaration"
+  let names := graphs.map Prod.fst
   if names.isEmpty || !decide names.Nodup || names != signatures then
     throw "unaccounted or missing dispatch declarations"
-  else pure names.length
+  let calls ← (lines.filter (fun line => (line.splitOn "dispatch g_").length > 1)).mapM (fun line =>
+    dispatch_calls (dispatch_tokens line.toList false "" []))
+  unless validates_dispatch_counts graphs calls.flatten do
+    throw "dispatch action counts differ from the declared graphs"
+  pure names.length
 
 def validates_access (generated : String) : Bool :=
   let sections := generated.splitOn "\n\n"
@@ -1495,6 +1566,7 @@ end Heresy
 #print axioms Heresy.kernel_certificate_sound
 #print axioms Heresy.kernel_return_preserves_result
 #print axioms Heresy.checked_kernel_entry_equation
+#print axioms Heresy.checked_dispatch_counts
 #print axioms Heresy.program_certificate_sound
 #print axioms Heresy.framed_program_certificate_sound
 #print axioms Heresy.closed_executable_exit_refines

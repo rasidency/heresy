@@ -921,6 +921,120 @@ theorem guarded_loop_preserves_observations (related : source → target → Pro
     obtain ⟨fuel, executed⟩ := (guarded_loop_preserves_execution right phase initial final result).mpr finished
     exact ⟨fuel, final, executed, (agrees after final matched).symm.trans visible⟩
 
+inductive LoopContinues (actions : LoopActions state fault value) : LoopPhase → state → LoopPhase → state → Prop where
+  | tested : actions.test initial = (.ok true, after) → LoopContinues actions .test initial .body after
+  | completed : actions.body initial = (.ok .next, after) → LoopContinues actions .body initial .advance after
+  | continued : actions.body initial = (.ok .continue, after) → LoopContinues actions .body initial .advance after
+  | advanced : actions.advance initial = (.ok (), after) → LoopContinues actions .advance initial .test after
+
+inductive LoopPrefix (actions : LoopActions state fault value) (entry : LoopPhase) (initial : state) :
+    LoopPhase → state → Prop where
+  | entry : LoopPrefix actions entry initial entry initial
+  | step : LoopPrefix actions entry initial phase before → LoopContinues actions phase before next after →
+      LoopPrefix actions entry initial next after
+
+private theorem related_loop_prefix_step (related : source → target → Prop)
+    (left : LoopActions source fault value) (right : LoopActions target fault value)
+    (actions : RelatedLoopActions related left right) (entry phase next : LoopPhase) (before after : source) (initial : target)
+    (paired : related before initial) (continues : LoopContinues left phase before next after) :
+    ∃ final, guarded_blocks (loop_graph entry) (loop_actions right) phase.block initial = some (.jump next.block final) ∧
+      related after final := by
+  rw [loop_guard_preserves_blocks]
+  cases continues with
+  | tested observed =>
+    obtain ⟨final, tested, matched⟩ := actions.test.advance related paired observed
+    exact ⟨final, by simp [loop_blocks, LoopPhase.block, tested], matched⟩
+  | completed observed =>
+    obtain ⟨final, completed, matched⟩ := actions.body.advance related paired observed
+    exact ⟨final, by simp [loop_blocks, LoopPhase.block, completed], matched⟩
+  | continued observed =>
+    obtain ⟨final, continued, matched⟩ := actions.body.advance related paired observed
+    exact ⟨final, by simp [loop_blocks, LoopPhase.block, continued], matched⟩
+  | advanced observed =>
+    obtain ⟨final, advanced, matched⟩ := actions.advance.advance related paired observed
+    exact ⟨final, by simp [loop_blocks, LoopPhase.block, advanced], matched⟩
+
+theorem guarded_loop_preserves_prefix (related : source → target → Prop)
+    (left : LoopActions source fault value) (right : LoopActions target fault value)
+    (actions : RelatedLoopActions related left right) (entry phase : LoopPhase) (before after : source) (initial : target)
+    (paired : related before initial) (visited : LoopPrefix left entry before phase after) :
+    ∃ final, DispatchVisits (guarded_blocks (loop_graph entry) (loop_actions right)) entry.block initial phase.block final ∧
+      related after final := by
+  induction visited with
+  | entry => exact ⟨initial, .entry, paired⟩
+  | step _ action earlier =>
+    obtain ⟨middle, reached, matched⟩ := earlier
+    obtain ⟨final, stepped, same⟩ := related_loop_prefix_step related left right actions entry _ _ _ _ middle matched action
+    exact ⟨final, .jump reached stepped, same⟩
+
+structure SwitchEntry where
+  bounds : Option (Int × Int)
+  target : Nat
+
+def switch_matches (selector : Int) (entry : SwitchEntry) : Bool :=
+  match entry.bounds with
+  | none => false
+  | some (lower, upper) => decide (lower ≤ selector ∧ selector ≤ upper)
+
+def switch_search (selector : Int) : Option Nat → List SwitchEntry → Option Nat
+  | fallback, [] => fallback
+  | fallback, entry :: rest =>
+    match entry.bounds with
+    | none => switch_search selector (some entry.target) rest
+    | some _ => if switch_matches selector entry then some entry.target else switch_search selector fallback rest
+
+def last_switch_default : List SwitchEntry → Option Nat
+  | [] => none
+  | entry :: rest =>
+    (last_switch_default rest).or (if entry.bounds.isNone then some entry.target else none)
+
+theorem switch_search_preserves_selection (selector : Int) (fallback : Option Nat) (entries : List SwitchEntry) :
+    switch_search selector fallback entries =
+      ((entries.find? (switch_matches selector)).map SwitchEntry.target).or ((last_switch_default entries).or fallback) := by
+  induction entries generalizing fallback with
+  | nil => rfl
+  | cons entry rest later =>
+    cases bounds : entry.bounds with
+    | none =>
+      simp [switch_search, switch_matches, bounds, last_switch_default, later]
+    | some pair =>
+      by_cases matched : switch_matches selector entry = true
+      · simp [switch_search, bounds, matched]
+      · simp [switch_search, bounds, matched, last_switch_default, later]
+
+theorem switch_search_lists_target (selector : Int) (fallback : Option Nat) (entries : List SwitchEntry)
+    (target : Nat) (selected : switch_search selector fallback entries = some target) :
+    fallback = some target ∨ ∃ entry ∈ entries, entry.target = target := by
+  induction entries generalizing fallback with
+  | nil => exact .inl selected
+  | cons entry rest later =>
+    cases bounds : entry.bounds with
+    | none =>
+      simp only [switch_search, bounds] at selected
+      rcases later (some entry.target) selected with first | ⟨chosen, present, target_eq⟩
+      · exact .inr ⟨entry, by simp, Option.some.inj first⟩
+      · exact .inr ⟨chosen, List.mem_cons_of_mem _ present, target_eq⟩
+    | some span =>
+      by_cases matched : switch_matches selector entry = true
+      · simp [switch_search, bounds, matched] at selected
+        exact .inr ⟨entry, by simp, selected⟩
+      · simp [switch_search, bounds, matched] at selected
+        rcases later fallback selected with first | ⟨chosen, present, target_eq⟩
+        · exact .inl first
+        · exact .inr ⟨chosen, List.mem_cons_of_mem _ present, target_eq⟩
+
+theorem guarded_switch_accepts_selection (graph : DispatchGraph)
+    (actions : List (state → Option (Transfer state result))) (shape : graph.successors.length = actions.length)
+    (selector : Int) (fallback : Option Nat) (entries : List SwitchEntry) (index selected : Nat) (initial : state)
+    (row : List Nat) (action : state → Option (Transfer state result))
+    (installed : (graph.successors.zip actions)[index]? = some (row, action))
+    (listed : ∀ target, (fallback = some target ∨ ∃ entry ∈ entries, entry.target = target) → target ∈ row)
+    (chosen : switch_search selector fallback entries = some selected)
+    (jump : action initial = some (.jump selected initial)) :
+    guarded_blocks graph actions index initial = some (.jump selected initial) := by
+  have present := listed selected (switch_search_lists_target selector fallback entries selected chosen)
+  simp [guarded_blocks, shape, installed, jump, present]
+
 end Heresy
 
 #print axioms Heresy.framed_link_correct
@@ -935,6 +1049,9 @@ end Heresy
 #print axioms Heresy.loop_dispatch_preserves_execution
 #print axioms Heresy.guarded_loop_preserves_execution
 #print axioms Heresy.guarded_loop_preserves_observations
+#print axioms Heresy.guarded_loop_preserves_prefix
 #print axioms Heresy.related_branch_preserves_execution
 #print axioms Heresy.related_logic_preserves_execution
 #print axioms Heresy.related_chain_preserves_execution
+#print axioms Heresy.switch_search_preserves_selection
+#print axioms Heresy.guarded_switch_accepts_selection
