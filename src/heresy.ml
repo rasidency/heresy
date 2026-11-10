@@ -122,6 +122,7 @@ let rec walk ?(through = fun _ -> true) f node =
   if through node then begin
     f node;
     let inner = match kind node, children node with
+      | "OpaqueValueExpr", _ -> []
       | "GenericSelectionExpr", inner -> List.filter (fun child -> Json.bool (field child "selected")) inner
       | _, [] -> (match Json.list (field node "array_filler") with _ :: values -> values | [] -> [])
       | _, inner -> inner
@@ -159,6 +160,7 @@ type context = {
   names : (string, string) Hashtbl.t;
   functions : Json.t list;
   globals : Json.t list;
+  shared_operand : string option;
   graphs : (string * int * int list list) Queue.t;
   pure : (string, Json.t list * string) Hashtbl.t;
   constants : (string, string) Hashtbl.t;
@@ -337,7 +339,7 @@ let resolve_records source content layouts tree =
   let rec capture_tags node =
     let record = kind node = "RecordDecl" && text node "tagUsed" <> "" in
     let captured = if record then Some (identity node) else None in
-    List.iter capture_tags (children node);
+    if kind node <> "OpaqueValueExpr" then List.iter capture_tags (children node);
     match captured with
     | Some (_, key) when Json.bool (field node "completeDefinition") ->
         let tag = text node "tagUsed" in
@@ -471,11 +473,13 @@ let resolve_records source content layouts tree =
           in visit [] scope children
         in
         let inner = children node in
-        let children, after = rewrite_children scope inner in
+        let children, after = if node_kind = "OpaqueValueExpr" then inner, scope else rewrite_children scope inner in
         let inherited = match node_kind, inner with
           | "DeclRefExpr", _ -> refer (text (field node "referencedDecl") "id")
           | "MemberExpr", _ -> refer (text node "referencedMemberDecl")
           | "ConditionalOperator", _ :: yes :: _ -> refer (text yes "id")
+          | "BinaryConditionalOperator", [_; _; yes; _] -> refer (text yes "id")
+          | "OpaqueValueExpr", [common] -> refer (text common "id")
           | ("CallExpr" | "ParenExpr" | "ImplicitCastExpr" | "UnaryOperator" | "ArraySubscriptExpr" |
              "BinaryOperator" | "CompoundAssignOperator" | "ConstantExpr" | "TypedefDecl" |
              "TypeOfExprType" | "ParenType"), first :: rest ->
@@ -1167,6 +1171,12 @@ and expression context node =
           in operation ^ " " ^ par (ex left) ^ " " ^ par (ex right)
       end
   | "ConditionalOperator", [condition; yes; no] -> par (ex condition ^ " >>= \\v -> if truth v then " ^ par (ex yes) ^ " else " ^ par (ex no))
+  | "BinaryConditionalOperator", [common; condition; yes; no] ->
+      let bound = expression { context with shared_operand = Some (text common "id") } in
+      "conditional " ^ par (ex common) ^ " " ^ par ("\\shared -> " ^ bound condition) ^
+        " " ^ par ("\\shared -> " ^ bound yes) ^ " " ^ par (ex no)
+  | "OpaqueValueExpr", [common] when context.shared_operand = Some (text common "id") ->
+      "pure shared"
   | ("ArraySubscriptExpr" | "MemberExpr" | "CompoundLiteralExpr"), _ -> par (lv node ^ " >>= load " ^ access_type context node)
   | "VAArgExpr", [list] -> "vaArg " ^ ctype context t ^ " " ^ par (ex list)
   | "AtomicExpr", target :: operands ->
@@ -1734,7 +1744,7 @@ let context namespace symbols source content frontend_layouts vla_bounds vla_ali
   let statics = ref [] in
   List.iter (walk (fun node -> if kind node = "VarDecl" && text node "storageClass" = "static" then statics := node :: !statics)) functions;
   let globals = file_globals @ List.rev !statics in
-  let context = { source; content; namespace; symbols; internal_functions; aliases = Hashtbl.create 32; records = Hashtbl.create 8; layouts = Hashtbl.create 8; frontend_layouts; names = Hashtbl.create 64; functions; globals; graphs = Queue.create (); pure = Hashtbl.create 8; constants = Hashtbl.create 32; label_names = Hashtbl.create 16; vla_bounds; vla_aliases; vla_inherited; vla_adjusted } in
+  let context = { source; content; namespace; symbols; internal_functions; aliases = Hashtbl.create 32; records = Hashtbl.create 8; layouts = Hashtbl.create 8; frontend_layouts; names = Hashtbl.create 64; functions; globals; shared_operand = None; graphs = Queue.create (); pure = Hashtbl.create 8; constants = Hashtbl.create 32; label_names = Hashtbl.create 16; vla_bounds; vla_aliases; vla_inherited; vla_adjusted } in
   List.iter (fun function_node ->
     walk (fun node -> if kind node = "AddrLabelExpr" then begin
       let id = text node "labelDeclId" in

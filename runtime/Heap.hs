@@ -5,7 +5,7 @@ module Heap
   , number, truth, normalise, cast, panic, at, atFlow, offset, load, store
   , frame, declare, variable, parameter, global, literal, materialise, clear
   , freeze
-  , chain, discard, statementValue, redirectFlow, branch, loop, postloop, selection, dispatch, indirectJump, logic, boolean, binary, unary
+  , chain, discard, statementValue, redirectFlow, branch, loop, postloop, selection, dispatch, indirectJump, logic, conditional, boolean, binary, unary
   , assign, update, realBinary, realUpdate, function, invoke, execute
   , asmBarrier, asmRegisters
   , imaginary, makeComplex, complexPart, complexBinary, complexUpdate
@@ -735,6 +735,12 @@ logic :: Bool -> R Value -> R Value -> R Value
 logic conjunction left right = do
   a <- left
   if truth a == conjunction then boolean . truth <$> right else pure (boolean (not conjunction))
+
+conditional :: R Value -> (Value -> R Value) -> (Value -> R Value) -> R Value -> R Value
+conditional common test convertValue fallback = do
+  shared <- common
+  tested <- test shared
+  if truth tested then convertValue shared else fallback
 
 boolean :: Bool -> Value
 boolean b = Number (if b then 1 else 0)

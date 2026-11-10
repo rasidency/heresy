@@ -113,6 +113,12 @@ int main(int argc, char **argv) {
     subtotal;
   }), default:99);
   printf("generic %d %d %d\n", effects, selected, evaluated);
+  int shared = 0;
+  int fallback = shared++ ?: ++shared;
+  double promoted = shared++ ?: 0.5;
+  int *missing = 0;
+  int *retained = (missing ?: &shared) ?: &fallback;
+  printf("conditional %d %.1f %d %d\n", fallback, promoted, shared, retained == &shared);
   int nested = ({ int value = 2; goto finish; value = 100; finish: value + 1; });
   printf("nested label %d\n", nested);
   int inline_field = ((struct {char c; int value;}){1, 8}).value;

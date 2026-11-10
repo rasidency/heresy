@@ -815,6 +815,42 @@ def logic_action (conjunction : Bool) (left right : state → Except fault Bool 
     state → Except fault Bool × state :=
   bind_action left (fun result => if result = conjunction then right else fun state => (.ok (!conjunction), state))
 
+inductive SharedEvaluates (common : state → Except fault α × state)
+    (test : α → state → Except fault Bool × state) (convert : α → state → Except fault β × state)
+    (fallback : state → Except fault β × state) : state → Except fault β × state → Prop where
+  | common_fault (h : common initial = (.error why, final)) :
+      SharedEvaluates common test convert fallback initial (.error why, final)
+  | test_fault (h : common initial = (.ok value, next)) (t : test value next = (.error why, final)) :
+      SharedEvaluates common test convert fallback initial (.error why, final)
+  | reuse (h : common initial = (.ok value, next)) (t : test value next = (.ok true, after)) :
+      SharedEvaluates common test convert fallback initial (convert value after)
+  | alternate (h : common initial = (.ok value, next)) (t : test value next = (.ok false, after)) :
+      SharedEvaluates common test convert fallback initial (fallback after)
+
+theorem shared_conditional_correct (common : state → Except fault α × state)
+    (test : α → state → Except fault Bool × state) (convert : α → state → Except fault β × state)
+    (fallback : state → Except fault β × state) (initial : state) (result : Except fault β × state) :
+    SharedEvaluates common test convert fallback initial result ↔
+      bind_action common (fun value => branch_action (test value) (convert value) fallback) initial = result := by
+  constructor
+  · intro evaluated
+    cases evaluated <;> simp_all [branch_action, bind_action]
+  · intro evaluated
+    subst result
+    cases h : common initial with
+    | mk outcome next =>
+      cases outcome with
+      | error why => simpa [bind_action, h] using (SharedEvaluates.common_fault (test := test) (convert := convert) (fallback := fallback) h)
+      | ok value =>
+        cases t : test value next with
+        | mk truth after =>
+          cases truth with
+          | error why => simpa [bind_action, branch_action, h, t] using (SharedEvaluates.test_fault (convert := convert) (fallback := fallback) h t)
+          | ok truth =>
+            cases truth with
+            | false => simpa [bind_action, branch_action, h, t] using (SharedEvaluates.alternate (convert := convert) (fallback := fallback) h t)
+            | true => simpa [bind_action, branch_action, h, t] using (SharedEvaluates.reuse (convert := convert) (fallback := fallback) h t)
+
 theorem related_logic_preserves_execution {related : source → target → Prop} (conjunction : Bool)
     {source_left source_right : source → Except fault Bool × source} {target_left target_right : target → Except fault Bool × target}
     (left : RelatedAction related source_left target_left) (right : RelatedAction related source_right target_right) :
@@ -1051,6 +1087,7 @@ end Heresy
 #print axioms Heresy.guarded_loop_preserves_observations
 #print axioms Heresy.guarded_loop_preserves_prefix
 #print axioms Heresy.related_branch_preserves_execution
+#print axioms Heresy.shared_conditional_correct
 #print axioms Heresy.related_logic_preserves_execution
 #print axioms Heresy.related_chain_preserves_execution
 #print axioms Heresy.switch_search_preserves_selection

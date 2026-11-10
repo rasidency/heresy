@@ -495,6 +495,12 @@ private def validates_dispatch_runtime (generated : String) : Bool :=
     "logic conjunction left right = do",
     "  a <- left",
     "  if truth a == conjunction then boolean . truth <$> right else pure (boolean (not conjunction))"]
+  let conditional := String.intercalate "\n" [
+    "conditional :: R Value -> (Value -> R Value) -> (Value -> R Value) -> R Value -> R Value",
+    "conditional common test convertValue fallback = do",
+    "  shared <- common",
+    "  tested <- test shared",
+    "  if truth tested then convertValue shared else fallback"]
   let branch := String.intercalate "\n" [
     "branch :: R Value -> R Flow -> R Flow -> R Flow",
     "branch condition yes no = condition >>= \\v -> if truth v then yes else no"]
@@ -566,7 +572,7 @@ private def validates_dispatch_runtime (generated : String) : Bool :=
     "        Just target | canonical == Just raw -> pure (Jump target)",
     "        _ -> panic \"invalid computed jump target\"",
     "    _ -> panic \"invalid computed jump target\""]
-  [chain, logic, branch, loop, postloop, redirect, selection, dispatch, computed].all sections.contains
+  [chain, logic, conditional, branch, loop, postloop, redirect, selection, dispatch, computed].all sections.contains
 
 private def push_dispatch_token (token : String) (tokens : List String) : List String :=
   if token.isEmpty then tokens else token :: tokens
