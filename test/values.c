@@ -556,5 +556,8 @@ int main(int argc, char **argv) {
   wide_values();
   complex_values(zero);
   variable_array_values(3, 5);
+  if (printf("%.1e\n", 1.0) != 8) return 2;
+  report("scientific %.0e %.0e %.0e %.2E %012.2e %08E %.3Le\n",
+         2.5, 3.5, 9.5, negative_zero.value, -0.125, inf, 1e-4900L);
   return 0;
 }

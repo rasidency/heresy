@@ -1402,6 +1402,45 @@ theorem closed_executable_exit_refines (input : Input) (artifact : Executable) (
   exact (target status).trans (model.trans (source status).symm)
 
 def validates_process (generated : String) : Bool :=
+  let nearestCoefficient := String.intercalate "\n" [
+    "nearestCoefficient :: Rational -> Integer",
+    "nearestCoefficient value =",
+    "  if 2 * r < d || (2 * r == d && even q) then q else q + 1",
+    "  where",
+    "    d = denominator value",
+    "    (q, r) = numerator value `divMod` d"]
+  let decimalDigits := String.intercalate "\n" [
+    "decimalDigits :: Int -> Bool -> Integer -> String",
+    "decimalDigits precision negative coefficient",
+    "  | precision == 0 = sign ++ digits",
+    "  | otherwise = sign ++ integer ++ \".\" ++ fractional",
+    "  where",
+    "    sign = if negative then \"-\" else \"\"",
+    "    digits = show coefficient",
+    "    padded = replicate (max 0 (precision - length digits + 1)) '0' ++ digits",
+    "    (integer, fractional) = splitAt (length padded - precision) padded"]
+  let fixedExtended := String.intercalate "\n" [
+    "fixedExtended :: Int -> ExtendedReal -> String",
+    "fixedExtended _ (Infinite negative) = if negative then \"-inf\" else \"inf\"",
+    "fixedExtended _ (NotANumber raw) = if testBit raw 79 then \"-nan\" else \"nan\"",
+    "fixedExtended precision (Finite negative value) =",
+    "  decimalDigits precision negative (nearestCoefficient (value * 10 ^ precision))"]
+  let scientificExtended := String.intercalate "\n" [
+    "scientificExtended :: Int -> ExtendedReal -> String",
+    "scientificExtended precision (Finite negative magnitude) =",
+    "  decimalDigits precision negative coefficient ++",
+    "  \"e\" ++ (if power < 0 then \"-\" else \"+\") ++ replicate (max 0 (2 - length digits)) '0' ++ digits",
+    "  where",
+    "    guess = length (show (numerator magnitude)) - length (show (denominator magnitude))",
+    "    decimalPower",
+    "      | magnitude == 0 = 0",
+    "      | magnitude < 10 ^^ guess = guess - 1",
+    "      | otherwise = guess",
+    "    scale = 10 ^ precision",
+    "    rounded = nearestCoefficient (magnitude * fromInteger scale / 10 ^^ decimalPower)",
+    "    (coefficient, power) = if rounded == 10 * scale then (scale, decimalPower + 1) else (rounded, decimalPower)",
+    "    digits = show (abs power)",
+    "scientificExtended precision value = fixedExtended precision value"]
   let transformer := String.intercalate "\n" [
     "newtype R a = R { unR :: ExceptT Fault (StateT World IO) a }",
     "  deriving (Functor, Applicative, Monad, MonadIO, MonadState World, MonadError Fault)",
@@ -1466,7 +1505,7 @@ def validates_process (generated : String) : Bool :=
     "      hPutStrLn stderr (\"heresy panic: \" ++ message)",
     "      unless (enabled || null (recent final)) $ hPutStrLn stderr (intercalate \"\\n\" (reverse (recent final)))",
     "      exitWith (ExitFailure 70)"]
-  [transformer, finish, stream_seed, stream_lookup, register, close, file_read, epilogue].all
+  [nearestCoefficient, decimalDigits, fixedExtended, scientificExtended, transformer, finish, stream_seed, stream_lookup, register, close, file_read, epilogue].all
     (fun equation => (generated.splitOn ("\n" ++ equation ++ "\n")).length == 2)
 
 private def validates_aggregate_memory (generated : String) : Bool :=

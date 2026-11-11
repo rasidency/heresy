@@ -1329,21 +1329,44 @@ decimalField = foldM step 0
       if n > (maxBound - digit) `div` 10 then panic "printf field exceeds the host representation"
         else pure (n * 10 + digit)
 
-fixedDecimal :: Int -> Double -> String
-fixedDecimal precision = fixedExtended precision . hostExtended
+nearestCoefficient :: Rational -> Integer
+nearestCoefficient value =
+  if 2 * r < d || (2 * r == d && even q) then q else q + 1
+  where
+    d = denominator value
+    (q, r) = numerator value `divMod` d
 
-fixedExtended :: Int -> ExtendedReal -> String
-fixedExtended _ (Infinite negative) = if negative then "-inf" else "inf"
-fixedExtended _ (NotANumber raw) = if testBit raw 79 then "-nan" else "nan"
-fixedExtended precision (Finite negative value)
+decimalDigits :: Int -> Bool -> Integer -> String
+decimalDigits precision negative coefficient
   | precision == 0 = sign ++ digits
   | otherwise = sign ++ integer ++ "." ++ fractional
   where
     sign = if negative then "-" else ""
-    scale = 10 ^ precision :: Integer
-    digits = show (round (value * fromInteger scale) :: Integer)
+    digits = show coefficient
     padded = replicate (max 0 (precision - length digits + 1)) '0' ++ digits
     (integer, fractional) = splitAt (length padded - precision) padded
+
+fixedExtended :: Int -> ExtendedReal -> String
+fixedExtended _ (Infinite negative) = if negative then "-inf" else "inf"
+fixedExtended _ (NotANumber raw) = if testBit raw 79 then "-nan" else "nan"
+fixedExtended precision (Finite negative value) =
+  decimalDigits precision negative (nearestCoefficient (value * 10 ^ precision))
+
+scientificExtended :: Int -> ExtendedReal -> String
+scientificExtended precision (Finite negative magnitude) =
+  decimalDigits precision negative coefficient ++
+  "e" ++ (if power < 0 then "-" else "+") ++ replicate (max 0 (2 - length digits)) '0' ++ digits
+  where
+    guess = length (show (numerator magnitude)) - length (show (denominator magnitude))
+    decimalPower
+      | magnitude == 0 = 0
+      | magnitude < 10 ^^ guess = guess - 1
+      | otherwise = guess
+    scale = 10 ^ precision
+    rounded = nearestCoefficient (magnitude * fromInteger scale / 10 ^^ decimalPower)
+    (coefficient, power) = if rounded == 10 * scale then (scale, decimalPower + 1) else (rounded, decimalPower)
+    digits = show (abs power)
+scientificExtended precision value = fixedExtended precision value
 
 format :: (CType -> arguments -> R (Value, arguments)) -> String -> arguments -> R String
 format _ [] _ = pure []
@@ -1359,10 +1382,11 @@ format takeArgument ('%' : rest) values = do
   width <- decimalField digits
   case suffix of
     specifier : more -> do
-      when (fraction /= Nothing && specifier /= 'f') (panic "unsupported printf precision")
+      let floating = specifier `elem` "fFeE"
+      when (fraction /= Nothing && not floating) (panic "unsupported printf precision")
       let ty = case specifier of
             's' -> PointerType
-            'f' -> FloatingType (if modifier == "L" then 80 else 64)
+            _ | floating -> FloatingType (if modifier == "L" then 80 else 64)
             _ -> IntegerType (max 32 bits) False
       (value, remaining) <- takeArgument ty values
       let real = castWord64ToDouble (fromInteger (number value))
@@ -1378,13 +1402,14 @@ format takeArgument ('%' : rest) values = do
         'o' -> pure (showOct (normalise bits False (number value)) "")
         'c' -> pure [chr (fromInteger (number value `mod` 256))]
         's' -> readString value
-        'f' -> do
+        _ | floating -> do
           unless (modifier `elem` ["", "l", "L"]) (panic "unsupported floating printf length")
           precision <- maybe (pure 6) decimalField fraction
-          pure (if modifier == "L" then fixedExtended precision extended else fixedDecimal precision real)
+          let render = if toLower specifier == 'e' then scientificExtended else fixedExtended
+              text = render precision (if modifier == "L" then extended else hostExtended real)
+          pure (if isUpper specifier then map toUpper text else text)
         _ -> panic ("unsupported printf conversion %" ++ [specifier])
-      let zero = take 1 digits == "0" && specifier `elem` "diuxXof" &&
-            (specifier /= 'f' || finite)
+      let zero = take 1 digits == "0" && (specifier `elem` "diuxXo" || floating && finite)
           padding = replicate (max 0 (width - length piece)) (if zero then '0' else ' ')
           padded = if zero && take 1 piece == "-" then "-" ++ padding ++ drop 1 piece else padding ++ piece
       remainingText <- format takeArgument more remaining

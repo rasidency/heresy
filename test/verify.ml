@@ -194,6 +194,10 @@ let () =
     check "calling convention slots and integer formats" (contains calls "4294967295 4294967295 3" && contains calls "-007 -1 255 17 FF" && contains calls "\255 255");
     let lowered = fixture "lowering" (read "test/lowering.c") in
     let values = fixture "values" (read "test/values.c") in
+    check "shared conditional operands retain effects and result conversions"
+      (contains lowered "conditional 2 2.0 3 1\n");
+    check "scientific conversions preserve ties, carry, sign and extended range"
+      (contains values "1.0e+00\nscientific 2e+00 4e+00 1e+01 -0.00E+00 -0001.25e-01      INF 1.000e-4900\n");
     let units = ["test/linkage/entry.c"; "test/linkage/worker.c"] in
     ignore (success frontend (["-std=c11"; "-O1"] @ units @ ["-o"; "build/linkageref"]));
     ignore (success compiler (units @ ["--build"; "build/linkage"]));

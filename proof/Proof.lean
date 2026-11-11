@@ -4,6 +4,103 @@ set_option warningAsError true
 
 namespace Heresy
 
+theorem decimal_exponent_bracket (n d i j : Nat)
+    (num_lower : 10 ^ i ≤ n) (num_upper : n < 10 ^ (i + 1))
+    (den_lower : 10 ^ j ≤ d) (den_upper : d < 10 ^ (j + 1)) :
+    let a := n * 10 ^ j
+    let b := d * 10 ^ i
+    let scaled := if a < b then 10 * a else a
+    b ≤ scaled ∧ scaled < 10 * b := by
+  dsimp only
+  have pos_i : 0 < 10 ^ i := Nat.pow_pos (by decide)
+  have pos_j : 0 < 10 ^ j := Nat.pow_pos (by decide)
+  have upper : n * 10 ^ j < 10 * (d * 10 ^ i) := calc
+    n * 10 ^ j < 10 ^ (i + 1) * 10 ^ j := Nat.mul_lt_mul_of_pos_right num_upper pos_j
+    _ = 10 ^ j * (10 * 10 ^ i) := by rw [Nat.pow_succ]; ac_rfl
+    _ ≤ d * (10 * 10 ^ i) := Nat.mul_le_mul_right _ den_lower
+    _ = _ := by ac_rfl
+  have lower : d * 10 ^ i < 10 * (n * 10 ^ j) := calc
+    d * 10 ^ i < 10 ^ (j + 1) * 10 ^ i := Nat.mul_lt_mul_of_pos_right den_upper pos_i
+    _ = 10 ^ i * (10 * 10 ^ j) := by rw [Nat.pow_succ]; ac_rfl
+    _ ≤ n * (10 * 10 ^ j) := Nat.mul_le_mul_right _ num_lower
+    _ = _ := by ac_rfl
+  split
+  · rename_i smaller
+    exact ⟨Nat.le_of_lt lower, Nat.mul_lt_mul_of_pos_left smaller (by decide)⟩
+  · rename_i larger
+    exact ⟨Nat.le_of_not_lt larger, upper⟩
+
+def nearest_coefficient (n d : Nat) : Nat :=
+  let q := n / d
+  let r := n % d
+  if 2 * r < d ∨ (2 * r = d ∧ q % 2 = 0) then q else q + 1
+
+theorem nearest_coefficient_correct (n d : Nat) (positive : 0 < d) :
+    let k := nearest_coefficient n d
+    let gap := max n (d * k) - min n (d * k)
+    2 * gap ≤ d ∧ (2 * gap = d → k % 2 = 0) := by
+  have divided := Nat.div_add_mod n d
+  have remainder := Nat.mod_lt n positive
+  dsimp only
+  unfold nearest_coefficient
+  dsimp only
+  split
+  · rw [Nat.max_eq_left (by omega), Nat.min_eq_right (by omega)]
+    omega
+  · rw [Nat.mul_add, Nat.mul_one, Nat.max_eq_right (by omega), Nat.min_eq_left (by omega)]
+    omega
+
+theorem decimal_rounding_carry (precision rounded : Nat)
+    (lower : 10 ^ precision ≤ rounded) (upper : rounded ≤ 10 * 10 ^ precision) :
+    let carry := rounded == 10 * 10 ^ precision
+    let coefficient := if carry then 10 ^ precision else rounded
+    10 ^ precision ≤ coefficient ∧ coefficient < 10 * 10 ^ precision ∧
+      coefficient * (if carry then 10 else 1) = rounded := by
+  dsimp only
+  have positive : 0 < 10 ^ precision := Nat.pow_pos (by decide)
+  by_cases boundary : rounded = 10 * 10 ^ precision
+  · simp [boundary, Nat.mul_comm]
+    omega
+  · simp [boundary]
+    omega
+
+theorem scientific_coefficient_correct (n d i j precision : Nat)
+    (num_lower : 10 ^ i ≤ n) (num_upper : n < 10 ^ (i + 1))
+    (den_lower : 10 ^ j ≤ d) (den_upper : d < 10 ^ (j + 1)) :
+    let a := n * 10 ^ j
+    let b := d * 10 ^ i
+    let scaled := (if a < b then 10 * a else a) * 10 ^ precision
+    let rounded := nearest_coefficient scaled b
+    let carry := rounded == 10 * 10 ^ precision
+    let coefficient := if carry then 10 ^ precision else rounded
+    let reconstructed := b * (coefficient * (if carry then 10 else 1))
+    let gap := max scaled reconstructed - min scaled reconstructed
+    10 ^ precision ≤ coefficient ∧ coefficient < 10 * 10 ^ precision ∧
+      2 * gap ≤ b ∧ (2 * gap = b → rounded % 2 = 0) := by
+  let a := n * 10 ^ j
+  let b := d * 10 ^ i
+  let magnitude := if a < b then 10 * a else a
+  let scale := 10 ^ precision
+  let scaled := magnitude * scale
+  have bpos : 0 < b := Nat.mul_pos (Nat.lt_of_lt_of_le (Nat.pow_pos (by decide)) den_lower)
+    (Nat.pow_pos (by decide))
+  have spos : 0 < scale := Nat.pow_pos (by decide)
+  obtain ⟨lo, hi⟩ : b ≤ magnitude ∧ magnitude < 10 * b :=
+    decimal_exponent_bracket n d i j num_lower num_upper den_lower den_upper
+  have qlo : scale ≤ scaled / b := by
+    apply (Nat.le_div_iff_mul_le bpos).2
+    simpa [scaled, Nat.mul_comm] using Nat.mul_le_mul_right scale lo
+  have qhi : scaled / b < 10 * scale := by
+    apply (Nat.div_lt_iff_lt_mul bpos).2
+    simpa [scaled, Nat.mul_assoc, Nat.mul_comm, Nat.mul_left_comm] using
+      Nat.mul_lt_mul_of_pos_right hi spos
+  have range : scale ≤ nearest_coefficient scaled b ∧ nearest_coefficient scaled b ≤ 10 * scale := by
+    unfold nearest_coefficient
+    dsimp only
+    split <;> omega
+  obtain ⟨lower, upper, exact_value⟩ := decimal_rounding_carry precision _ range.1 range.2
+  exact ⟨lower, upper, exact_value.symm ▸ nearest_coefficient_correct scaled b bpos⟩
+
 def modulus (width : Nat) : Int := 2 ^ width
 
 def unsigned (width : Nat) (value : Int) : Int := value % modulus width
@@ -1920,6 +2017,10 @@ theorem runtime_copy_snapshot (memory : Memory) (planes : Nat → CopyPlanes α)
   simp [runtime_copy, offsets]
 
 end Heresy
+#print axioms Heresy.decimal_exponent_bracket
+#print axioms Heresy.nearest_coefficient_correct
+#print axioms Heresy.scientific_coefficient_correct
+#print axioms Heresy.decimal_rounding_carry
 
 #print axioms Heresy.lower_correct
 #print axioms Heresy.checked_span

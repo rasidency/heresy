@@ -27,6 +27,8 @@ jobs:
           ! lake exe certificate dispatch /tmp/ChangedGraph.hs &&
           lake exe certificate memory /tmp/Values.hs &&
           lake exe certificate process /tmp/Values.hs &&
+          sed "s/d \&\& even q/d \&\& odd q/" /tmp/Values.hs > /tmp/Rounding.hs &&
+          ! lake exe certificate process /tmp/Rounding.hs &&
           lake exe certificate linkage /tmp/Values.hs /tmp/values/0.json &&
           dune exec --profile release -- heresy test/linkage/entry.c test/linkage/worker.c -o /tmp/Linkage.hs --ast-dir /tmp/units --build /tmp/linked &&
           lake exe certificate linkage /tmp/Linkage.hs /tmp/units/0.json /tmp/units/1.json &&
