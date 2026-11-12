@@ -1491,6 +1491,16 @@ def validates_process (generated : String) : Bool :=
     "      writeObject ident (updatedObject { bytes = snd updated })",
     "      event (\"read \" ++ show (B.length payload) ++ \" bytes into #\" ++ show ident)",
     "    pure (Number (toInteger (B.length payload) `div` number size))"]
+  let file_write := String.intercalate "\n" [
+    "builtin \"fwrite\" [source, size, count, value] = do",
+    "  total <- transferSize size count",
+    "  handle <- stream value",
+    "  if total == 0 then pure (Number 0) else do",
+    "    (_, object, displacement) <- checked total source",
+    "    let payload = B.pack [chr (fromInteger (M.findWithDefault 0 (displacement + i) (bytes object))) | i <- [0 .. total - 1]]",
+    "    io (B.hPut handle payload)",
+    "    event (\"write \" ++ show total ++ \" bytes\")",
+    "    pure count"]
   let epilogue := String.intercalate "\n" [
     "  outcome <- E.try (runWorld initial action)",
     "  let (result, final) = either (\\fault -> (Left fault, initial)) id outcome",
@@ -1505,7 +1515,7 @@ def validates_process (generated : String) : Bool :=
     "      hPutStrLn stderr (\"heresy panic: \" ++ message)",
     "      unless (enabled || null (recent final)) $ hPutStrLn stderr (intercalate \"\\n\" (reverse (recent final)))",
     "      exitWith (ExitFailure 70)"]
-  [nearestCoefficient, decimalDigits, fixedExtended, scientificExtended, transformer, finish, stream_seed, stream_lookup, register, close, file_read, epilogue].all
+  [nearestCoefficient, decimalDigits, fixedExtended, scientificExtended, transformer, finish, stream_seed, stream_lookup, register, close, file_read, file_write, epilogue].all
     (fun equation => (generated.splitOn ("\n" ++ equation ++ "\n")).length == 2)
 
 private def validates_aggregate_memory (generated : String) : Bool :=

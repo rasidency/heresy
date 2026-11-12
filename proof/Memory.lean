@@ -603,6 +603,50 @@ theorem file_read_after_release (before after : HeapState) (request : FileReadRe
     released_identity_stays_dead before after released allocated owned next released_ok trace
   simp [file_read_finish, file_read_destination, runtime_checked, same, found_last, liveness]
 
+def file_write_payload (memory : Memory) (source : Option Pointer) (size count : Nat) :
+    Except AccessFault (List Int) :=
+  if size * count = 0 then .ok []
+  else
+    match runtime_checked memory source (size * count : Nat) with
+    | .error why => .error why
+    | .ok (object, offset) => .ok ((List.range (size * count)).map (fun index => object.bytes (offset + index)))
+
+def FileWriteSnapshot (memory : Memory) (pointer : Pointer) (size count : Nat) (payload : List Int) : Prop :=
+  ∃ object, checked memory pointer (size * count) = some object ∧
+    payload.length = size * count ∧ ∀ (index : Nat) (inside : index < payload.length),
+      payload[index] = object.bytes ((pointer.address - object.base).toNat + index)
+
+theorem file_write_snapshot_correct (memory : Memory) (pointer : Pointer) (size count : Nat)
+    (nonempty : size * count ≠ 0) (payload : List Int) :
+    file_write_payload memory (some pointer) size count = .ok payload ↔
+      FileWriteSnapshot memory pointer size count payload := by
+  constructor
+  · intro returned
+    cases access : runtime_checked memory (some pointer) (size * count : Nat) with
+    | error why => simp only [file_write_payload, nonempty, if_false, access, reduceCtorEq] at returned
+    | ok pair =>
+      obtain ⟨object, offset⟩ := pair
+      obtain ⟨valid, displacement⟩ := (checked_refines memory pointer _ offset object).mp access
+      simp only [file_write_payload, nonempty, if_false, access, Except.ok.injEq] at returned
+      subst payload
+      exact ⟨object, valid, by simp, fun index inside => by simp [displacement]⟩
+  · rintro ⟨object, valid, length, bytes⟩
+    have access := (checked_refines memory pointer _ _ object).mpr ⟨valid, rfl⟩
+    simp only [file_write_payload, nonempty, if_false, access]
+    apply congrArg Except.ok
+    apply List.ext_getElem
+    · simpa using length.symm
+    · intro index _ inside
+      simpa using (bytes index inside).symm
+
+theorem file_read_write_roundtrip (object : Object) (offset : Nat) (payload : List Int) :
+    (List.range payload.length).map (fun index =>
+      (file_read_bytes object offset payload).bytes (offset + index)) = payload := by
+  apply List.ext_getElem
+  · simp
+  · intro index _ inside
+    simpa using file_read_copies_partial_element object offset payload index inside
+
 end Heresy
 
 #print axioms Heresy.heap_trace_allocated
@@ -629,3 +673,5 @@ end Heresy
 #print axioms Heresy.file_read_preserves_outside
 #print axioms Heresy.file_read_writes_within_allocation
 #print axioms Heresy.file_read_after_release
+#print axioms Heresy.file_write_snapshot_correct
+#print axioms Heresy.file_read_write_roundtrip
