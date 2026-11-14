@@ -572,6 +572,37 @@ theorem closed_stream_stays_invalid (before closed after : StreamTable α) (toke
     | step _ action earlier => exact stream_step_preserves_retired _ _ action _ earlier
   simp [stream_lookup, same, still_retired.2]
 
+def close_stream (table : StreamTable α) (token : StreamToken) (host_close : α → Except ε Unit) :
+    Option (Int × StreamTable α) := do
+  let handle ← stream_lookup table token
+  let claimed := { table with handles := fun ident => if ident = token.ident then none else table.handles ident }
+  match host_close handle with
+  | .error _ => some (-1, claimed)
+  | .ok () => some (0, claimed)
+
+theorem close_stream_correct (table after : StreamTable α) (token : StreamToken)
+    (host_close : α → Except ε Unit) (status : Int) :
+    close_stream table token host_close = some (status, after) ↔
+      unregister_stream table token = some after ∧ ∃ handle, stream_lookup table token = some handle ∧
+        ((host_close handle = .ok () ∧ status = 0) ∨ ((∃ why, host_close handle = .error why) ∧ status = -1)) := by
+  cases found : stream_lookup table token with
+  | none => simp [close_stream, unregister_stream, found]
+  | some handle =>
+    cases result : host_close handle with
+    | error why => simp [close_stream, unregister_stream, found, result, eq_comm, and_comm]
+    | ok value => cases value; simp [close_stream, unregister_stream, found, result, eq_comm, and_comm]
+
+theorem close_stream_retires_on_error (before closed after : StreamTable α) (token alias : StreamToken)
+    (host_close : α → Except ε Unit) (handle : α) (why : ε) (valid : before.valid)
+    (same : alias.ident = token.ident) (found : stream_lookup before token = some handle)
+    (failed : host_close handle = .error why) (claimed : unregister_stream before token = some closed)
+    (later : StreamTrace closed after) :
+    close_stream before token host_close = some (-1, closed) ∧ close_stream after alias host_close = none := by
+  have retired := closed_stream_stays_invalid before closed after token alias valid same claimed later
+  simp [unregister_stream, found] at claimed
+  subst closed
+  simp [close_stream, found, failed, retired]
+
 theorem wrong_stream_address_is_rejected (table : StreamTable α) (token : StreamToken)
     (invalid : token.address ≠ stream_address token.ident) : stream_lookup table token = none := by
   simp [stream_lookup, invalid]
@@ -586,5 +617,7 @@ end Heresy
 #print axioms Heresy.process_exit_is_final
 #print axioms Heresy.closed_stream_stays_invalid
 #print axioms Heresy.wrong_stream_address_is_rejected
+#print axioms Heresy.close_stream_retires_on_error
+#print axioms Heresy.close_stream_correct
 #print axioms Heresy.stream_trace_valid
 #print axioms Heresy.registered_stream_address_range

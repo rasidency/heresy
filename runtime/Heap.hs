@@ -1493,12 +1493,17 @@ builtin "fopen" [path, mode] = do
         Nothing -> io (hClose handle) >> panic "stream identity space exhausted"
         Just available -> pure available
       pure (Stream ident (4611686018427387904 + toInteger ident))
-builtin "fclose" [value@(Stream ident _)] = do
-  handle <- stream value
-  io (hClose handle)
+builtin "fclose" [Stream ident raw] = do
+  unless (raw == 4611686018427387904 + toInteger ident) (panic "closed or invalid file stream")
   table <- gets streamTable
-  liftIO $ atomicModifyIORef' table $ \(next, entries) -> ((next, M.delete ident entries), ())
-  pure (Number 0)
+  result <- liftIO $ E.mask_ $ do
+    claimed <- atomicModifyIORef' table $ \(next, entries) ->
+      let (handle, remaining) = M.updateLookupWithKey (\_ _ -> Nothing) ident entries
+      in ((next, remaining), handle)
+    traverse (tryIOError . hClose) claimed
+  case result of
+    Nothing -> panic "closed or invalid file stream"
+    Just closed -> pure (Number (either (const (-1)) (const 0) closed))
 builtin "fread" [destination, size, count, value] = do
   total <- transferSize size count
   handle <- stream value

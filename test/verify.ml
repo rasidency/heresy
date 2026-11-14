@@ -190,6 +190,10 @@ let () =
       check ("fixture " ^ name ^ "\n" ^ generated ^ "expected:\n" ^ native) (native = generated);
       generated
     in
+    if Sys.file_exists "/dev/full" then begin
+      let output = fixture "full" "#include <stdio.h>\nint main(void){FILE *stream=fopen(\"/dev/full\",\"wb\");if(!stream)return 2;size_t n=fwrite(\"x\",1,1,stream);int closed=fclose(stream);printf(\"%lu %d\\n\",(unsigned long)n,closed);return 0;}" in
+      check "deferred output error reaches fclose" (output = "1 -1\n")
+    end;
     let calls = fixture "calls" "#include <stdio.h>\nlong wide(long x){return x;} int narrow(void){return -1;} int one(int x){return x;} int main(void){long(*a)(int)=(long(*)(int))wide;long(*r)(void)=(long(*)(void))narrow;int(*many)(int,int)=(int(*)(int,int))one;printf(\"%ld %ld %d\\n\",a(-1),r(),many(3,4));printf(\"%04d %hhd %hhu %o %X\\n\",-7,-1,255,15U,255U);int c=putchar(-1);printf(\" %d\\n\",c);return 0;}" in
     check "calling convention slots and integer formats" (contains calls "4294967295 4294967295 3" && contains calls "-007 -1 255 17 FF" && contains calls "\255 255");
     let lowered = fixture "lowering" (read "test/lowering.c") in
