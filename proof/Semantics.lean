@@ -424,16 +424,21 @@ def process_report : ProcessOutcome → List ProcessEvent
     [.stderr ("heresy panic: " ++ message)] ++
     (if tracing || recent.isEmpty then [] else [.stderr (String.intercalate "\n" recent.reverse)]) ++ [.exit 70]
 
+def stdout_cleanup : ProcessOutcome → List ProcessEvent
+  | .returned _ | .finished _ => [.flush_stdout]
+  | .transfer | .panic .. => []
+
 def process_epilogue (handles : List Nat) (outcome : ProcessOutcome) : List ProcessEvent :=
-  handles.map .close ++ .flush_stdout :: process_report outcome
+  handles.map .close ++ stdout_cleanup outcome ++ process_report outcome
 
 theorem process_return (handles : List Nat) (value : Int) :
     process_epilogue handles (.returned value) = process_epilogue handles (process_exit (signed 32 value)) := by
-  simp [process_epilogue, process_exit, process_report, exit_status_truncation]
+  simp [process_epilogue, process_exit, process_report, stdout_cleanup, exit_status_truncation]
 
-theorem process_closes_then_flushes (handles : List Nat) (outcome : ProcessOutcome) :
-    (process_epilogue handles outcome).take (handles.length + 1) = handles.map .close ++ [.flush_stdout] ∧
-    (process_epilogue handles outcome).drop (handles.length + 1) = process_report outcome := by
+theorem process_cleanup_order (handles : List Nat) (outcome : ProcessOutcome) :
+    let prefixEvents := handles.map ProcessEvent.close ++ stdout_cleanup outcome
+    (process_epilogue handles outcome).take prefixEvents.length = prefixEvents ∧
+    (process_epilogue handles outcome).drop prefixEvents.length = process_report outcome := by
   simp [process_epilogue, List.take_append, List.drop_append]
   exact List.take_of_length_le (by simp)
 
@@ -442,21 +447,116 @@ theorem process_exit_is_final (handles : List Nat) (outcome : ProcessOutcome) :
       ∀ code, ProcessEvent.exit code ∉ earlier := by
   cases outcome with
   | returned value =>
-    exact ⟨unsigned 8 value, handles.map .close ++ [.flush_stdout], by simp [process_epilogue, process_report, List.append_assoc],
+    exact ⟨unsigned 8 value, handles.map .close ++ [.flush_stdout], by simp [process_epilogue, stdout_cleanup, process_report, List.append_assoc],
       by simp⟩
   | finished status =>
-    exact ⟨status, handles.map .close ++ [.flush_stdout], by simp [process_epilogue, process_report, List.append_assoc],
+    exact ⟨status, handles.map .close ++ [.flush_stdout], by simp [process_epilogue, stdout_cleanup, process_report, List.append_assoc],
       by simp⟩
   | transfer =>
-    exact ⟨70, handles.map .close ++ [.flush_stdout, .stderr "heresy panic: control transfer escaped its function"],
-      by simp [process_epilogue, process_report, List.append_assoc], by simp⟩
+    exact ⟨70, handles.map .close ++ [.stderr "heresy panic: control transfer escaped its function"],
+      by simp [process_epilogue, stdout_cleanup, process_report, List.append_assoc], by simp⟩
   | panic message recent tracing =>
     by_cases immediate : (tracing || recent.isEmpty) = true
-    · exact ⟨70, handles.map .close ++ [.flush_stdout, .stderr ("heresy panic: " ++ message)],
-        by simp [process_epilogue, process_report, immediate, List.append_assoc], by simp⟩
-    · exact ⟨70, handles.map .close ++ [.flush_stdout, .stderr ("heresy panic: " ++ message),
+    · exact ⟨70, handles.map .close ++ [.stderr ("heresy panic: " ++ message)],
+        by simp [process_epilogue, stdout_cleanup, process_report, immediate, List.append_assoc], by simp⟩
+    · exact ⟨70, handles.map .close ++ [.stderr ("heresy panic: " ++ message),
           .stderr (String.intercalate "\n" recent.reverse)],
-        by simp [process_epilogue, process_report, immediate, List.append_assoc], by simp⟩
+        by simp [process_epilogue, stdout_cleanup, process_report, immediate, List.append_assoc], by simp⟩
+
+structure StdoutState where
+  visible : List UInt8
+  pending : List UInt8
+  line : Bool
+
+structure StdoutBuffer where
+  visible : List UInt8
+  chunks : List (List UInt8)
+  size : Nat
+  line : Bool
+
+def StdoutBuffer.snapshot (buffer : StdoutBuffer) : StdoutState :=
+  ⟨buffer.visible, buffer.chunks.reverse.flatten, buffer.line⟩
+
+def stdout_boundary (line : Bool) (size : Nat) (bytes : List UInt8) : Nat :=
+  if bytes.length > 1024 - size then bytes.length
+  else if line then bytes.length - bytes.reverse.idxOf 10 else 0
+
+theorem stdout_last_newline (size : Nat) (prefixBytes suffix : List UInt8) (last : 10 ∉ suffix)
+    (fits : (prefixBytes ++ 10 :: suffix).length ≤ 1024 - size) :
+    stdout_boundary true size (prefixBytes ++ 10 :: suffix) = prefixBytes.length + 1 := by
+  simp only [stdout_boundary, Nat.not_lt.mpr fits, if_false, if_true]
+  have missing : (10 : UInt8) ∉ suffix.reverse := by simpa using last
+  simp [List.reverse_cons, List.idxOf_append, missing, List.append_assoc]
+  omega
+
+def stdout_write (terminal : Bool) (state : StdoutState) (bytes : List UInt8) : StdoutState :=
+  let cut := stdout_boundary state.line state.pending.length bytes
+  if cut = 0 then { state with pending := state.pending ++ bytes }
+  else ⟨state.visible ++ state.pending ++ bytes.take cut, bytes.drop cut, terminal⟩
+
+def stdout_buffer_write (terminal : Bool) (buffer : StdoutBuffer) (bytes : List UInt8) : StdoutBuffer :=
+  let cut := stdout_boundary buffer.line buffer.size bytes
+  if bytes.isEmpty then buffer
+  else if cut = 0 then { buffer with chunks := bytes :: buffer.chunks, size := buffer.size + bytes.length }
+  else
+    let suffix := bytes.drop cut
+    ⟨buffer.visible ++ ((bytes.take cut :: buffer.chunks).reverse.flatten),
+      if suffix.isEmpty then [] else [suffix], suffix.length, terminal⟩
+
+theorem stdout_write_correct (terminal : Bool) (buffer : StdoutBuffer) (bytes : List UInt8)
+    (valid : buffer.size = buffer.snapshot.pending.length) :
+    let next := stdout_buffer_write terminal buffer bytes
+    next.snapshot = stdout_write terminal buffer.snapshot bytes ∧ next.size = next.snapshot.pending.length := by
+  unfold StdoutBuffer.snapshot at *
+  by_cases empty : bytes = []
+  · subst bytes
+    simp [stdout_buffer_write, stdout_write, stdout_boundary, valid]
+  · simp only [stdout_buffer_write, List.isEmpty_iff, empty, if_false,
+      stdout_write, valid]
+    split
+    · simp [List.flatten_append]
+    · split <;> simp_all [List.flatten_append, List.append_assoc]
+
+theorem stdout_prefix_correct (terminal : Bool) (initial : StdoutBuffer) (writes : List (List UInt8))
+    (valid : initial.size = initial.snapshot.pending.length) :
+    (writes.foldl (stdout_buffer_write terminal) initial).snapshot =
+      writes.foldl (stdout_write terminal) initial.snapshot := by
+  induction writes generalizing initial with
+  | nil => rfl
+  | cons bytes rest ih =>
+    obtain ⟨same, next_valid⟩ := stdout_write_correct terminal initial bytes valid
+    simp only [List.foldl_cons, ih _ next_valid, same]
+
+theorem stdout_write_preserves_bytes (terminal : Bool) (state : StdoutState) (bytes : List UInt8) :
+    let next := stdout_write terminal state bytes
+    next.visible ++ next.pending = state.visible ++ state.pending ++ bytes := by
+  unfold stdout_write
+  dsimp only
+  split <;> simp [List.append_assoc]
+
+theorem stdout_pending_bounded (terminal : Bool) (state : StdoutState) (bytes : List UInt8)
+    (bounded : state.pending.length ≤ 1024) :
+    (stdout_write terminal state bytes).pending.length ≤ 1024 := by
+  by_cases spill : bytes.length > 1024 - state.pending.length
+  · have nonempty : bytes.length ≠ 0 := by omega
+    simp [stdout_write, stdout_boundary, spill, nonempty]
+  · unfold stdout_write
+    dsimp only
+    split <;> simp only [List.length_append, List.length_drop] <;> omega
+
+theorem stdout_visible_extends (terminal : Bool) (state : StdoutState) (writes : List (List UInt8)) :
+    ∃ emitted, (writes.foldl (stdout_write terminal) state).visible = state.visible ++ emitted := by
+  induction writes generalizing state with
+  | nil => exact ⟨[], by simp⟩
+  | cons bytes rest ih =>
+    obtain ⟨later, eq⟩ := ih (stdout_write terminal state bytes)
+    simp only [List.foldl_cons, eq]
+    unfold stdout_write
+    dsimp only
+    split
+    · exact ⟨later, rfl⟩
+    · exact ⟨state.pending ++ (bytes.take (stdout_boundary state.line state.pending.length bytes) ++ later),
+        by simp [List.append_assoc]⟩
 
 structure StreamToken where
   ident : Nat
@@ -613,11 +713,14 @@ end Heresy
 #print axioms Heresy.approximation_complete
 #print axioms Heresy.recursive_target_refines
 #print axioms Heresy.process_return
-#print axioms Heresy.process_closes_then_flushes
+#print axioms Heresy.process_cleanup_order
 #print axioms Heresy.process_exit_is_final
 #print axioms Heresy.closed_stream_stays_invalid
 #print axioms Heresy.wrong_stream_address_is_rejected
 #print axioms Heresy.close_stream_retires_on_error
 #print axioms Heresy.close_stream_correct
+#print axioms Heresy.stdout_prefix_correct
+#print axioms Heresy.stdout_write_preserves_bytes
+#print axioms Heresy.stdout_visible_extends
 #print axioms Heresy.stream_trace_valid
 #print axioms Heresy.registered_stream_address_range

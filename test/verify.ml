@@ -146,9 +146,11 @@ let () =
     check ("representation and control flow differential\nexpected:\n" ^ native ^ "actual:\n" ^ generated) (native = generated);
     compile "alias";
     let code, output, errors = run "build/alias" [] in
-    check "shared capability invalidation" (code = 70 && contains output "Alias capability after free: 0" && contains errors "use after free" && contains errors "alias.c:17");
+    check "shared capability invalidation" (code = 70 && contains errors "use after free" && contains errors "alias.c:17");
     let native_code, native_out, native_err = run "build/aliasref" [] in
     check "Fil-C rejects the same alias access" (native_code <> 0 && contains (native_out ^ native_err) "cannot access pointer to free object");
+    check "panics retain the stdout prefix visible before the fault"
+      (output = native_out && contains output "Alias before free: 42");
     compile "bounds";
     check "in-bounds access matches Fil-C" (success "build/bounds" [] = success "build/boundsref" []);
     let code, _, errors = run "build/bounds" ["16"] in
@@ -194,6 +196,7 @@ let () =
       let output = fixture "full" "#include <stdio.h>\nint main(void){FILE *stream=fopen(\"/dev/full\",\"wb\");if(!stream)return 2;size_t n=fwrite(\"x\",1,1,stream);int closed=fclose(stream);printf(\"%lu %d\\n\",(unsigned long)n,closed);return 0;}" in
       check "deferred output error reaches fclose" (output = "1 -1\n")
     end;
+    ignore (fixture "visible" "#include <stdio.h>\nint main(void){for(int i=0;i<2048;i++)putchar(65);FILE *stream=fopen(\"/proc/self/fd/1\",\"rb\");if(!stream)return 2;char bytes[2048];size_t visible=fread(bytes,1,sizeof bytes,stream);return fclose(stream)||visible!=1025;}");
     let calls = fixture "calls" "#include <stdio.h>\nlong wide(long x){return x;} int narrow(void){return -1;} int one(int x){return x;} int main(void){long(*a)(int)=(long(*)(int))wide;long(*r)(void)=(long(*)(void))narrow;int(*many)(int,int)=(int(*)(int,int))one;printf(\"%ld %ld %d\\n\",a(-1),r(),many(3,4));printf(\"%04d %hhd %hhu %o %X\\n\",-7,-1,255,15U,255U);int c=putchar(-1);printf(\" %d\\n\",c);return 0;}" in
     check "calling convention slots and integer formats" (contains calls "4294967295 4294967295 3" && contains calls "-007 -1 255 17 FF" && contains calls "\255 255");
     let lowered = fixture "lowering" (read "test/lowering.c") in

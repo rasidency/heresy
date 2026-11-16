@@ -179,7 +179,8 @@ private def startup_nodes : Nat → Json → Except String (List Json)
   | 0, _ => .error "incomplete traversal of a typed translation unit"
   | depth + 1, node => do
     let children := child_nodes node
-    let children := if field_text node "kind" == "GenericSelectionExpr" then
+    let children := if field_text node "kind" == "OpaqueValueExpr" then []
+      else if field_text node "kind" == "GenericSelectionExpr" then
         children.filter (fun child => json_field child "selected" == .bool true)
       else if children.isEmpty then ((json_field node "array_filler").getArr?.toOption.getD #[]).toList.drop 1
       else children
@@ -243,7 +244,7 @@ private def render_link_line (entries : List (String × String)) (count : Nat) (
 private def validates_link_runtime (generated : String) : Bool :=
   let gate := "  gate <- if parallel then Just <$> newMVar () else pure Nothing"
   let setup := String.intercalate "\n" [
-    "      initial = World counter [] S.empty S.empty (S.fromList entries) codes \"startup\" 0 [] False False table gate threads owner nullPointer initThread",
+    "      initial = World counter [] S.empty S.empty (S.fromList entries) codes \"startup\" 0 [] False False table (terminal, output) gate threads owner nullPointer initThread",
     "      action = do",
     "        initialiser",
     "        when parallel $ do",
@@ -1441,6 +1442,49 @@ def validates_process (generated : String) : Bool :=
     "    (coefficient, power) = if rounded == 10 * scale then (scale, decimalPower + 1) else (rounded, decimalPower)",
     "    digits = show (abs power)",
     "scientificExtended precision value = fixedExtended precision value"]
+  let bufferOutput := String.intercalate "\n" [
+    "bufferOutput :: Bool -> OutputBuffer -> B.ByteString -> (Maybe B.ByteString, OutputBuffer)",
+    "bufferOutput terminal before@(OutputBuffer line size chunks) input",
+    "  | B.null input = (Nothing, before)",
+    "  | B.length input > 1024 - size = flush input B.empty",
+    "  | line, Just index <- B.elemIndexEnd '\\n' input =",
+    "      let (prefix, suffix) = B.splitAt (index + 1) input in flush prefix suffix",
+    "  | otherwise = (Nothing, OutputBuffer line (size + B.length input) (input : chunks))",
+    "  where",
+    "    flush prefix suffix = (Just (B.concat (reverse (prefix : chunks))),",
+    "      OutputBuffer terminal (B.length suffix) [suffix | not (B.null suffix)])"]
+  let sendOutput := String.intercalate "\n" [
+    "sendOutput :: B.ByteString -> IO (Either IOError ())",
+    "sendOutput bytes = tryIOError (B.hPut stdout bytes >> hFlush stdout)"]
+  let writeOutput := String.intercalate "\n" [
+    "writeOutput :: [B.ByteString] -> R Bool",
+    "writeOutput inputs = do",
+    "  (terminal, lock) <- gets outputStream",
+    "  let write buffer [] = pure (buffer, True)",
+    "      write buffer (chunk : rest) = case bufferOutput terminal buffer chunk of",
+    "        (Nothing, next) -> write next rest",
+    "        (Just bytes, next) -> do",
+    "          sent <- sendOutput bytes",
+    "          case sent of",
+    "            Left _ -> pure (OutputBuffer terminal 0 [], False)",
+    "            Right () -> write next rest",
+    "  liftIO (modifyMVar lock (\\buffer -> write buffer inputs))"]
+  let printBytes := String.intercalate "\n" [
+    "printBytes :: String -> R Value",
+    "printBytes text = do",
+    "  sent <- writeOutput [B.pack text]",
+    "  pure (Number (if sent then toInteger (length text) else -1))"]
+  let output_calls := String.intercalate "\n" [
+    "builtin \"puts\" [p] = do",
+    "  text <- readString p",
+    "  sent <- writeOutput [B.pack text, B.singleton '\\n']",
+    "  pure (Number (if sent then 0 else -1))",
+    "builtin \"putchar\" [v] = do",
+    "  let byte = number v `mod` 256",
+    "  sent <- writeOutput [B.singleton (chr (fromInteger byte))]",
+    "  pure (Number (if sent then byte else -1))",
+    "builtin \"printf\" (p : values) = readString p >>= \\pattern -> format takeValue pattern values >>= printBytes",
+    "builtin \"vprintf\" [p, list] = readString p >>= \\pattern -> format takeVariadic pattern list >>= printBytes"]
   let transformer := String.intercalate "\n" [
     "newtype R a = R { unR :: ExceptT Fault (StateT World IO) a }",
     "  deriving (Functor, Applicative, Monad, MonadIO, MonadState World, MonadError Fault)",
@@ -1448,7 +1492,10 @@ def validates_process (generated : String) : Bool :=
     "runWorld :: World -> R a -> IO (Either Fault a, World)",
     "runWorld world action = runStateT (runExceptT (unR action)) world"]
   let finish := "builtin \"exit\" [code] = throwError (Finish (fromInteger (number code `mod` 256)))"
-  let stream_seed := "  table <- newIORef (1, M.empty)"
+  let stream_seed := String.intercalate "\n" [
+    "  table <- newIORef (1, M.empty)",
+    "  terminal <- either (const False) id <$> tryIOError (hIsTerminalDevice stdout)",
+    "  output <- newMVar (OutputBuffer True 0 [])"]
   let stream_lookup := String.intercalate "\n" [
     "stream :: Value -> R Handle",
     "stream (Stream ident raw) = do",
@@ -1511,7 +1558,13 @@ def validates_process (generated : String) : Bool :=
     "  let (result, final) = either (\\fault -> (Left fault, initial)) id outcome",
     "  handles <- snd <$> readIORef table",
     "  forM_ (M.elems handles) (void . tryIOError . hClose)",
-    "  hFlush stdout",
+    "  let flushOutput = modifyMVar_ output $ \\(OutputBuffer line _ chunks) -> do",
+    "        void (sendOutput (B.concat (reverse chunks)))",
+    "        pure (OutputBuffer line 0 [])",
+    "  case result of",
+    "    Right _ -> flushOutput",
+    "    Left (Finish _) -> flushOutput",
+    "    _ -> pure ()",
     "  case result of",
     "    Right value -> let code = fromInteger (number value `mod` 256) in exitWith (if code == 0 then ExitSuccess else ExitFailure code)",
     "    Left (Finish code) -> exitWith (if code == 0 then ExitSuccess else ExitFailure code)",
@@ -1520,7 +1573,7 @@ def validates_process (generated : String) : Bool :=
     "      hPutStrLn stderr (\"heresy panic: \" ++ message)",
     "      unless (enabled || null (recent final)) $ hPutStrLn stderr (intercalate \"\\n\" (reverse (recent final)))",
     "      exitWith (ExitFailure 70)"]
-  [nearestCoefficient, decimalDigits, fixedExtended, scientificExtended, transformer, finish, stream_seed, stream_lookup, register, close, file_read, file_write, epilogue].all
+  [bufferOutput, sendOutput, writeOutput, printBytes, output_calls, nearestCoefficient, decimalDigits, fixedExtended, scientificExtended, transformer, finish, stream_seed, stream_lookup, register, close, file_read, file_write, epilogue].all
     (fun equation => (generated.splitOn ("\n" ++ equation ++ "\n")).length == 2)
 
 private def validates_aggregate_memory (generated : String) : Bool :=

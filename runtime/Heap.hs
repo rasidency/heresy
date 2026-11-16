@@ -62,6 +62,7 @@ data Object = Object
   { base :: !Integer, extent :: !Int, live :: !Bool, storage :: !String
   , bytes :: !(M.IntMap Integer), shadow :: !(M.IntMap Value), atomicSlots :: !I.IntSet
   , synchronisation :: !(M.IntMap Synchronisation), arraySpans :: ![Integer], origin :: !String }
+data OutputBuffer = OutputBuffer !Bool !Int ![B.ByteString]
 data World = World
   { allocationCounter :: !(IORef (Int, Integer))
   , frames :: ![S.Map String Value], globals :: !(S.Map String Value)
@@ -69,6 +70,7 @@ data World = World
   , symbols :: !(S.Map String Integer)
   , location :: !String, events :: !Int, recent :: ![String], tracing :: !Bool, history :: !Bool
   , streamTable :: !(IORef (Int, M.IntMap Handle))
+  , outputStream :: !(Bool, MVar OutputBuffer)
   , memoryGate :: !(Maybe (MVar ())), threadTable :: !(MVar (S.Map Integer (MVar Value)))
   , rootThread :: !ThreadId, currentThread :: !Value, threadInitialiser :: !(R ()) }
 newtype R a = R { unR :: ExceptT Fault (StateT World IO) a }
@@ -1428,8 +1430,35 @@ takeVariadic ty cursor = do
 
 printBytes :: String -> R Value
 printBytes text = do
-  liftIO (B.putStr (B.pack text))
-  pure (Number (toInteger (length text)))
+  sent <- writeOutput [B.pack text]
+  pure (Number (if sent then toInteger (length text) else -1))
+
+bufferOutput :: Bool -> OutputBuffer -> B.ByteString -> (Maybe B.ByteString, OutputBuffer)
+bufferOutput terminal before@(OutputBuffer line size chunks) input
+  | B.null input = (Nothing, before)
+  | B.length input > 1024 - size = flush input B.empty
+  | line, Just index <- B.elemIndexEnd '\n' input =
+      let (prefix, suffix) = B.splitAt (index + 1) input in flush prefix suffix
+  | otherwise = (Nothing, OutputBuffer line (size + B.length input) (input : chunks))
+  where
+    flush prefix suffix = (Just (B.concat (reverse (prefix : chunks))),
+      OutputBuffer terminal (B.length suffix) [suffix | not (B.null suffix)])
+
+sendOutput :: B.ByteString -> IO (Either IOError ())
+sendOutput bytes = tryIOError (B.hPut stdout bytes >> hFlush stdout)
+
+writeOutput :: [B.ByteString] -> R Bool
+writeOutput inputs = do
+  (terminal, lock) <- gets outputStream
+  let write buffer [] = pure (buffer, True)
+      write buffer (chunk : rest) = case bufferOutput terminal buffer chunk of
+        (Nothing, next) -> write next rest
+        (Just bytes, next) -> do
+          sent <- sendOutput bytes
+          case sent of
+            Left _ -> pure (OutputBuffer terminal 0 [], False)
+            Right () -> write next rest
+  liftIO (modifyMVar lock (\buffer -> write buffer inputs))
 
 copyMemory :: Value -> Value -> Int -> R Value
 copyMemory destination _ 0 = pure destination
@@ -1560,12 +1589,12 @@ builtin name [Pointer capability _] | name == "zgetlower" || name == "zgetupper"
       pure (Pointer capability (base object + if name == "zgetupper" && live object then toInteger (extent object) else 0))
 builtin "puts" [p] = do
   text <- readString p
-  liftIO (B.putStr (B.pack (text ++ "\n")))
-  pure (Number 0)
+  sent <- writeOutput [B.pack text, B.singleton '\n']
+  pure (Number (if sent then 0 else -1))
 builtin "putchar" [v] = do
   let byte = number v `mod` 256
-  liftIO (B.putStr (B.singleton (chr (fromInteger byte))))
-  pure (Number byte)
+  sent <- writeOutput [B.singleton (chr (fromInteger byte))]
+  pure (Number (if sent then byte else -1))
 builtin "printf" (p : values) = readString p >>= \pattern -> format takeValue pattern values >>= printBytes
 builtin "vprintf" [p, list] = readString p >>= \pattern -> format takeVariadic pattern list >>= printBytes
 builtin "pthread_create" [destination, attributes, callable, argumentValue] = do
@@ -1735,13 +1764,15 @@ execute entries labels parallel initialiser initThread = do
       recorded = enabled || traceMode == Just "recent"
   counter <- newIORef (1, 4096)
   table <- newIORef (1, M.empty)
+  terminal <- either (const False) id <$> tryIOError (hIsTerminalDevice stdout)
+  output <- newMVar (OutputBuffer True 0 [])
   gate <- if parallel then Just <$> newMVar () else pure Nothing
   threads <- newMVar S.empty
   owner <- myThreadId
   let names = map fst entries ++ labels ++ map fst pthreadArities ++
         ["malloc", "calloc", "free", "memcpy", "memmove", "memset", "strlen", "strcmp", "puts", "putchar", "printf", "vprintf", "exit", "zhasvalidcap", "zis_readonly", "zgetlower", "zgetupper", "fopen", "fread", "fwrite", "fclose"]
       codes = S.fromList (zip names [9223372036854775808..])
-      initial = World counter [] S.empty S.empty (S.fromList entries) codes "startup" 0 [] False False table gate threads owner nullPointer initThread
+      initial = World counter [] S.empty S.empty (S.fromList entries) codes "startup" 0 [] False False table (terminal, output) gate threads owner nullPointer initThread
       action = do
         initialiser
         when parallel $ do
@@ -1760,7 +1791,13 @@ execute entries labels parallel initialiser initThread = do
   let (result, final) = either (\fault -> (Left fault, initial)) id outcome
   handles <- snd <$> readIORef table
   forM_ (M.elems handles) (void . tryIOError . hClose)
-  hFlush stdout
+  let flushOutput = modifyMVar_ output $ \(OutputBuffer line _ chunks) -> do
+        void (sendOutput (B.concat (reverse chunks)))
+        pure (OutputBuffer line 0 [])
+  case result of
+    Right _ -> flushOutput
+    Left (Finish _) -> flushOutput
+    _ -> pure ()
   case result of
     Right value -> let code = fromInteger (number value `mod` 256) in exitWith (if code == 0 then ExitSuccess else ExitFailure code)
     Left (Finish code) -> exitWith (if code == 0 then ExitSuccess else ExitFailure code)
