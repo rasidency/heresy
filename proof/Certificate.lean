@@ -1674,7 +1674,151 @@ private def validates_pointer_memory (generated : String) : Bool :=
     "      caps = if ty == PointerType then M.insert displacement converted (shadow object) else shadow object"]
   [width, checked_load, load, checked_store, store].all (fun equation => (generated.splitOn ("\n" ++ equation ++ "\n")).length == 2)
 
+inductive SharedExpression where
+  | literal (value : Nat)
+  | call (name : String)
+  | choose (common fallback : SharedExpression)
+
+def SharedExpression.source (call : String → σ → Except ε Int × σ) :
+    SharedExpression → σ → Except ε Int × σ
+  | .literal n, state => (.ok n, state)
+  | .call name, state => call name state
+  | .choose common fallback, state =>
+    match common.source call state with
+    | (.error why, next) => (.error why, next)
+    | (.ok n, next) => if n = 0 then fallback.source call next else (.ok n, next)
+
+def SharedExpression.target (call : String → σ → Except ε Int × σ) :
+    SharedExpression → σ → Except ε Int × σ
+  | .literal n => fun state => (.ok n, state)
+  | .call name => call name
+  | .choose common fallback => bind_action (common.target call) fun shared =>
+      branch_action (fun state => (.ok (shared != 0), state))
+        (fun state => (.ok shared, state)) (fallback.target call)
+
+theorem shared_expression_correct (expr : SharedExpression) (call : String → σ → Except ε Int × σ) :
+    expr.target call = expr.source call := by
+  induction expr with
+  | literal n => rfl
+  | call name => rfl
+  | choose common fallback left right =>
+    funext state
+    simp only [SharedExpression.target, SharedExpression.source, left, right, branch_action, bind_action]
+    obtain ⟨result, next⟩ := common.source call state
+    cases result with
+    | error why => rfl
+    | ok n => by_cases zero : n = 0 <;> simp [zero]
+
+private def SharedExpression.haskell : SharedExpression → String
+  | .literal n => "pure (Number (" ++ toString n ++ "))"
+  | .call name => "invoke (Just (IntegerType 32 True)) (function " ++ haskell_quote name ++ ") []"
+  | .choose common fallback => "conditional (" ++ common.haskell ++
+      ") (\\shared -> pure shared) (\\shared -> pure shared) (" ++ fallback.haskell ++ ")"
+
+private def refers_to_common (common opaqueNode : Json) : Bool :=
+  match child_nodes opaqueNode with
+  | [child] => field_text opaqueNode "kind" == "OpaqueValueExpr" && field_text common "id" != "" &&
+      field_text child "id" == field_text common "id" && type_spelling opaqueNode == "int"
+  | _ => false
+
+private def read_shared : Nat → Json → Except String SharedExpression
+  | 0, _ => .error "incomplete shared expression"
+  | depth + 1, node => do
+    unless type_spelling node == "int" do throw "expected an int expression"
+    match field_text node "kind", child_nodes node with
+    | "ParenExpr", [child] => read_shared depth child
+    | "IntegerLiteral", [] =>
+      let n ← require (field_text node "value").toNat? "invalid integer literal"
+      unless n < 2147483648 do throw "integer literal exceeds int"
+      pure (.literal n)
+    | "CallExpr", [callee] =>
+      let name := direct_callee depth callee
+      if name.isEmpty then throw "expected a direct call" else pure (.call name)
+    | "BinaryConditionalOperator", [common, test, reused, fallback] =>
+      unless refers_to_common common test && refers_to_common common reused &&
+          field_text test "id" != "" && field_text test "id" == field_text reused "id" do
+        throw "conditional operands differ from the shared value"
+      return .choose (← read_shared depth common) (← read_shared depth fallback)
+    | _, _ => throw "unsupported shared expression"
+
+private def location_rest : List Char → Option (List Char)
+  | '"' :: rest => some rest
+  | '\\' :: _ :: rest => location_rest rest
+  | '\\' :: [] | [] => none
+  | _ :: rest => location_rest rest
+
+private def skip_location (head line : String) : Option String := do
+  guard (line.startsWith (head ++ "\""))
+  return String.mk (← location_rest (line.drop (head.length + 1)).toList)
+
+private def shared_body (name line : String) : Option String := do
+  let after ← skip_location (hex_binding "f" name ++ " _ = at ") line
+  let block ← skip_location " (marshal (IntegerType 32 True) <$> (frame (do { atFlow " after
+  let statement ← skip_location " (chain [(atFlow " block
+  let start := " (Return <$> ("
+  let stop := ")))]) })))"
+  guard (statement.startsWith start && statement.endsWith stop)
+  return (statement.drop start.length).take (statement.length - start.length - stop.length)
+
+def checked_shared_body (name line : String) (expr : SharedExpression) : Bool :=
+  shared_body name line == some expr.haskell
+
+theorem checked_shared_body_correct (name line : String) (expr : SharedExpression)
+    (checked : checked_shared_body name line expr = true) (call : String → σ → Except ε Int × σ) :
+    shared_body name line = some expr.haskell ∧ expr.target call = expr.source call := by
+  exact ⟨beq_iff_eq.mp checked, shared_expression_correct expr call⟩
+
+private def shared_source (name frontend : String) : Except String SharedExpression := do
+  let tree ← Json.parse frontend
+  let [fn] := (function_definitions (unit_function_declarations tree)).filter (fun n => field_text n "name" == name)
+    | throw "expected one named function definition"
+  unless type_spelling fn == "int (void)" && field_text fn "storageClass" != "static" do
+    throw "expected an external int (void) definition"
+  let [block] := child_nodes fn | throw "expected one function body"
+  let [ret] := child_nodes block | throw "expected a single return"
+  let [body] := child_nodes ret | throw "expected a return value"
+  unless field_text ret "kind" == "ReturnStmt" do throw "expected a return"
+  let expr ← read_shared (frontend.utf8ByteSize + 1) body
+  let .choose .. := expr | throw "expected a shared conditional"
+  return expr
+
+def validate_shared (name frontend generated : String) : Except String Unit :=
+  match shared_source name frontend with
+  | .error why => .error why
+  | .ok expr =>
+    let binding := hex_binding "f" name
+    match (generated.splitOn "\n").filter (·.startsWith (binding ++ " ")) with
+    | [signature, equation] =>
+      if signature == binding ++ " :: [Value] -> R Value" && checked_shared_body name equation expr &&
+          validates_dispatch_runtime generated then .ok ()
+      else .error "generated shared conditional differs from the typed function"
+    | _ => .error "missing or ambiguous generated definition"
+
+theorem shared_certificate_sound (name frontend generated : String)
+    (accepted : validate_shared name frontend generated = .ok ()) (call : String → σ → Except ε Int × σ) :
+    ∃ expr equation, shared_source name frontend = .ok expr ∧ equation ∈ generated.splitOn "\n" ∧
+      shared_body name equation = some expr.haskell ∧ expr.target call = expr.source call := by
+  unfold validate_shared at accepted
+  split at accepted
+  next => contradiction
+  next expr parsed =>
+    dsimp only at accepted
+    split at accepted
+    next signature equation rows =>
+      split at accepted
+      next checked =>
+        have present : equation ∈ (generated.splitOn "\n").filter (·.startsWith (hex_binding "f" name ++ " ")) := by
+          rw [rows]
+          simp
+        simp only [Bool.and_eq_true] at checked
+        exact ⟨expr, equation, parsed, (List.mem_filter.mp present).1,
+          checked_shared_body_correct name equation expr checked.1.2 call⟩
+      next => contradiction
+    next => contradiction
+
 end Heresy
+
+#print axioms Heresy.shared_certificate_sound
 
 #print axioms Heresy.kernel_certificate_sound
 #print axioms Heresy.kernel_return_preserves_result
@@ -1692,6 +1836,10 @@ end Heresy
 
 def main (arguments : List String) : IO UInt32 := do
   match arguments with
+  | ["shared", name, ast, haskell] =>
+    match Heresy.validate_shared name (← IO.FS.readFile ast) (← IO.FS.readFile haskell) with
+    | .ok () => IO.println s!"checked shared conditional in {name}"; pure 0
+    | .error message => IO.eprintln message; pure 1
   | "linkage" :: haskell :: ast :: rest =>
     match Heresy.validate_linkage (← (ast :: rest).mapM (fun (path : String) => IO.FS.readFile path)) (← IO.FS.readFile haskell) with
     | .ok count => IO.println s!"checked {count} linked function bindings, label symbols and startup"; pure 0
@@ -1745,5 +1893,5 @@ def main (arguments : List String) : IO UInt32 := do
     | .ok count => IO.println s!"checked {count} emitted integer kernel(s)"; pure 0
     | .error message => IO.eprintln message; pure 1
   | _ =>
-    IO.eprintln "usage: certificate [program] AST.json Module.hs | certificate (dispatch|memory|process) Module.hs | certificate linkage Module.hs AST.json ..."
+    IO.eprintln "usage: certificate [program] AST.json Module.hs | certificate shared FUNCTION AST.json Module.hs | certificate (dispatch|memory|process) Module.hs | certificate linkage Module.hs AST.json ..."
     pure 2

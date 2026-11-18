@@ -17,6 +17,11 @@ jobs:
           lake exe certificate /tmp/machine.json /tmp/Machine.hs &&
           sed "/^f_.* = at /s/(number a0)/0/" /tmp/Machine.hs > /tmp/ChangedKernel.hs &&
           ! lake exe certificate /tmp/machine.json /tmp/ChangedKernel.hs &&
+          "$FILCC" -std=c11 test/shared.c -o /tmp/sharedref && /tmp/sharedref &&
+          dune exec --profile release -- heresy test/shared.c -o /tmp/Shared.hs --ast-dir /tmp/sharedast --build /tmp/shared &&
+          /tmp/shared && lake exe certificate shared choose /tmp/sharedast/0.json /tmp/Shared.hs &&
+          sed "/^f_63686f6f7365 _ = /s/pure shared/pure (Number 0)/" /tmp/Shared.hs > /tmp/ChangedShared.hs &&
+          ! lake exe certificate shared choose /tmp/sharedast/0.json /tmp/ChangedShared.hs &&
           dune exec --profile release -- heresy test/values.c -o /tmp/Values.hs --ast-dir /tmp/values &&
           lake exe certificate dispatch /tmp/Values.hs &&
           sed "s/if truth tested then convertValue shared else fallback/if truth tested then fallback else convertValue shared/" /tmp/Values.hs > /tmp/Conditional.hs &&

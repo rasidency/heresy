@@ -16,11 +16,11 @@ let run program arguments =
   if Process.run ~timeout:0. program arguments <> 0 then failwith (program ^ " failed")
 
 let files = [
-  "Containerfile"; ".dockerignore"; ".gitignore"; "README.md";
+  "Containerfile"; ".dockerignore"; ".gitattributes"; ".gitignore"; "README.md";
   "dune-project"; "dune"; "heresy.opam";
   "src/dune"; "src/heresy.ml"; "src/process.ml"; "src/process.mli";
   "runtime/Heap.hs"; "tools/dune"; "tools/embed.ml"; "tools/release.ml";
-  "test/dune"; "test/verify.ml"; "test/fault.ml"; "test/closed.c"; "test/frames.c"; "test/helpers.c"; "test/recursive.c"; "test/slots.c"; "test/lowering.c"; "test/values.c"; "proof/Proof.lean"; "proof/Execution.lean"; "proof/Semantics.lean"; "proof/Synchronisation.lean"; "proof/Memory.lean"; "proof/Certificate.lean";
+  "test/dune"; "test/verify.ml"; "test/fault.ml"; "test/closed.c"; "test/frames.c"; "test/helpers.c"; "test/recursive.c"; "test/shared.c"; "test/slots.c"; "test/lowering.c"; "test/values.c"; "proof/Proof.lean"; "proof/Execution.lean"; "proof/Semantics.lean"; "proof/Synchronisation.lean"; "proof/Memory.lean"; "proof/Certificate.lean";
   "test/linkage/entry.c"; "test/linkage/worker.c";
   "assets/pipeline.svg"; "assets/capability.svg"; "assets/pipeline.dot"; "assets/capability.dot";
   "lean-toolchain"; "lakefile.toml"; "lake-manifest.json";
