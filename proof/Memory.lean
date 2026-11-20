@@ -17,8 +17,8 @@ def dead_at (memory : Memory) (ident : Nat) : Prop :=
 def replace_object (memory : Memory) (ident : Nat) (object : Object) : Memory :=
   fun key => if key = ident then some object else memory key
 
-def new_object (plan : AllocationPlan) : Object :=
-  ⟨plan.address, plan.extent, true, false, fun _ => 0, fun _ => none⟩
+def new_object (heap : Bool) (plan : AllocationPlan) : Object :=
+  ⟨plan.address, plan.extent, true, false, fun _ => 0, fun _ => none, heap⟩
 
 inductive HeapTransition : HeapState → HeapState → Prop where
   | observe : HeapTransition state state
@@ -26,9 +26,9 @@ inductive HeapTransition : HeapState → HeapState → Prop where
       HeapTransition state { state with objects := replace_object state.objects ident new }
   | release {ident : Nat} {object : Object} : state.objects ident = some object →
       HeapTransition state { state with objects := invalidate state.objects ident }
-  | allocate : state.counter.ident ≤ host_max →
+  | allocate (heap : Bool) : state.counter.ident ≤ host_max →
       plan_allocation state.counter global size host_max = some plan →
-      HeapTransition state ⟨replace_object state.objects plan.ident (new_object plan), plan.next⟩
+      HeapTransition state ⟨replace_object state.objects plan.ident (new_object heap plan), plan.next⟩
 
 theorem heap_transition_allocated (before after : HeapState) (step : HeapTransition before after)
     (allocated : before.allocated) : after.allocated := by
@@ -47,7 +47,7 @@ theorem heap_transition_allocated (before after : HeapState) (step : HeapTransit
     · subst ident
       exact allocated _ _ previous
     · exact allocated _ _ (by simpa [invalidate, same] using found)
-  | allocate counter_fits planned =>
+  | allocate heap counter_fits planned =>
     rename_i _ _ _ plan
     obtain ⟨_, _, _, _, _, _, _, _, identity, grows, _, _⟩ :=
       allocation_plan_sound _ _ _ _ plan counter_fits planned
@@ -75,7 +75,7 @@ theorem heap_transition_preserves_dead (before after : HeapState) (step : HeapTr
     · subst ident
       exact ⟨{ object with live := false, bytes := fun _ => 0, shadow := fun _ => none }, by simp [invalidate, found], rfl⟩
     · exact ⟨object, by simp [invalidate, same, found], liveness⟩
-  | allocate counter_fits planned =>
+  | allocate heap counter_fits planned =>
     rename_i _ _ _ plan
     obtain ⟨_, _, _, _, _, _, _, _, identity, _, _, _⟩ :=
       allocation_plan_sound _ _ _ _ plan counter_fits planned
@@ -87,11 +87,51 @@ inductive HeapTrace : HeapState → HeapState → Prop where
   | start : HeapTrace state state
   | step : HeapTrace before middle → HeapTransition middle after → HeapTrace before after
 
+theorem heap_trace_prepend {before middle after : HeapState} (first : HeapTransition before middle)
+    (rest : HeapTrace middle after) : HeapTrace before after := by
+  induction rest with
+  | start => exact .step .start first
+  | step _ transition earlier => exact .step earlier transition
+
 theorem heap_trace_allocated (before after : HeapState) (trace : HeapTrace before after)
     (allocated : before.allocated) : after.allocated := by
   induction trace with
   | start => exact allocated
   | step _ transition earlier => exact heap_transition_allocated _ _ transition earlier
+
+def HeapState.null_reserved (state : HeapState) : Prop := state.objects 0 = none ∧ 0 < state.counter.ident
+
+theorem heap_transition_reserves_null (before after : HeapState) (step : HeapTransition before after)
+    (reserved : before.null_reserved) : after.null_reserved := by
+  obtain ⟨empty, positive⟩ := reserved
+  cases step with
+  | observe => exact ⟨empty, positive⟩
+  | replace previous preserved =>
+    rename_i ident _ _
+    have different : 0 ≠ ident := by
+      intro equal
+      cases equal
+      simp [empty] at previous
+    exact ⟨by simp [replace_object, different, empty], positive⟩
+  | release previous =>
+    rename_i ident _
+    have different : 0 ≠ ident := by
+      intro equal
+      cases equal
+      simp [empty] at previous
+    exact ⟨by simp [invalidate, different, empty], positive⟩
+  | allocate heap fitted planned =>
+    rename_i _ _ _ plan
+    obtain ⟨_, _, _, _, _, _, _, _, identity, grows, _, _⟩ :=
+      allocation_plan_sound _ _ _ _ plan fitted planned
+    have different : 0 ≠ plan.ident := by omega
+    exact ⟨by simp [replace_object, different, empty], Nat.lt_trans (identity.symm ▸ positive) grows⟩
+
+theorem heap_trace_reserves_null (before after : HeapState) (trace : HeapTrace before after)
+    (reserved : before.null_reserved) : after.null_reserved := by
+  induction trace with
+  | start => exact reserved
+  | step _ transition earlier => exact heap_transition_reserves_null _ _ transition earlier
 
 theorem heap_trace_preserves_dead (before after : HeapState) (trace : HeapTrace before after)
     (allocated : before.allocated) (ident : Nat) (dead : dead_at before.objects ident) :

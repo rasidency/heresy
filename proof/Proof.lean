@@ -853,6 +853,7 @@ structure Object where
   readonly : Bool
   bytes : Nat → Int
   shadow : Nat → Option Nat
+  heap : Bool
 
 structure Pointer where
   capability : Nat
