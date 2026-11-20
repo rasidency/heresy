@@ -2582,22 +2582,31 @@ let emit_closed contexts trees =
 let main () =
   let sources = ref [] and output = ref "" and executable = ref "" and ast_directory = ref "" and report = ref false in
   let check = ref false and closed = ref false and timeout = ref 0. and ghc = ref "ghc" in
+  let verify_artifact = ref "" and certificate = ref None in
   let specs = [
     "-o", Arg.Set_string output, "FILE standalone generated Haskell";
     "--build", Arg.Set_string executable, "FILE executable output";
     "--ast-dir", Arg.Set_string ast_directory, "DIRECTORY write numbered typed ASTs and compile the standalone module if building";
     "--check", Arg.Set check, " validate the supported language subset without writing output";
+    "--verify-artifact", Arg.String (fun path ->
+      if path = "" then raise (Arg.Bad "expected a Haskell artifact path");
+      verify_artifact := path), "FILE replay lowering and verify the Haskell module before an optional build";
+    "--certificate", Arg.String (fun path ->
+      if path = "" then raise (Arg.Bad "expected a Lean certificate executable");
+      certificate := Some path), "PROGRAM require a Lean certificate before writing or building the module";
     "--closed", Arg.Set closed, " lower a closed integer program for whole-program certification";
     "--explain", Arg.Set report, " report lowering decisions";
     "--timeout", Arg.Set_float timeout, "SECONDS optional tool deadline, zero disables it";
     "--ghc", Arg.Set_string ghc, "PROGRAM select GHC 9.6.7";
     "--version", Arg.Unit (fun () -> Printf.printf "Heresy %s (Fil-C 0.687 -> Haskell)\n" Runtime.version; exit 0), " show compiler version"
   ] in
-  Arg.parse specs (fun path -> sources := path :: !sources) "heresy input.c [other.c ...] [-o Main.hs] [--build executable] [--ast-dir directory] [--check] [--explain]";
+  Arg.parse specs (fun path -> sources := path :: !sources) "heresy input.c [other.c ...] [-o Main.hs] [--build executable] [--ast-dir directory] [--check | --verify-artifact FILE] [--certificate PROGRAM] [--explain]";
   if !sources = [] then raise (Error "a Fil-C input file is required");
   if not (Float.is_finite !timeout) || !timeout < 0. then raise (Error "timeout must be finite and nonnegative");
   if !check && (!output <> "" || !executable <> "" || !ast_directory <> "") then
     raise (Error "--check cannot be combined with -o, --build or --ast-dir");
+  if !verify_artifact <> "" && (!check || !output <> "" || !ast_directory <> "") then
+    raise (Error "--verify-artifact cannot be combined with --check, -o or --ast-dir");
   let sources = List.rev_map Unix.realpath !sources in
   if List.length (List.sort_uniq String.compare sources) <> List.length sources then raise (Error "duplicate input file");
   List.iter (fun source ->
@@ -2625,13 +2634,52 @@ let main () =
   let definitions = if !closed then emit_closed contexts trees else emit contexts in
   let generated = if !closed then definitions else Runtime.source ^ "\n" ^ definitions in
   let listed = String.concat ", " (List.map Filename.basename sources) in
+  let artifact =
+    if !verify_artifact = "" then None else begin
+      let path = Unix.realpath !verify_artifact in
+      if (Unix.stat path).Unix.st_kind <> Unix.S_REG then raise (Error "artifact must be a regular file");
+      if read path <> generated then raise (Error "generated Haskell differs from the supplied artifact");
+      Some path
+    end
+  in
+  Option.iter (fun checker ->
+    let workspace = temporary_directory (Filename.get_temp_dir_name ()) in
+    Fun.protect ~finally:(fun () -> remove workspace) (fun () ->
+      let candidate = Filename.concat workspace "Main.hs" in
+      write candidate generated;
+      let args = if !closed then begin
+        match prepared with
+        | [(_, (content, _, _, _, _, _, _))] ->
+            let input = Filename.concat workspace "Source.c" in
+            write input content;
+            ["text"; input; candidate]
+        | _ -> raise (Error "closed compilation requires one translation unit")
+      end else begin
+        let runtime = Filename.concat workspace "Heap.hs" in
+        write runtime Runtime.support;
+        let asts = List.mapi (fun index tree ->
+          let path = Filename.concat workspace (string_of_int index ^ ".json") in
+          write path (json_tree tree);
+          path) trees in
+        match asts with
+        | [ast] -> ["ordinary"; runtime; ast; candidate]
+        | _ -> ["ordinary-link"; runtime; candidate] @ asts
+      end in
+      let message = capture checker args in
+      print_string message)) !certificate;
   if !check then begin
     Printf.printf "Checked %s\n" listed;
     if !report then List.iter explain contexts
+  end else if Option.is_some artifact && !executable = "" then begin
+    Option.iter (fun path -> Printf.printf "Verified complete Haskell artifact %s\n" (Filename.basename path)) artifact
   end else begin
   let source = List.hd sources in
-  if !output = "" then output := Filename.concat "build" (String.capitalize_ascii (Filename.remove_extension (Filename.basename source)) ^ ".hs");
-  let output = output_path !output in
+  let output = match artifact with
+    | Some path -> path
+    | None ->
+        if !output = "" then output := Filename.concat "build" (String.capitalize_ascii (Filename.remove_extension (Filename.basename source)) ^ ".hs");
+        output_path !output
+  in
   if List.exists (same_file output) sources then raise (Error "output would overwrite an input source");
   let executable = if !executable = "" then None else Some (output_path !executable) in
   Option.iter (fun executable ->
@@ -2647,13 +2695,14 @@ let main () =
     let workspace = temporary_directory (Filename.dirname executable) in
     Fun.protect ~finally:(fun () -> remove workspace) (fun () ->
       let main = Filename.concat workspace "Main.hs" and target = Filename.concat workspace "heresy" in
+      let containers = if Option.is_some !certificate then "containers-0.6.7" else "containers" in
       let options = ["-O1"; "-v0"; "-rtsopts"; "-threaded"; "-package-env"; "-"; "-hide-all-packages";
-        "-package"; "base"; "-package"; "bytestring"; "-package"; "containers"; "-package"; "mtl"] in
+        "-package"; "base"; "-package"; "bytestring"; "-package"; containers; "-package"; "mtl"] in
       let run args =
         let code = Process.run ~timeout:!timeout !ghc args in
         if code <> 0 then raise (Error ("GHC exited with status " ^ string_of_int code))
       in
-      if !closed || !ast_directory <> "" then begin
+      if Option.is_some artifact || Option.is_some !certificate || !closed || !ast_directory <> "" then begin
         write main generated;
         run (options @ ["-outputdir"; workspace; main; "-o"; target])
       end else begin
@@ -2663,12 +2712,14 @@ let main () =
         run (options @ ["-i"; "-i" ^ workspace; "-outputdir"; workspace; "-c"; main]);
         run (options @ [Filename.concat workspace "Main.o"; Filename.concat workspace "Heap.o"; "-o"; target])
       end;
-      atomic_write output generated;
+      if Option.is_none artifact then atomic_write output generated;
       Unix.rename target executable)
   in
   (match executable with None -> atomic_write output generated | Some path -> build path);
   List.iter (fun (path, tree) -> atomic_write path (json_tree tree)) asts;
-  Printf.printf "Compiled %s -> %s\n" listed (Filename.basename output);
+  (match artifact with
+  | None -> Printf.printf "Compiled %s -> %s\n" listed (Filename.basename output)
+  | Some path -> Printf.printf "Verified complete Haskell artifact %s\n" (Filename.basename path));
   Option.iter (fun path -> Printf.printf "Built %s with GHC\n" (Filename.basename path)) executable;
   if !report then List.iter explain contexts
   end
