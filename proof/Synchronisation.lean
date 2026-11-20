@@ -223,6 +223,59 @@ theorem condition_enrolment_survives_handoff (thread ticket : Nat) (previous upd
   exact ⟨mutex_release_valid thread previous updated signal valid released,
     enrolment_survives_trace ticket _ after steps (.inl pending)⟩
 
+def condition_reacquire (thread signal mutex_ticket : Nat) (condition : SignalQueue) (mutex : MutexQueue) :
+    Option (SignalQueue × MutexQueue × MutexResult) :=
+  if signal ∈ condition.posted then
+    let (next, outcome) := mutex_acquire false thread mutex_ticket mutex
+    some (consume_signal condition signal, next, outcome)
+  else none
+
+theorem condition_reacquire_requires_post (thread signal mutex_ticket : Nat) (condition updated : SignalQueue)
+    (mutex next : MutexQueue) (outcome : MutexResult)
+    (resumed : condition_reacquire thread signal mutex_ticket condition mutex = some (updated, next, outcome)) :
+    signal ∈ condition.posted ∧ updated = consume_signal condition signal := by
+  by_cases posted : signal ∈ condition.posted
+  · simp [condition_reacquire, posted] at resumed
+    exact ⟨posted, resumed.1.symm⟩
+  · simp [condition_reacquire, posted] at resumed
+
+theorem condition_immediate_reacquire_owns (thread signal mutex_ticket : Nat)
+    (condition updated : SignalQueue) (mutex next : MutexQueue)
+    (resumed : condition_reacquire thread signal mutex_ticket condition mutex =
+      some (updated, next, .complete 0)) : next.owner = some thread := by
+  have posted := (condition_reacquire_requires_post _ _ _ _ _ _ _ _ resumed).1
+  cases owner : mutex.owner with
+  | none =>
+    simp [condition_reacquire, posted, mutex_acquire, owner] at resumed
+    obtain ⟨_, rfl⟩ := resumed
+    rfl
+  | some current =>
+    by_cases same : current = thread <;>
+      simp [condition_reacquire, posted, mutex_acquire, owner, same] at resumed
+
+inductive MutexHandoffs : MutexQueue → List Nat → MutexQueue → Prop where
+  | idle : MutexHandoffs mutex [] mutex
+  | step : mutex_release owner before = some (middle, some ticket) →
+      MutexHandoffs middle tickets after → MutexHandoffs before (ticket :: tickets) after
+
+theorem mutex_handoffs_serve_fifo (owner thread ticket : Nat) (earlier : List (Nat × Nat)) :
+    MutexHandoffs ⟨some owner, earlier ++ [(thread, ticket)]⟩
+      (earlier.map Prod.snd ++ [ticket]) ⟨some thread, []⟩ := by
+  induction earlier generalizing owner with
+  | nil => exact .step (mutex_release_handoff owner thread ticket []) .idle
+  | cons entry rest ih =>
+    obtain ⟨next, wake⟩ := entry
+    exact .step (mutex_release_handoff owner next wake (rest ++ [(thread, ticket)])) (ih next)
+
+theorem condition_queued_reacquire (thread signal ticket owner : Nat) (condition : SignalQueue)
+    (earlier : List (Nat × Nat)) (posted : signal ∈ condition.posted) (different : owner ≠ thread) :
+    let queued := MutexQueue.mk (some owner) (earlier ++ [(thread, ticket)])
+    condition_reacquire thread signal ticket condition ⟨some owner, earlier⟩ =
+      some (consume_signal condition signal, queued, .wait ticket) ∧
+    MutexHandoffs queued (earlier.map Prod.snd ++ [ticket]) ⟨some thread, []⟩ := by
+  exact ⟨by simp [condition_reacquire, posted, mutex_acquire, different],
+    mutex_handoffs_serve_fifo owner thread ticket earlier⟩
+
 end Heresy
 
 #print axioms Heresy.condition_enroll_releases_and_keeps_ticket
@@ -233,3 +286,5 @@ end Heresy
 #print axioms Heresy.mutex_release_valid
 #print axioms Heresy.mutex_handoff_reserves_ownership
 #print axioms Heresy.condition_enrolment_survives_handoff
+
+#print axioms Heresy.condition_queued_reacquire
