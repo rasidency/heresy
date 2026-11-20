@@ -2283,13 +2283,16 @@ let prepare_frontend source content dump =
         let base, dimensions = shape element in base, dimensions, true
     | _ -> let base, dimensions = shape node in base, dimensions, false
   in
-  let captured = ref 0 in
+  let captured = Hashtbl.create (List.length edits) in
   let capture ?(array=false) ?(hidden=[]) variable alias =
+    let marker = text alias "name" in
+    if kind alias <> "TypedefDecl" || Hashtbl.mem captured marker then
+      raise (Error "ambiguous variable-length array probe");
     match children alias with
     | [declared] ->
         let base, dimensions, indirect = rooted_shape declared in
         if dimensions = [] then raise (Error "missing translated variable-length array bounds");
-        incr captured;
+        Hashtbl.add captured marker ();
         let id = text variable "id" in
         List.iter (walk (fun node -> if kind node = "DeclRefExpr" &&
           List.mem (text (field node "referencedDecl") "id") hidden then
@@ -2322,13 +2325,16 @@ let prepare_frontend source content dump =
         | [alias] -> begin match Hashtbl.find_opt markers (text alias "name") with
           | Some (Some (name, array)) ->
               let remaining = List.drop_while (fun node -> text node "name" <> name) parameters in
-              let parameter = List.hd remaining in
+              let parameter = match remaining with
+                | parameter :: _ -> parameter
+                | [] -> raise (Error "variable-length array probe has no matching parameter")
+              in
               capture ~array ~hidden:(List.map (fun node -> text node "id") remaining) parameter alias
           | _ -> ()
           end
         | _ -> ()) (children body)) (children node)) (children tree);
   walk (fun node -> if kind node = "CompoundStmt" then bind (children node)) tree;
-  if !captured <> List.length edits then raise (Error "unresolved variable-length array bounds");
+  if Hashtbl.length captured <> List.length edits then raise (Error "unresolved variable-length array bounds");
   walk (fun node -> if kind node = "TypedefDecl" && varying node && not (Hashtbl.mem markers (text node "name")) then
     match children node with
     | [declared] ->
