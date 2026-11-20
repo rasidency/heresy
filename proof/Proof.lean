@@ -854,6 +854,8 @@ structure Object where
   bytes : Nat → Int
   shadow : Nat → Option Nat
   heap : Bool
+  arraySpans : List Int := []
+  atomicAddress : Nat → Option Int := fun _ => none
 
 structure Pointer where
   capability : Nat
@@ -949,7 +951,7 @@ theorem checked_offset_fits (memory : Memory) (pointer : Pointer) (count offset 
 
 def invalidate (memory : Memory) (capability : Nat) : Memory := fun ident =>
   if ident = capability then
-    (memory ident).map fun object => { object with live := false, bytes := fun _ => 0, shadow := fun _ => none }
+    (memory ident).map fun object => { object with live := false, bytes := fun _ => 0, shadow := fun _ => none, atomicAddress := fun _ => none }
   else memory ident
 
 theorem invalidation_rejects_aliases (memory : Memory) (capability : Nat)
@@ -1295,7 +1297,8 @@ def capture (object : Object) (start size : Nat) : Snapshot :=
 def restore (object : Object) (start : Nat) (value : Snapshot) : Object :=
   { object with
     bytes := fun i => if start ≤ i ∧ i < start + value.size then value.bytes (i - start) else object.bytes i
-    shadow := fun i => if start ≤ i ∧ i + 8 ≤ start + value.size then value.shadow (i - start) else object.shadow i }
+    shadow := fun i => if start ≤ i ∧ i + 8 ≤ start + value.size then value.shadow (i - start) else object.shadow i
+    atomicAddress := fun i => if start ≤ i ∧ i + 8 ≤ start + value.size then none else object.atomicAddress i }
 
 theorem restore_bytes (source destination : Object) (sourceOffset targetOffset size i : Nat) (inside : i < size) :
     (restore destination targetOffset (capture source sourceOffset size)).bytes (targetOffset + i) = source.bytes (sourceOffset + i) := by

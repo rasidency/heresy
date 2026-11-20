@@ -256,8 +256,7 @@ private theorem rooted_not_nil {rep : Int} {root : Option Mask} {t : Tree α} (v
 
 private theorem mask_canonical (key mask : Mask) :
     maskPrefix (maskPrefix key mask) mask = maskPrefix key mask := by
-  unfold maskPrefix
-  bv_decide
+  simp only [maskPrefix, BitVec.and_assoc, BitVec.and_self]
 
 private theorem rooted_fork_raw {rep leftRep rightRep : Int} {tr ur : Option Mask}
     {t u : Tree α} {m : Mask} (left : Rooted leftRep tr t) (right : Rooted rightRep ur u)
@@ -808,18 +807,13 @@ theorem merge_run_exists {l r : Trie α} (vl : l.Valid) (vr : r.Valid) :
             (recurse (.fork single canonical vlo vhi ln rn sl sr low high) vrhi ?_)
           all_goals simp only [Trie.size]; omega
 
-private theorem narrow_mask_sign {m parent : Mask} (single : SingleBit m) (parentBit : SingleBit parent) (above : m.ult parent) :
+private theorem narrow_mask_sign {m parent : Mask} (parentBit : SingleBit parent) (above : m.ult parent) :
     m.msb = false := by
-  obtain ⟨_, bit⟩ := single
-  obtain ⟨_, parentPattern⟩ := parentBit
-  bv_decide
-
-private theorem child_unsigned {t : Trie α} {parent : Mask} (valid : t.Valid)
-    (single : SingleBit parent) (smaller : t.header.rank.ult parent) :
-    t.header.rank.msb = false := by
-  by_cases zero : t.header.rank = 0
-  · rw [zero]; rfl
-  · exact narrow_mask_sign (fork_bit valid zero) single smaller
+  obtain ⟨k, bound, power⟩ := single_bit_power parentBit
+  have smaller : m.toNat < parent.toNat := of_decide_eq_true above
+  have limit : parent.toNat ≤ 2^63 := power ▸ Nat.pow_le_pow_right (by decide) (by omega)
+  rw [BitVec.msb_eq_decide]
+  exact decide_eq_false (by change ¬2^63 ≤ m.toNat; omega)
 
 private theorem unsigned_below {t : Trie α} (valid : t.Valid) (sign : t.header.rank.msb = false) :
     UnsignedBranches t.tree := by
@@ -828,8 +822,8 @@ private theorem unsigned_below {t : Trie α} (valid : t.Valid) (sign : t.header.
   | tip => exact .tip
   | fork single _ vl vr _ _ narrowL narrowR _ _ il ir =>
     apply UnsignedBranches.bin sign
-    · exact il (child_unsigned vl single narrowL)
-    · exact ir (child_unsigned vr single narrowR)
+    · exact il (narrow_mask_sign single narrowL)
+    · exact ir (narrow_mask_sign single narrowR)
 
 private theorem source_root {t : Trie α} (valid : t.Valid) :
     ∀ b l r, t.tree = .bin b l r → UnsignedBranches l ∧ UnsignedBranches r ∧
@@ -839,8 +833,8 @@ private theorem source_root {t : Trie α} (valid : t.Valid) :
   | fork single _ vl vr _ _ narrowL narrowR _ _ =>
     intro b l r eq
     cases eq
-    refine ⟨unsigned_below vl (child_unsigned vl single narrowL),
-      unsigned_below vr (child_unsigned vr single narrowR), ?_⟩
+    refine ⟨unsigned_below vl (narrow_mask_sign single narrowL),
+      unsigned_below vr (narrow_mask_sign single narrowR), ?_⟩
     intro sign
     simp only [Branch.ofMask] at sign ⊢
     rw [if_pos sign]

@@ -1,5 +1,4 @@
 import Proof
-import Std.Tactic.BVDecide
 
 set_option warningAsError true
 
@@ -21,23 +20,146 @@ def maskPrefix (key mask : Word) : Word := key &&& ((0 - mask) ^^^ mask)
 
 def SingleBit (m : Word) : Prop := m ≠ 0 ∧ m &&& (m - 1) = 0
 
+private theorem leading_bit {n k : Nat} (low : 2^k ≤ n) (high : n < 2^(k+1)) : n.testBit k = true := by
+  have lt : n - 2^k < 2^k := by rw [Nat.pow_succ] at high; omega
+  rw [← Nat.add_sub_of_le low, Nat.testBit_two_pow_add_eq, Nat.testBit_lt_two_pow lt]
+  rfl
+
+theorem single_bit_power {m : Word} (single : SingleBit m) :
+    ∃ k < 64, m.toNat = 2^k := by
+  obtain ⟨nonzero, pattern⟩ := single
+  have pos := BitVec.toNat_pos_of_ne_zero nonzero
+  let k := m.toNat.log2
+  have low : 2^k ≤ m.toNat := Nat.log2_self_le (by omega)
+  have high : m.toNat < 2^(k+1) := Nat.lt_log2_self
+  refine ⟨k, (Nat.log2_lt (by omega)).mpr m.isLt, ?_⟩
+  apply Classical.byContradiction
+  intro different
+  have current := leading_bit low high
+  have previous : (m.toNat - 1).testBit k = true := leading_bit (by omega) (by omega)
+  have both := congrArg (fun v : Word => v.toNat.testBit k) pattern
+  have pred : (m-1).toNat = m.toNat - 1 := BitVec.toNat_sub_of_le (by exact pos)
+  change (m &&& (m-1)).toNat.testBit k = (0 : Nat).testBit k at both
+  rw [BitVec.toNat_and, Nat.testBit_and, pred, current, previous, Nat.zero_testBit] at both
+  contradiction
+
+private theorem mask_bit {m : Word} (power : m.toNat = 2^k) (i : Nat) :
+    m.getLsbD i = decide (k = i) := by rw [← BitVec.testBit_toNat, power, Nat.testBit_two_pow]
+
+private theorem prefix_bit (key : Word) {m : Word} (power : m.toNat = 2^k) {i : Nat} :
+    (maskPrefix key m).getLsbD i = (key.getLsbD i && decide (k < i)) := by
+  by_cases inside : i < 64
+  case neg => simp [BitVec.getLsbD_of_ge _ _ (Nat.le_of_not_gt inside)]
+  have pos : 0 < m.toNat := power ▸ Nat.two_pow_pos k
+  have neg : 0 - m = ~~~(m - 1) := by
+    change 0#64 - m = ~~~(m - 1#64)
+    rw [BitVec.zero_sub, BitVec.not_sub_one_eq_not_add_one, BitVec.neg_eq_not_add]
+  have pred : (m - 1).getLsbD i = decide (i < k) := by
+    rw [← BitVec.testBit_toNat, BitVec.toNat_sub_of_le (by exact pos), power]
+    exact Nat.testBit_two_pow_sub_one k i
+  simp only [maskPrefix, neg, BitVec.getLsbD_and, BitVec.getLsbD_xor, BitVec.getLsbD_not, inside, decide_true,
+    Bool.true_and, pred, mask_bit power]
+  rcases Nat.lt_trichotomy i k with h | rfl | h
+  · simp [h, Nat.ne_of_gt h, Nat.not_lt_of_ge (Nat.le_of_lt h)]
+  · simp
+  · simp [h, Nat.ne_of_lt h, Nat.not_lt_of_ge (Nat.le_of_lt h)]
+
+private theorem branch_bit (key : Word) {m : Word} (power : m.toNat = 2^k) :
+    (key &&& m = 0) ↔ key.getLsbD k = false := by
+  constructor
+  · intro zero
+    have bit := congrArg (fun v : Word => v.getLsbD k) zero
+    simpa [mask_bit power] using bit
+  · intro clear
+    apply BitVec.eq_of_getLsbD_eq
+    intro i hi
+    by_cases eq : k = i
+    · subst i; simp [mask_bit power, clear]
+    · simp [mask_bit power, eq]
+
+private theorem prefix_nat (key : Word) {m : Word} (power : m.toNat = 2^k) :
+    (maskPrefix key m).toNat = 2^(k+1) * (key.toNat / 2^(k+1)) := by
+  apply Nat.eq_of_testBit_eq
+  intro i
+  rw [BitVec.testBit_toNat, prefix_bit key power, Nat.testBit_two_pow_mul, Nat.testBit_div_two_pow]
+  by_cases high : k < i
+  · have ge : k + 1 ≤ i := high
+    simp [high, ge, show i - (k + 1) + (k + 1) = i by omega, BitVec.testBit_toNat]
+  · simp [high, show ¬ i ≥ k + 1 by omega]
+
 private theorem pivot_bits (key pref m : Word) (single : SingleBit m)
     (matched : maskPrefix key m = pref) :
     (key.slt (if m.msb then 0 else pref + m) = true) ↔
       ((key &&& m = 0) ↔ m.msb = false) := by
-  unfold SingleBit at single
-  unfold maskPrefix at matched
-  obtain ⟨nonzero, bit⟩ := single
-  cases hm : m.msb <;> simp only [Bool.false_eq_true, ↓reduceIte, iff_true] <;> bv_decide
+  obtain ⟨k, bound, power⟩ := single_bit_power single
+  subst pref
+  rw [branch_bit key power]
+  have sign : m.msb = decide (k = 63) := mask_bit power 63
+  by_cases last : k = 63
+  · subst k
+    simp [sign, BitVec.slt_zero_eq_msb, BitVec.msb_eq_getLsbD_last]
+  · have below : k < 63 := by omega
+    have clear : maskPrefix key m &&& m = 0 := (branch_bit _ power).mpr (by simp [prefix_bit key power])
+    have same : (maskPrefix key m + m).msb = key.msb := by
+      rw [BitVec.add_eq_or_of_and_eq_zero _ _ clear]
+      change ((maskPrefix key m ||| m).getLsbD 63) = key.getLsbD 63
+      simp only [BitVec.getLsbD_or, prefix_bit key power, mask_bit power, below, last, decide_true, decide_false, Bool.and_true, Bool.or_false]
+    have unsigned_order : key.slt (maskPrefix key m + m) = true ↔ key.toNat < (maskPrefix key m + m).toNat := by
+      rw [BitVec.slt_iff_toInt_lt, BitVec.toInt_eq_msb_cond, BitVec.toInt_eq_msb_cond, same]
+      cases key.msb <;> simp only [Bool.false_eq_true, if_false, if_true] <;> omega
+    simp only [sign, last, decide_false, Bool.false_eq_true, if_false, iff_true]
+    rw [unsigned_order, BitVec.toNat_add_of_and_eq_zero clear, prefix_nat key power, power]
+    have parts := Nat.mod_add_div key.toNat (2^(k+1))
+    have remainder : (key.toNat % 2^(k+1)).testBit k = key.getLsbD k := by simp [Nat.testBit_mod_two_pow, BitVec.testBit_toNat]
+    have compare (n r p m : Nat) (parts : r + p = n) : n < p + m ↔ r < m := by omega
+    rw [compare _ _ _ _ parts]
+    by_cases low : key.toNat % 2^(k+1) < 2^k
+    · rw [← remainder, Nat.testBit_lt_two_pow low]
+      simp [low]
+    · have one := leading_bit (Nat.le_of_not_gt low) (Nat.mod_lt key.toNat (Nat.two_pow_pos (k+1)))
+      rw [← remainder, one]
+      simp [low]
 
 theorem nested_bits (key child small large : Word)
     (ss : SingleBit small) (sl : SingleBit large) (shorter : small.ult large)
     (hkey : maskPrefix key small = child) :
     maskPrefix key large = maskPrefix child large ∧ key &&& large = child &&& large := by
-  simp only [SingleBit, maskPrefix] at *
-  obtain ⟨_, _⟩ := ss
-  obtain ⟨_, _⟩ := sl
-  bv_decide
+  obtain ⟨s, _, smallPow⟩ := single_bit_power ss
+  obtain ⟨l, _, largePow⟩ := single_bit_power sl
+  have lt : s < l := (Nat.pow_lt_pow_iff_right (by decide : 1 < 2)).mp (by
+    simpa only [BitVec.ult, decide_eq_true_eq, smallPow, largePow] using shorter)
+  subst child
+  constructor
+  · apply BitVec.eq_of_getLsbD_eq
+    intro i _
+    by_cases high : l < i
+    · simp [prefix_bit _ largePow, prefix_bit _ smallPow, high, Nat.lt_trans lt high]
+    · simp [prefix_bit _ largePow, high]
+  · apply BitVec.eq_of_getLsbD_eq
+    intro i _
+    by_cases eq : l = i
+    · subst i; simp [mask_bit largePow, prefix_bit _ smallPow, lt]
+    · simp [mask_bit largePow, eq]
+
+private theorem highest_differing_bit (a b m : Word) (power : m.toNat = 2^k)
+    (low : 2^k ≤ (a ^^^ b).toNat) (high : (a ^^^ b).toNat < 2^(k+1)) :
+    maskPrefix a m = maskPrefix b m ∧ (a &&& m = 0 ↔ b &&& m ≠ 0) := by
+  constructor
+  · apply BitVec.eq_of_getLsbD_eq
+    intro i _
+    rw [prefix_bit a power, prefix_bit b power]
+    by_cases above : k < i
+    · have bound := Nat.lt_of_lt_of_le high (Nat.pow_le_pow_right (by decide : 0 < 2) above)
+      have equal := Nat.testBit_lt_two_pow bound
+      rw [BitVec.testBit_toNat, BitVec.getLsbD_xor] at equal
+      have agree (p q : Bool) (h : (p ^^ q) = false) : p = q := by cases p <;> cases q <;> simp_all
+      rw [agree _ _ equal]
+    · simp [above]
+  · have bit := leading_bit low high
+    rw [BitVec.testBit_toNat, BitVec.getLsbD_xor] at bit
+    simp only [ne_eq, branch_bit _ power]
+    have apart (p q : Bool) (h : (p ^^ q) = true) : (p = false ↔ ¬q = false) := by cases p <;> cases q <;> simp_all
+    exact apart _ _ bit
 
 inductive Tree (α : Type) where
   | nil
@@ -442,8 +564,7 @@ private theorem highest_pair (a b : Word) (different : a ≠ b) :
   generalize ax : a ^^^ b = x
   have hx : x ≠ 0 := by
     intro h
-    apply different
-    bv_decide
+    exact different (BitVec.xor_eq_zero_iff.mp (ax.trans h))
   generalize maskEq : highest_mask x = m
   have natM : m.toNat = 2 ^ (63 - x.clz.toNat) := maskEq ▸ highest_nat x
   have posM : 0 < m.toNat := by rw [natM]; exact Nat.two_pow_pos _
@@ -466,23 +587,11 @@ private theorem highest_pair (a b : Word) (different : a ≠ b) :
     rw [natM, show 2 * 2 ^ (63 - x.clz.toNat) = 2 ^ (64 - x.clz.toNat) by
       rw [show 64 - x.clz.toNat = (63 - x.clz.toNat) + 1 by omega, Nat.pow_succ, Nat.mul_comm]]
     exact BitVec.toNat_lt_two_pow_sub_clz
-  have lt : m.ule x = true := by simpa [BitVec.ule] using low
-  have ht : m.msb = true ∨ x.ult (m + m) = true := by
-    by_cases sign : m.msb
-    · exact Or.inl sign
-    · right
-      have doubleFits := BitVec.toNat_lt_of_msb_false (Bool.eq_false_iff.mpr sign)
-      have bv : (m + m).toNat = 2 * m.toNat := by
-        rw [BitVec.toNat_add, Nat.mod_eq_of_lt (by omega)]
-        omega
-      have inRange : x.toNat < (m + m).toNat := by omega
-      simpa [BitVec.ult] using inRange
-  obtain ⟨mnonzero, mbit⟩ := signed
-  constructor
-  · exact ⟨mnonzero, mbit⟩
-  · clear maskEq natM posM dx low high
-    unfold maskPrefix
-    bv_decide
+  refine ⟨signed, highest_differing_bit a b m natM ?_ ?_⟩
+  · rw [ax, ← natM]
+    exact low
+  · rw [ax, Nat.pow_succ, ← natM, Nat.mul_comm]
+    exact high
 
 def branchingMask (first second : Int) : BitVec 64 :=
   highest_mask (BitVec.ofInt 64 first ^^^ BitVec.ofInt 64 second)
