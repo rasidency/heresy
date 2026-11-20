@@ -6,7 +6,10 @@
   (proof/Semantics.lean as proof/Semantics.lean)
   (proof/Synchronisation.lean as proof/Synchronisation.lean)
   (proof/Memory.lean as proof/Memory.lean)
+  (proof/Patricia.lean as proof/Patricia.lean)
+  (proof/Containers.lean as proof/Containers.lean)
   (proof/Certificate.lean as proof/Certificate.lean)
+  (runtime/Heap.hs as runtime/Heap.hs)
   (assets/pipeline.svg as assets/pipeline.svg)
   (assets/capability.svg as assets/capability.svg)))
 
