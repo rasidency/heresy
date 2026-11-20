@@ -9,6 +9,8 @@
   (proof/Patricia.lean as proof/Patricia.lean)
   (proof/Containers.lean as proof/Containers.lean)
   (proof/Runtime.lean as proof/Runtime.lean)
+  (proof/Ordinary.lean as proof/Ordinary.lean)
+  (proof/Surface.lean as proof/Surface.lean)
   (proof/Certificate.lean as proof/Certificate.lean)
   (runtime/Heap.hs as runtime/Heap.hs)
   (assets/pipeline.svg as assets/pipeline.svg)

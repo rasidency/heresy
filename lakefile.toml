@@ -1,6 +1,6 @@
 name = "heresy"
 version = "0.2.0"
-defaultTargets = ["Proof", "Execution", "Semantics", "Synchronisation", "Memory", "Patricia", "Containers", "Runtime", "certificate"]
+defaultTargets = ["Proof", "Execution", "Semantics", "Synchronisation", "Memory", "Patricia", "Containers", "Runtime", "Ordinary", "Surface", "certificate"]
 
 [[lean_lib]]
 name = "Proof"
@@ -32,6 +32,14 @@ srcDir = "proof"
 
 [[lean_lib]]
 name = "Runtime"
+srcDir = "proof"
+
+[[lean_lib]]
+name = "Ordinary"
+srcDir = "proof"
+
+[[lean_lib]]
+name = "Surface"
 srcDir = "proof"
 
 [[lean_exe]]

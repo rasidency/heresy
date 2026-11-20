@@ -1006,6 +1006,7 @@ theorem guarded_loop_preserves_prefix (related : source → target → Prop)
 structure SwitchEntry where
   bounds : Option (Int × Int)
   target : Nat
+  deriving Repr
 
 def switch_matches (selector : Int) (entry : SwitchEntry) : Bool :=
   match entry.bounds with
@@ -1058,6 +1059,21 @@ theorem switch_search_lists_target (selector : Int) (fallback : Option Nat) (ent
         rcases later fallback selected with first | ⟨chosen, present, target_eq⟩
         · exact .inl first
         · exact .inr ⟨chosen, List.mem_cons_of_mem _ present, target_eq⟩
+
+theorem switch_search_has_target (selector : Int) (entries : List SwitchEntry) (fallback : Option Nat)
+    (present : fallback.isSome || entries.any (·.bounds.isNone) = true) :
+    (switch_search selector fallback entries).isSome = true := by
+  induction entries generalizing fallback with
+  | nil => simpa [switch_search] using present
+  | cons entry rest later =>
+    cases bounds : entry.bounds with
+    | none => simpa [switch_search, bounds] using later (some entry.target) (by simp)
+    | some range =>
+      have tail : fallback.isSome || rest.any (·.bounds.isNone) = true := by
+        simpa [bounds] using present
+      by_cases matched : switch_matches selector entry = true
+      · simp [switch_search, bounds, matched]
+      · simpa [switch_search, bounds, matched] using later fallback tail
 
 theorem guarded_switch_accepts_selection (graph : DispatchGraph)
     (actions : List (state → Option (Transfer state result))) (shape : graph.successors.length = actions.length)
