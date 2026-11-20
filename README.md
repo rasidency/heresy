@@ -93,3 +93,56 @@ lake exe certificate build/machine.json build/Machine.hs
 ```
 
 For the expression machine the certificate reconstructs the lowering of its fingerprint kernel from the AST then checks the emitted Haskell equation and the modular normalisation routine it calls
+
+For ordinary lowering, the module certificate checks the complete embedded runtime against the supplied Heap source, validates function linkage against the ordered frontend dumps and checks the emitted dispatch graphs where present:
+
+```sh
+dune exec --profile release -- heresy test/effects.c -o build/Effects.hs --ast-dir build/effectsast
+lake exe certificate module runtime/Heap.hs build/Effects.hs build/effectsast/0.json
+dune exec --profile release -- heresy test/effects.c --verify-artifact build/Effects.hs --build build/effects
+```
+
+Artifact verification replays the frontend and lowering, compares the entire generated module byte for byte and optionally hands those bytes to GHC as a standalone module, bypassing the compiled runtime cache for that build
+
+The stateful model relates a finite store indexed by injective references to the capability heap and relates buffered writes to their logical stdout state at every finite execution prefix, including runs that stop on a fault. The copied alias fixture moves a pointer word between partially overlapping ranges of one allocation, then releases the pointee and checks that both native Fil-C and the normal Haskell backend preserve the visible `A\n` prefix before rejecting the stale alias
+
+The Lean trace proves that the ranges overlap within one capability and that copying retains the original pointer word. It also proves that releasing the pointee causes the later dereference to fail with `A\n` still visible on stdout.
+
+The copy proof uses a hand translation of the [containers 0.6.7 IntMap implementation](https://hackage-content-origin.haskell.org/package/containers-0.6.7/docs/Data-IntMap-Internal.html) shipped with the pinned GHC. The merge proof covers equal tips, shared prefixes, descent into a matching child and links between disjoint prefixes. Every derivation of those source equations on valid tries yields a left biased merge and retains the canonical prefix and mask order.
+
+The ascending builder proof covers every run on strictly increasing signed keys. Each recursive call consumes a prefix of the remaining entries and leaves a suffix outside its scope, which supplies the routing and mask order needed by the next splice. Pruning and rebuilding both produce valid tries that feed the merge proof, so the complete sequence yields the byte and shadow equations for the original snapshots even when the ranges overlap.
+
+The source equations are transcribed from Haskell and the bitvector calculations use the pinned Lean compiler to check certificates. GHC code generation and the validity of tries supplied by operations outside this fragment remain in the trust boundary. The separate IntSet used for atomic slots retains its existing model.
+
+The ordinary certificate reconstructs all checked function bodies from the ordered translation units and independently renders the complete Haskell module, including parameter slots, direct calls and startup. It resolves external prototypes against a unique definition and qualifies private functions by unit, preserving distinct bindings for identical private names. Definitions can call one another recursively through checked prototypes, and expressions over pointers, bytes and 32 or 64 bit integers can read and update the capability heap.
+
+The checker retains lexical scope and declaration order while assigning slots to scalar locals in nested blocks, conditional arms and loop initialisers. The structured control model propagates a return through the surrounding loops and consumes a break at the innermost loop. A continue runs the advance expression in a for loop or the trailing test in a do while loop, even when it skips every remaining statement in the body. The certificate also proves that loop transfers cannot escape a function and that only main may fall through without returning a value.
+
+The checker reconstructs block indices and successor rows for direct jumps, switches over integer literals and computed jumps whose expressions select among explicit label addresses. The proof compares unguarded execution of the reconstructed graph with guarded dispatch and shows that each action produces only listed routes, including case fall-through, default selection and transfers from a switch to an enclosing loop.
+
+Shared scalar objects and fixed arrays use two startup phases. Every unit allocates its objects before any unit stores its initial values, which allows an initialiser in one unit to take the address of an object defined in another unit. The checker derives array store offsets from the element width and requires the initialiser spans to be ordered, disjoint and contained within the object.
+
+Local aggregates clear their byte range and the complete shadow words it contains each time execution enters a declaration with an initialiser list. This restores zero for omitted elements when a block reuses the same stack slot on a later loop iteration. For records with scalar members, Lean computes LP64 padding and proves that struct fields occupy disjoint spans while union fields start at offset zero and fit within their shared storage. Whole-record copies preserve the snapshot of bytes and pointer capabilities, so subsequent changes to the original do not alter the copy.
+
+Named bitfields can share bytes. The checker computes their bit offsets and the smallest byte span needed for each access, then checks initialisers for overlap at bit granularity. The store proof shows that reloading the written span returns the new bits inside the field and the original bits outside it.
+
+The Lean theorem relates the evaluator for the typed source model to the emitted action model at every finite execution prefix. Function entry and loop iterations consume explicit trace steps, so increasing the budget can extend the observed stdout and leaves a completed observation unchanged. An explicit process exit discards the remaining continuations, exposes pending stdout bytes and reduces the supplied status to its low eight bits.
+
+Both entry signatures initialise the argument strings after the globals and before entering main. The model writes a terminating zero in each string and a null pointer after the last vector entry, using the same allocation sizes and write order as the runtime. The observation checker accepts the encoded argument bytes, including the executable name and any empty arguments, in a NUL-delimited file.
+
+Build the checker and require it before writing or compiling the ordinary artifact:
+
+```sh
+lake build
+dune exec --profile release -- heresy test/linkage/client.c test/linkage/server.c \
+  --certificate .lake/build/bin/certificate --build build/linked
+```
+
+The gate invokes GHC with the same standalone bytes that the checker accepted, including the runtime embedded in the checker, and selects the containers version used by the trie proofs. The ordinary proof starts at the typed Fil-C dump and ends at the action model. It leaves general C frontend semantics, GHC execution and coverage of variable length arrays, aggregate calling conventions, variadic calls and concurrency as separate proof obligations.
+
+For a closed main that returns a parenthesised unsigned long expression cast to int, the gate can check the C source directly. Lean proves that the tokeniser and parser accept exactly the restricted lexical and syntax rules, then checks the complete emitted module against the unique expression derived from those rules. The executable theorem for this fragment assumes that the host implements the checked Haskell semantics:
+
+```sh
+dune exec --profile release -- heresy test/closed.c --closed \
+  --certificate .lake/build/bin/certificate --build build/closed
+```

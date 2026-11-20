@@ -22,7 +22,86 @@ jobs:
           /tmp/shared && lake exe certificate shared choose /tmp/sharedast/0.json /tmp/Shared.hs &&
           sed "/^f_63686f6f7365 _ = /s/pure shared/pure (Number 0)/" /tmp/Shared.hs > /tmp/ChangedShared.hs &&
           ! lake exe certificate shared choose /tmp/sharedast/0.json /tmp/ChangedShared.hs &&
+          dune exec --profile release -- heresy test/effects.c -o /tmp/Effects.hs --ast-dir /tmp/effectsast &&
+          lake exe certificate module runtime/Heap.hs /tmp/Effects.hs /tmp/effectsast/0.json &&
+          lake exe certificate ordinary runtime/Heap.hs /tmp/effectsast/0.json /tmp/Effects.hs &&
+          sed "/^f_6d61696e _ = /s/pure (Number (65))/pure (Number (66))/" /tmp/Effects.hs > /tmp/ChangedBody.hs &&
+          ! lake exe certificate ordinary runtime/Heap.hs /tmp/effectsast/0.json /tmp/ChangedBody.hs &&
+          ! dune exec --profile release -- heresy examples/machine.c --certificate .lake/build/bin/certificate -o /tmp/Uncertified.hs &&
+          test ! -e /tmp/Uncertified.hs &&
+          sed "1s/GeneralizedNewtypeDeriving/StandaloneDeriving/" /tmp/Effects.hs > /tmp/ChangedRuntime.hs &&
+          ! lake exe certificate module runtime/Heap.hs /tmp/ChangedRuntime.hs /tmp/effectsast/0.json &&
+          dune exec --profile release -- heresy test/effects.c --certificate .lake/build/bin/certificate --verify-artifact /tmp/Effects.hs --build /tmp/effects &&
+          status=0 && { /tmp/effects >/tmp/effects.out 2>/tmp/effects.err || status=$?; } &&
+          test "$status" -eq 70 && grep -q "use after free" /tmp/effects.err &&
+          lake exe certificate effects runtime/Heap.hs /tmp/effectsast/0.json /tmp/Effects.hs /tmp/effects.out &&
+          dune exec --profile release -- heresy test/recursion.c --certificate .lake/build/bin/certificate -o /tmp/Recursion.hs --ast-dir /tmp/recursionast --build /tmp/recursion &&
+          sed "/^f_726570656174 (a0/s/\"forward\"/\"repeat\"/" /tmp/Recursion.hs > /tmp/ChangedCall.hs &&
+          ! lake exe certificate ordinary runtime/Heap.hs /tmp/recursionast/0.json /tmp/ChangedCall.hs &&
+          status=0 && { /tmp/recursion >/tmp/recursion.out 2>/tmp/recursion.err || status=$?; } &&
+          test "$status" -eq 70 && grep -q "use after free" /tmp/recursion.err &&
+          lake exe certificate effects runtime/Heap.hs /tmp/recursionast/0.json /tmp/Recursion.hs /tmp/recursion.out &&
+          "$FILCC" -std=c11 -O1 test/recursion.c -o /tmp/recursionref &&
+          status=0 && { /tmp/recursionref >/tmp/recursionref.out 2>/tmp/recursionref.err || status=$?; } &&
+          test "$status" -ne 0 && grep -q "cannot access pointer to free object" /tmp/recursionref.err &&
+          cmp /tmp/recursion.out /tmp/recursionref.out &&
+          dune exec --profile release -- heresy test/control.c --certificate .lake/build/bin/certificate -o /tmp/Control.hs --ast-dir /tmp/controlast --build /tmp/control &&
+          status=0 && { /tmp/control >/tmp/control.out || status=$?; } &&
+          test "$status" -eq 7 &&
+          "$FILCC" -std=c11 -O1 test/control.c -o /tmp/controlref &&
+          status=0 && { /tmp/controlref >/tmp/controlref.out || status=$?; } &&
+          test "$status" -eq 7 && cmp /tmp/control.out /tmp/controlref.out &&
+          lake exe certificate ordinary-observe runtime/Heap.hs /tmp/Control.hs 256 7 /tmp/control.out /tmp/controlast/0.json &&
+          sed "/^f_7363616e (a0/s/pure Continue/pure Break/" /tmp/Control.hs > /tmp/ChangedTransfer.hs &&
+          ! lake exe certificate ordinary runtime/Heap.hs /tmp/controlast/0.json /tmp/ChangedTransfer.hs &&
+          dune exec --profile release -- heresy test/dispatch.c --certificate .lake/build/bin/certificate -o /tmp/Dispatch.hs --ast-dir /tmp/dispatchast --build /tmp/dispatch &&
+          status=0 && { /tmp/dispatch >/tmp/dispatch.out || status=$?; } &&
+          test "$status" -eq 2 &&
+          "$FILCC" -std=c11 -O1 test/dispatch.c -o /tmp/dispatchref &&
+          status=0 && { /tmp/dispatchref >/tmp/dispatchref.out || status=$?; } &&
+          test "$status" -eq 2 && cmp /tmp/dispatch.out /tmp/dispatchref.out &&
+          lake exe certificate ordinary-observe runtime/Heap.hs /tmp/Dispatch.hs 512 2 /tmp/dispatch.out /tmp/dispatchast/0.json &&
+          sed "/^f_726f757465 (a0/s/pure (Jump 13)/pure (Jump 12)/" /tmp/Dispatch.hs > /tmp/ChangedDispatch.hs &&
+          ! lake exe certificate ordinary runtime/Heap.hs /tmp/dispatchast/0.json /tmp/ChangedDispatch.hs &&
+          dune exec --profile release -- heresy test/arrays.c --certificate .lake/build/bin/certificate -o /tmp/Arrays.hs --ast-dir /tmp/arraysast --build /tmp/arrays &&
+          /tmp/arrays > /tmp/arrays.out &&
+          "$FILCC" -std=c11 -O1 test/arrays.c -o /tmp/arraysref &&
+          /tmp/arraysref > /tmp/arraysref.out && cmp /tmp/arrays.out /tmp/arraysref.out &&
+          lake exe certificate ordinary-observe runtime/Heap.hs /tmp/Arrays.hs 512 0 /tmp/arrays.out /tmp/arraysast/0.json &&
+          sed "/^f_6d61696e _ = /s/clear 2 p/clear 1 p/" /tmp/Arrays.hs > /tmp/ChangedClear.hs &&
+          ! lake exe certificate ordinary runtime/Heap.hs /tmp/arraysast/0.json /tmp/ChangedClear.hs &&
+          dune exec --profile release -- heresy test/records.c --certificate .lake/build/bin/certificate -o /tmp/Records.hs --ast-dir /tmp/recordsast --build /tmp/records &&
+          /tmp/records > /tmp/records.out &&
+          "$FILCC" -std=c11 -O1 test/records.c -o /tmp/recordsref &&
+          /tmp/recordsref > /tmp/recordsref.out && cmp /tmp/records.out /tmp/recordsref.out &&
+          lake exe certificate ordinary-observe runtime/Heap.hs /tmp/Records.hs 512 0 /tmp/records.out /tmp/recordsast/0.json &&
+          sed "/void (global .*padded/s/ 8)/ 5)/" /tmp/Records.hs > /tmp/ChangedLayout.hs &&
+          ! lake exe certificate ordinary runtime/Heap.hs /tmp/recordsast/0.json /tmp/ChangedLayout.hs &&
+          dune exec --profile release -- heresy test/fields.c --certificate .lake/build/bin/certificate -o /tmp/Fields.hs --ast-dir /tmp/fieldsast --build /tmp/fields &&
+          /tmp/fields > /tmp/fields.out &&
+          "$FILCC" -std=c11 -O1 test/fields.c -o /tmp/fieldsref &&
+          /tmp/fieldsref > /tmp/fieldsref.out && cmp /tmp/fields.out /tmp/fieldsref.out &&
+          lake exe certificate ordinary-observe runtime/Heap.hs /tmp/Fields.hs 512 0 /tmp/fields.out /tmp/fieldsast/0.json &&
+          sed "/^f_6d61696e _ = /s/BitField 5 8 True/BitField 4 8 True/" /tmp/Fields.hs > /tmp/ChangedField.hs &&
+          ! lake exe certificate ordinary runtime/Heap.hs /tmp/fieldsast/0.json /tmp/ChangedField.hs &&
+          dune exec --profile release -- heresy test/exit.c --certificate .lake/build/bin/certificate -o /tmp/Exit.hs --ast-dir /tmp/exitast --build /tmp/explicitexit &&
+          status=0 && { /tmp/explicitexit >/tmp/explicitexit.out || status=$?; } &&
+          test "$status" -eq 7 && test "$(cat /tmp/explicitexit.out)" = A &&
+          lake exe certificate ordinary-observe runtime/Heap.hs /tmp/Exit.hs 256 7 /tmp/explicitexit.out /tmp/exitast/0.json &&
+          dune exec --profile release -- heresy test/arguments.c --certificate .lake/build/bin/certificate -o /tmp/Arguments.hs --ast-dir /tmp/argumentsast --build /tmp/arguments &&
+          status=0 && { LC_ALL=C.UTF-8 /tmp/arguments "é" "" >/tmp/arguments.out || status=$?; } &&
+          test "$status" -eq 7 &&
+          "$FILCC" -std=c11 -O1 test/arguments.c -o /tmp/argumentsref &&
+          status=0 && { LC_ALL=C.UTF-8 /tmp/argumentsref "é" "" >/tmp/argumentsref.out || status=$?; } &&
+          test "$status" -eq 7 && cmp /tmp/arguments.out /tmp/argumentsref.out &&
+          printf "%s\000%s\000\000" /tmp/arguments "é" > /tmp/arguments.argv &&
+          lake exe certificate ordinary-observe-argv runtime/Heap.hs /tmp/Arguments.hs 512 7 /tmp/arguments.out /tmp/arguments.argv /tmp/argumentsast/0.json &&
+          printf "%s\000" /tmp/arguments > /tmp/short.argv &&
+          ! lake exe certificate ordinary-observe-argv runtime/Heap.hs /tmp/Arguments.hs 512 7 /tmp/arguments.out /tmp/short.argv /tmp/argumentsast/0.json &&
+          printf "%s" /tmp/arguments > /tmp/unterminated.argv &&
+          ! lake exe certificate ordinary-observe-argv runtime/Heap.hs /tmp/Arguments.hs 512 7 /tmp/arguments.out /tmp/unterminated.argv /tmp/argumentsast/0.json &&
           dune exec --profile release -- heresy test/values.c -o /tmp/Values.hs --ast-dir /tmp/values &&
+          lake exe certificate module runtime/Heap.hs /tmp/Values.hs /tmp/values/0.json &&
           lake exe certificate dispatch /tmp/Values.hs &&
           sed "s/if truth tested then convertValue shared else fallback/if truth tested then fallback else convertValue shared/" /tmp/Values.hs > /tmp/Conditional.hs &&
           ! lake exe certificate dispatch /tmp/Conditional.hs &&
@@ -37,6 +116,17 @@ jobs:
           sed "s/d \&\& even q/d \&\& odd q/" /tmp/Values.hs > /tmp/Rounding.hs &&
           ! lake exe certificate process /tmp/Rounding.hs &&
           lake exe certificate linkage /tmp/Values.hs /tmp/values/0.json &&
+          dune exec --profile release -- heresy test/linkage/client.c test/linkage/server.c --certificate .lake/build/bin/certificate -o /tmp/ScalarLink.hs --ast-dir /tmp/scalarunits --build /tmp/scalarlink &&
+          /tmp/scalarlink > /tmp/scalarlink.out &&
+          "$FILCC" -std=c11 -O1 test/linkage/client.c test/linkage/server.c -o /tmp/scalarref &&
+          /tmp/scalarref > /tmp/scalarref.out &&
+          cmp /tmp/scalarlink.out /tmp/scalarref.out &&
+          lake exe certificate ordinary-observe runtime/Heap.hs /tmp/ScalarLink.hs 128 0 /tmp/scalarlink.out /tmp/scalarunits/0.json /tmp/scalarunits/1.json &&
+          ! lake exe certificate ordinary-link runtime/Heap.hs /tmp/ScalarLink.hs /tmp/scalarunits/1.json /tmp/scalarunits/0.json &&
+          sed "/^f_6d61696e _ = /s/function \"unit:0:adjust\"/function \"unit:1:adjust\"/" /tmp/ScalarLink.hs > /tmp/ChangedPrivate.hs &&
+          ! lake exe certificate ordinary-link runtime/Heap.hs /tmp/ChangedPrivate.hs /tmp/scalarunits/0.json /tmp/scalarunits/1.json &&
+          sed "/^main = execute /s/allocateGlobals_unit_756e69743a313a; initialiseGlobals_unit_756e69743a303a/initialiseGlobals_unit_756e69743a303a; allocateGlobals_unit_756e69743a313a/" /tmp/ScalarLink.hs > /tmp/ChangedStartup.hs &&
+          ! lake exe certificate ordinary-link runtime/Heap.hs /tmp/ChangedStartup.hs /tmp/scalarunits/0.json /tmp/scalarunits/1.json &&
           dune exec --profile release -- heresy test/linkage/entry.c test/linkage/worker.c -o /tmp/Linkage.hs --ast-dir /tmp/units --build /tmp/linked &&
           lake exe certificate linkage /tmp/Linkage.hs /tmp/units/0.json /tmp/units/1.json &&
           test "$(/tmp/linked)" = "linkage 4 18 42 18 9 1" &&
@@ -44,8 +134,17 @@ jobs:
           sed "/^main = execute/s/] True (/] False (/" /tmp/Linkage.hs > /tmp/Disabled.hs &&
           ! lake exe certificate linkage /tmp/Disabled.hs /tmp/units/0.json /tmp/units/1.json &&
           "$FILCC" -std=c11 -fsyntax-only -Xclang -ast-dump=json test/closed.c > /tmp/closed.json &&
-          dune exec --profile release -- heresy test/closed.c --closed -o /tmp/Closed.hs &&
+          dune exec --profile release -- heresy test/closed.c --closed --certificate .lake/build/bin/certificate -o /tmp/Closed.hs --build /tmp/closed &&
           lake exe certificate program /tmp/closed.json /tmp/Closed.hs &&
+          lake exe certificate text test/closed.c /tmp/Closed.hs &&
+          "$FILCC" -std=c11 -O1 test/closed.c -o /tmp/closedref &&
+          actual=0 && { /tmp/closed || actual=$?; } &&
+          expected=0 && { /tmp/closedref || expected=$?; } &&
+          test "$actual" -eq 37 && test "$actual" -eq "$expected" &&
+          sed "s/0x100UL/0x101UL/" test/closed.c > /tmp/ChangedSource.c &&
+          ! lake exe certificate text /tmp/ChangedSource.c /tmp/Closed.hs &&
+          sed "s/ + / ++ /" test/closed.c > /tmp/CompoundToken.c &&
+          ! lake exe certificate text /tmp/CompoundToken.c /tmp/Closed.hs &&
           "$FILCC" -std=c11 -fsyntax-only -Xclang -ast-dump=json test/slots.c > /tmp/slots.json &&
           dune exec --profile release -- heresy test/slots.c --closed -o /tmp/Slots.hs &&
           lake exe certificate program /tmp/slots.json /tmp/Slots.hs &&

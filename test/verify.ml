@@ -151,6 +151,21 @@ let () =
     check "Fil-C rejects the same alias access" (native_code <> 0 && contains (native_out ^ native_err) "cannot access pointer to free object");
     check "panics retain the stdout prefix visible before the fault"
       (output = native_out && contains output "Alias before free: 42");
+    ignore (success compiler ["test/effects.c"; "-o"; "build/Effects.hs"; "--build"; "build/effects"]);
+    ignore (success frontend ["-std=c11"; "-O1"; "test/effects.c"; "-o"; "build/effectsref"]);
+    let code, output, errors = run "build/effects" [] in
+    let native_code, native_out, native_errors = run "build/effectsref" [] in
+    check "overlapping memmove carries pointer payload and capability through release and preserves prior stdout"
+      (code = 70 && contains errors "use after free" && native_code <> 0 &&
+       contains (native_out ^ native_errors) "cannot access pointer to free object" &&
+       output = "A\n" && output = native_out);
+    ignore (success compiler ["test/effects.c"; "--verify-artifact"; "build/Effects.hs"]);
+    let changed = "build/Changed.hs" in
+    write changed (read "build/Effects.hs" ^ "\n");
+    let mismatch, _, message = run compiler ["test/effects.c"; "--verify-artifact"; changed] in
+    check "artifact replay rejects changed bytes without writing to the candidate"
+      (mismatch <> 0 && contains message "differs from the supplied artifact" &&
+       read changed = read "build/Effects.hs" ^ "\n");
     compile "bounds";
     check "in-bounds access matches Fil-C" (success "build/bounds" [] = success "build/boundsref" []);
     let code, _, errors = run "build/bounds" ["16"] in
