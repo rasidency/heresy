@@ -66,7 +66,7 @@ data OutputBuffer = OutputBuffer !Bool !Int ![B.ByteString]
 data World = World
   { allocationCounter :: !(IORef (Int, Integer))
   , frames :: ![S.Map String Value], globals :: !(S.Map String Value)
-  , literals :: !(S.Map String Value), functions :: !(S.Map String ([Value] -> R Value))
+  , literals :: !(IORef (S.Map String Value)), functions :: !(S.Map String ([Value] -> R Value))
   , symbols :: !(S.Map String Integer)
   , location :: !String, events :: !Int, recent :: ![String], tracing :: !Bool, history :: !Bool
   , streamTable :: !(IORef (Int, M.IntMap Handle))
@@ -609,27 +609,24 @@ freeze action = do
     _ -> panic "read-only storage requires a data pointer"
 
 literal :: String -> R Value
-literal text = do
-  found <- gets (S.lookup text . literals)
-  case found of
-    Just p -> pure p
+literal text = locked $ do
+  table <- gets literals
+  pool <- liftIO (readIORef table)
+  case S.lookup text pool of
+    Just pointer -> pure pointer
     Nothing -> do
-      oldEvents <- gets events
-      oldRecent <- gets recent
-      oldTracing <- gets tracing
-      oldHistory <- gets history
-      modify' (\w -> w { tracing = False, history = False })
+      recorded <- gets history
+      modify' (\w -> w { history = False })
       pointer <- allocate "global" (length text + 1)
-      forM_ (zip [0..] (map ord text ++ [0])) $ \(i, c) -> void (store (IntegerType 8 False) (offset i pointer) (Number (toInteger c)))
+      modify' (\w -> w { history = recorded })
       case pointer of
         Pointer capability _ -> do
-          locked $ do
-            object <- readObject capability
-            writeObject capability (object { storage = "literal" })
-          modify' (\w -> w { literals = S.insert text pointer (literals w) })
-        _ -> pure ()
-      modify' (\w -> w { events = oldEvents, recent = oldRecent, tracing = oldTracing, history = oldHistory })
-      pure pointer
+          object <- readObject capability
+          let payload = M.fromDistinctAscList [(i, toInteger (ord c .&. 255)) | (i, c) <- zip [0..] text, c /= '\0']
+          writeObject capability (object { bytes = payload, storage = "literal" })
+          liftIO (writeIORef table $! S.insert text pointer pool)
+          pure pointer
+        _ -> panic "literal allocation requires a data pointer"
 
 argument :: String -> R Value
 argument text = do
@@ -806,17 +803,29 @@ unary op ty expression = do
     _ -> panic ("unsupported unary operator " ++ op)
 
 assign :: CType -> R Value -> R Value -> R Value
-assign ty destination expression = do
-  p <- destination
-  value <- expression
-  store ty p value
+assign ty destination expression = case ty of
+  AggregateType _ _ -> placeFirst
+  AtomicAggregate _ _ _ -> placeFirst
+  _ -> do
+    value <- expression
+    pointer <- destination
+    store ty pointer value
+  where
+    placeFirst = do
+      pointer <- destination
+      value <- expression
+      store ty pointer value
 
 update :: String -> CType -> Int -> Bool -> Integer -> Bool -> R Value -> R Value -> R Value
 update op ty width signed stride postfix destination expression = do
+  value <- expression
   pointer <- destination
   old <- load ty pointer
-  value <- expression
-  result <- either panic pure (calculate op width signed stride old value)
+  let promoted = case ty of
+        IntegerType _ _ -> cast (IntegerType width signed) old
+        BitField _ _ _ -> cast (IntegerType width signed) old
+        _ -> old
+  result <- either panic pure (calculate op width signed stride promoted value)
   stored <- store ty pointer result
   pure (if postfix then old else stored)
 
@@ -1567,10 +1576,13 @@ builtin "memset" [destination, value, count] = do
   forM_ [0 .. n - 1] $ \i -> void (store (IntegerType 8 False) (offset (toInteger i) destination) value)
   pure destination
 builtin "strlen" [p] = Number . toInteger . length <$> readString p
-builtin "strcmp" [a, b] = do
-  x <- readString a
-  y <- readString b
-  pure (Number (case compare x y of LT -> -1; EQ -> 0; GT -> 1))
+builtin "strcmp" [a, b] = compareBytes a b
+  where
+    compareBytes left right = do
+      x <- number <$> load (IntegerType 8 False) left
+      y <- number <$> load (IntegerType 8 False) right
+      if x /= y || x == 0 then pure (Number (x - y))
+        else compareBytes (offset 1 left) (offset 1 right)
 builtin "zhasvalidcap" [Pointer NoCapability _] = pure (boolean False)
 builtin "zhasvalidcap" [Pointer capability _] = boolean . live <$> readObject capability
 builtin "zhasvalidcap" [Function _ _] = pure (boolean True)
@@ -1762,6 +1774,7 @@ execute entries labels parallel initialiser initThread = do
     exitWith (ExitFailure 64)
   let enabled = traceMode == Just "1"
       recorded = enabled || traceMode == Just "recent"
+  literalTable <- newIORef S.empty
   counter <- newIORef (1, 4096)
   table <- newIORef (1, M.empty)
   terminal <- either (const False) id <$> tryIOError (hIsTerminalDevice stdout)
@@ -1772,7 +1785,7 @@ execute entries labels parallel initialiser initThread = do
   let names = map fst entries ++ labels ++ map fst pthreadArities ++
         ["malloc", "calloc", "free", "memcpy", "memmove", "memset", "strlen", "strcmp", "puts", "putchar", "printf", "vprintf", "exit", "zhasvalidcap", "zis_readonly", "zgetlower", "zgetupper", "fopen", "fread", "fwrite", "fclose"]
       codes = S.fromList (zip names [9223372036854775808..])
-      initial = World counter [] S.empty S.empty (S.fromList entries) codes "startup" 0 [] False False table (terminal, output) gate threads owner nullPointer initThread
+      initial = World counter [] S.empty literalTable (S.fromList entries) codes "startup" 0 [] False False table (terminal, output) gate threads owner nullPointer initThread
       action = do
         initialiser
         when parallel $ do

@@ -4,9 +4,29 @@ set_option warningAsError true
 
 namespace Heresy
 
+abbrev ArrayFrames := List (List (Nat × Pointer))
+
+abbrev LiteralPool := List (List UInt8 × Pointer)
+
+inductive FileEvent where
+  | opened (path mode : List UInt8) (success : Bool)
+  | input (handle count : Nat) (payload : Option (List UInt8))
+  | output (handle : Nat) (payload : List UInt8) (success : Bool)
+  | closed (handle : Nat) (success : Bool)
+  deriving Repr
+
+structure FileWorld where
+  events : List FileEvent := []
+  handles : List (Nat × Bool) := []
+  next : Nat := 1
+  deriving Repr
+
 structure HeapState where
   objects : Memory
   counter : AllocationCounter
+  arrayFrames : ArrayFrames := []
+  literals : LiteralPool := []
+  files : FileWorld := {}
 
 def HeapState.allocated (state : HeapState) : Prop :=
   ∀ ident object, state.objects ident = some object → ident < state.counter.ident
@@ -18,23 +38,59 @@ def replace_object (memory : Memory) (ident : Nat) (object : Object) : Memory :=
   fun key => if key = ident then some object else memory key
 
 def new_object (heap : Bool) (plan : AllocationPlan) : Object :=
-  ⟨plan.address, plan.extent, true, false, fun _ => 0, fun _ => none, heap⟩
+  ⟨plan.address, plan.extent, true, false, fun _ => 0, fun _ => none, heap, [], fun _ => none⟩
+
+inductive AllocationContent where
+  | empty (heap : Bool)
+  | literal (bytes : List UInt8)
+
+def AllocationContent.object (plan : AllocationPlan) : AllocationContent → Object
+  | .empty heap => new_object heap plan
+  | .literal text => { new_object false plan with readonly := true, bytes := fun i => (text[i]?.getD 0).toNat }
+
+def AllocationContent.pool (before : LiteralPool) (plan : AllocationPlan) : AllocationContent → LiteralPool
+  | .empty _ => before
+  | .literal text => (text, ⟨plan.ident, plan.address⟩) :: before
+
+def AllocationContent.fresh (before : LiteralPool) : AllocationContent → Prop
+  | .empty _ => True
+  | .literal text => before.lookup text = none
 
 inductive HeapTransition : HeapState → HeapState → Prop where
   | observe : HeapTransition state state
+  | files (next : FileWorld) : HeapTransition state { state with files := next }
+  | frames (next : ArrayFrames) : HeapTransition state { state with arrayFrames := next }
   | replace {ident : Nat} {old new : Object} : state.objects ident = some old → new.live = old.live →
       HeapTransition state { state with objects := replace_object state.objects ident new }
   | release {ident : Nat} {object : Object} : state.objects ident = some object →
       HeapTransition state { state with objects := invalidate state.objects ident }
-  | allocate (heap : Bool) : state.counter.ident ≤ host_max →
+  | initialise (content : AllocationContent) : content.fresh state.literals → state.counter.ident ≤ host_max →
       plan_allocation state.counter global size host_max = some plan →
-      HeapTransition state ⟨replace_object state.objects plan.ident (new_object heap plan), plan.next⟩
+      HeapTransition state ⟨replace_object state.objects plan.ident (content.object plan), plan.next, state.arrayFrames, content.pool state.literals plan, state.files⟩
+
+theorem HeapTransition.allocate (heap : Bool) (fitted : state.counter.ident ≤ host_max)
+    (allocation : plan_allocation state.counter global size host_max = some plan) :
+    HeapTransition state ⟨replace_object state.objects plan.ident (new_object heap plan), plan.next, state.arrayFrames, state.literals, state.files⟩ :=
+  .initialise (.empty heap) trivial fitted allocation
+
+theorem heap_transition_preserves_literal (step : HeapTransition before after)
+    (found : before.literals.lookup text = some ptr) : after.literals.lookup text = some ptr := by
+  cases step with
+  | observe | files | frames | replace | release => exact found
+  | initialise content fresh _ _ =>
+    cases content with
+    | empty => exact found
+    | literal bytes =>
+      have different : text ≠ bytes := fun same => by
+        subst bytes
+        exact Option.noConfusion (found.symm.trans fresh)
+      simpa [AllocationContent.pool, List.lookup_cons, beq_eq_false_iff_ne.mpr different] using found
 
 theorem heap_transition_allocated (before after : HeapState) (step : HeapTransition before after)
     (allocated : before.allocated) : after.allocated := by
   intro ident object found
   cases step with
-  | observe => exact allocated ident object found
+  | observe | files _ | frames _ => exact allocated ident object found
   | replace previous preserved =>
     rename_i slot _ _
     by_cases same : ident = slot
@@ -47,7 +103,7 @@ theorem heap_transition_allocated (before after : HeapState) (step : HeapTransit
     · subst ident
       exact allocated _ _ previous
     · exact allocated _ _ (by simpa [invalidate, same] using found)
-  | allocate heap counter_fits planned =>
+  | initialise content fresh counter_fits planned =>
     rename_i _ _ _ plan
     obtain ⟨_, _, _, _, _, _, _, _, identity, grows, _, _⟩ :=
       allocation_plan_sound _ _ _ _ plan counter_fits planned
@@ -61,7 +117,7 @@ theorem heap_transition_preserves_dead (before after : HeapState) (step : HeapTr
     dead_at after.objects ident := by
   obtain ⟨object, found, liveness⟩ := dead
   cases step with
-  | observe => exact ⟨object, found, liveness⟩
+  | observe | files _ | frames _ => exact ⟨object, found, liveness⟩
   | replace previous preserved =>
     rename_i slot old new
     by_cases same : ident = slot
@@ -73,9 +129,9 @@ theorem heap_transition_preserves_dead (before after : HeapState) (step : HeapTr
     rename_i slot _
     by_cases same : ident = slot
     · subst ident
-      exact ⟨{ object with live := false, bytes := fun _ => 0, shadow := fun _ => none }, by simp [invalidate, found], rfl⟩
+      exact ⟨{ object with live := false, bytes := fun _ => 0, shadow := fun _ => none, atomicAddress := fun _ => none }, by simp [invalidate, found], rfl⟩
     · exact ⟨object, by simp [invalidate, same, found], liveness⟩
-  | allocate heap counter_fits planned =>
+  | initialise content fresh counter_fits planned =>
     rename_i _ _ _ plan
     obtain ⟨_, _, _, _, _, _, _, _, identity, _, _, _⟩ :=
       allocation_plan_sound _ _ _ _ plan counter_fits planned
@@ -105,7 +161,7 @@ theorem heap_transition_reserves_null (before after : HeapState) (step : HeapTra
     (reserved : before.null_reserved) : after.null_reserved := by
   obtain ⟨empty, positive⟩ := reserved
   cases step with
-  | observe => exact ⟨empty, positive⟩
+  | observe | files _ | frames _ => exact ⟨empty, positive⟩
   | replace previous preserved =>
     rename_i ident _ _
     have different : 0 ≠ ident := by
@@ -120,7 +176,7 @@ theorem heap_transition_reserves_null (before after : HeapState) (step : HeapTra
       cases equal
       simp [empty] at previous
     exact ⟨by simp [invalidate, different, empty], positive⟩
-  | allocate heap fitted planned =>
+  | initialise content fresh fitted planned =>
     rename_i _ _ _ plan
     obtain ⟨_, _, _, _, _, _, _, _, identity, grows, _, _⟩ :=
       allocation_plan_sound _ _ _ _ plan fitted planned
@@ -151,7 +207,7 @@ theorem released_identity_stays_dead (before after : HeapState) (released : Poin
   have released_step : HeapTransition before { before with objects := invalidate before.objects released.capability } :=
     .release found
   have dead : dead_at (invalidate before.objects released.capability) released.capability :=
-    ⟨{ object with live := false, bytes := fun _ => 0, shadow := fun _ => none }, by simp [invalidate, found], rfl⟩
+    ⟨{ object with live := false, bytes := fun _ => 0, shadow := fun _ => none, atomicAddress := fun _ => none }, by simp [invalidate, found], rfl⟩
   exact heap_trace_preserves_dead _ _ trace (heap_transition_allocated before _ released_step allocated) released.capability dead
 
 theorem released_alias_stays_dead (before after : HeapState) (released : Pointer) (alias : Pointer)
@@ -186,13 +242,14 @@ theorem freeze_transition (state : HeapState) (pointer : Pointer) (next : Memory
     exact .replace found (new := {object with readonly := true}) rfl
 
 def object_planes (object : Object) : CopyPlanes Nat :=
-  ⟨fun index => some (object.bytes index.toNat), fun slot => object.shadow slot.toNat, fun _ => false⟩
+  ⟨fun index => some (object.bytes index.toNat), fun slot => object.shadow slot.toNat, fun slot => (object.atomicAddress slot.toNat).isSome⟩
 
 def copied_object (source destination : Object) (s d count : Nat) : Object :=
   let result := copy_snapshot (object_planes source) (object_planes destination) s d count
   { destination with
     bytes := fun index => (result.payload index).getD 0,
-    shadow := fun slot => result.shadow slot }
+    shadow := fun slot => result.shadow slot
+    atomicAddress := fun slot => if result.atomic slot then destination.atomicAddress slot else none }
 
 theorem copy_transition (state : HeapState) (source destination : Pointer) (count s d : Nat)
     (offsets : runtime_copy_offsets state.objects source destination count = .ok (some (s, d))) :
@@ -434,9 +491,36 @@ inductive PointerWordFault where
 def data_pointer_word (object : Object) (slot : Nat) : Option Nat × Int :=
   (object.shadow slot, little_endian_read 8 (fun i => object.bytes (slot + i)))
 
-def write_pointer_word (object : Object) (slot : Nat) (value : Pointer) : Object :=
+def atomic_data_pointer (object : Object) (slot : Nat) : Option Nat × Int :=
+  let (cap, raw) := data_pointer_word object slot
+  (cap, (object.atomicAddress slot).getD raw)
+
+def write_pointer_word (object : Object) (slot : Nat) (value : Pointer) (atomic : Bool := false) : Object :=
   { integer_store object slot 8 value.address with
-    shadow := fun index => if index = slot then some value.capability else object.shadow index }
+    shadow := fun index => if index = slot then some value.capability else object.shadow index
+    atomicAddress := fun index => if index = slot then (if atomic then some value.address else none)
+      else object.atomicAddress index }
+
+theorem atomic_pointer_payload_store (object : Object) (slot offset width : Nat) (pointer : Pointer) (word : Int) :
+    atomic_data_pointer (integer_store (write_pointer_word object slot pointer true) offset width word) slot =
+      (some pointer.capability, pointer.address) := by
+  simp [atomic_data_pointer, data_pointer_word, integer_store, write_pointer_word]
+
+theorem ordinary_pointer_clears_atomic (object : Object) (slot : Nat) (pointer : Pointer) :
+    atomic_data_pointer (write_pointer_word object slot pointer) slot =
+      data_pointer_word (write_pointer_word object slot pointer) slot := by
+  simp [atomic_data_pointer, write_pointer_word]
+
+theorem pointer_byte_observes_address (object : Object) (slot index : Nat) (value : Pointer) (inside : index < 8) :
+    (write_pointer_word object slot value).bytes (slot + index) = little_endian_byte value.address index := by
+  have span : slot ≤ slot + index ∧ slot + index < slot + 8 := by omega
+  simp [write_pointer_word, integer_store, span]
+
+theorem pointer_bytes_distinguish_layouts (object : Object) (slot index : Nat) (left right : Pointer)
+    (inside : index < 8) (different : little_endian_byte left.address index ≠ little_endian_byte right.address index) :
+    (write_pointer_word object slot left).bytes (slot + index) ≠
+      (write_pointer_word object slot right).bytes (slot + index) := by
+  simpa only [pointer_byte_observes_address object slot index _ inside] using different
 
 theorem data_pointer_word_roundtrip (object : Object) (slot : Nat) (value : Pointer) :
     data_pointer_word (write_pointer_word object slot value) slot =
