@@ -106,7 +106,14 @@ let children node = Json.list (field node "inner")
 let ty node =
   let t = field node "type" in
   let desugared = text t "desugaredQualType" in
-  if desugared = "" then text t "qualType" else desugared
+  let written = text t "qualType" in
+  let nested_tag = List.exists (fun tag ->
+    String.starts_with ~prefix:(tag ^ " @") written &&
+    String.starts_with ~prefix:(tag ^ " ") desugared &&
+    Str.string_match (Str.regexp (tag ^ " @[0-9]+$")) written 0 &&
+    List.length (Str.split_delim (Str.regexp_string "::(unnamed at ") desugared) = 2
+  ) ["struct"; "union"] in
+  if desugared = "" || nested_tag then written else desugared
 let bool value = if value then "True" else "False"
 let quote s =
   let buffer = Buffer.create (String.length s + 2) in
@@ -251,10 +258,11 @@ module Tags = Map.Make (String)
 
 let resolve_records source content layouts tree =
   let identities = Hashtbl.create 32 and types = Hashtbl.create 32 in
+  let declared_types = Hashtbl.create 32 in
   let resolved = Hashtbl.create 32 and queues = Hashtbl.create 32 in
   let records_by_spelling = Hashtbl.create 32 in
   let anonymous = Hashtbl.create 16 and aliases = Hashtbl.create 16 in
-  let recovered = Hashtbl.create 8 in
+  let recovered = Hashtbl.create 8 and evidence = ref [] in
   let typedefs = Hashtbl.create 32 in
   let headers = Hashtbl.create 8 in
   let named = Str.regexp "\\b\\(struct\\|union\\) [A-Za-z_][A-Za-z_0-9]*\\b" in
@@ -425,7 +433,9 @@ let resolve_records source content layouts tree =
         let native_fields = List.map (fun field ->
           { field with native_type = resolve_spelling scope Tags.empty (ref Tags.empty) field.native_type }
         ) native.native_fields in
-        Hashtbl.replace resolved key { native with native_fields }
+        let layout = { native with native_fields } in
+        Hashtbl.replace resolved key layout;
+        evidence := (key, layout) :: !evidence
     | _ -> ()
   and resolve_spelling scope extra used raw =
     let raw = if contains raw "(unnamed" || contains raw "(anonymous" then
@@ -516,17 +526,44 @@ let resolve_records source content layouts tree =
         let fields = List.map (function
           | "inner", _ -> "inner", Json.Array children
           | "array_filler", Json.Array nodes -> "array_filler", Json.Array (fst (rewrite_children scope nodes))
-          | "type", metadata -> "type", rename scope inherited metadata
+          | "referencedDecl", Json.Object parts as entry ->
+              let reference = snd entry in
+              let key = text reference "id" in
+              (match Hashtbl.find_opt declared_types key with
+               | Some (raw, canonical) when raw = field reference "type" ->
+                   "referencedDecl", Json.Object (List.map (function
+                     | "type", _ -> "type", canonical
+                     | part -> part) parts)
+               | _ -> entry)
+          | "type", metadata ->
+              let canonical = rename scope inherited metadata in
+              if id <> "" && List.mem node_kind ["VarDecl"; "ParmVarDecl"] then
+                Hashtbl.replace declared_types id (metadata, canonical);
+              "type", canonical
           | "argType", metadata -> "argType", rename scope Tags.empty metadata
           | ("computeLHSType" | "computeResultType" as key), metadata -> key, rename scope inherited metadata
           | "name", _ when record <> None -> "name", Json.String (fst (Option.get record))
           | part -> part) fields in
+        let fields = match record with
+          | Some (_, key) when node_kind = "RecordDecl" && List.exists (fun child -> kind child = "PackedAttr") children ->
+              (match Hashtbl.find_opt resolved key with
+               | None -> fields
+               | Some layout ->
+                   let number value = Json.Number (string_of_int value) in
+                   let entry field = Json.Array [number field.native_offset;
+                     Option.fold ~none:Json.Null ~some:number field.native_width] in
+                   ("heresyLayout", Json.Array [number layout.native_size; number layout.native_alignment;
+                     Json.Array (List.map entry layout.native_fields)]) :: fields)
+          | _ -> fields in
         if node_kind = "RecordDecl" && text node "name" = "" then begin
           let name = match record with Some (name, _) -> name | None -> "" in
           let fields = ("name", Json.String name) :: fields in
           Json.Object fields, after
         end else begin
           if id <> "" then Hashtbl.replace types id !used;
+          let fields = match record with
+            | Some _ -> ("heresyRecordTag", Json.String (text node "name")) :: fields
+            | None -> fields in
           let fields, after = if node_kind = "TypedefDecl" then
             let name = text node "name" in
             let key = "@type" ^ string_of_int (Hashtbl.length typedefs) in
@@ -538,6 +575,15 @@ let resolve_records source content layouts tree =
     | other -> other, scope
   in
   let tree, _ = rewrite Tags.empty tree in
+  let tree = match tree, !evidence with
+    | Json.Object fields, _ :: _ ->
+        let number n = Json.Number (string_of_int n) in
+        let entry field = Json.Array [Json.String field.native_name; Json.String field.native_type;
+          number field.native_offset; Option.fold ~none:Json.Null ~some:number field.native_width] in
+        let record (key, layout) = Json.Array [Json.String key; number layout.native_size;
+          number layout.native_alignment; Json.Array (List.map entry layout.native_fields)] in
+        Json.Object (("heresyInlineRecords", Json.Array (List.rev_map record !evidence)) :: fields)
+    | _ -> tree in
   resolved, tree
 
 let clean context original =
@@ -1067,11 +1113,26 @@ and expression context node =
           let alias = text arg "typeAliasDeclId" in
           if Hashtbl.mem context.vla_aliases alias then "vlaSize 0 " ^ vla_shape context alias else
           let base, modifiers = declarator context t in
+          let rec counts = function
+            | Dimension bound :: rest ->
+                let total, dynamic = counts rest in
+                total + 1, dynamic + (if int_of_string_opt bound = None then 1 else 0)
+            | _ -> 0, 0
+          in
+          let total, dynamic = counts modifiers in
+          let all_bounds = List.length children = total in
+          if not all_bounds && List.length children <> dynamic then
+            fail context node "unexpected variable-length bounds in sizeof";
           let rec dimensions bound_nodes = function
             | Dimension bound :: rest ->
                 begin match int_of_string_opt bound, bound_nodes with
                 | Some count, _ ->
-                    let width, dims = dimensions bound_nodes rest in
+                    let remaining = match all_bounds, bound_nodes with
+                      | true, _ :: rest -> rest
+                      | false, _ -> bound_nodes
+                      | true, [] -> fail context node "missing typed fixed bound in sizeof"
+                    in
+                    let width, dims = dimensions remaining rest in
                     width, ("pure (Number " ^ string_of_int count ^ ")") :: dims
                 | None, node :: tail ->
                     let width, dims = dimensions tail rest in
@@ -1108,6 +1169,7 @@ and expression context node =
             | None, Some width -> "realUpdate " ^ op ^ " " ^ string_of_int width ^ " " ^ ctype context t
             | None, None ->
                 let width, signed = if pointer context t then 64, false else scalar context t in
+                let width, signed = if width < 32 then 32, true else width, signed in
                 if pointer context t && dynamic_array context (element context t) then
                   match dynamic_origin context child with
                   | Some (id, rank) -> "vlaUpdate " ^ op ^ " " ^ string_of_int (rank + 1) ^ " " ^ vla_shape context id
@@ -1117,7 +1179,7 @@ and expression context node =
                   "update " ^ op ^ " " ^ access_type context child ^ " " ^ string_of_int width ^ " " ^ bool signed ^ " " ^ string_of_int stride
           in
           begin match atomic_underlying context (ty child) with
-          | None -> update () ^ " " ^ postfix ^ " " ^ par (lv child) ^ " (pure (Number 1))"
+          | None -> update () ^ " " ^ postfix ^ " " ^ par (lv child) ^ " (pure (Number (1)))"
           | Some t ->
               let stride = if pointer context t then (layout context (element context t)).size else 1 in
               "atomicModify " ^ op ^ " " ^ ctype context t ^ " " ^ string_of_int stride ^ " " ^ postfix ^
@@ -1345,31 +1407,7 @@ and declaration context node =
 
 and inline_assembly context node =
   let reject () = fail context node "unsupported inline assembly" in
-  let source =
-    let location field_name =
-      let p = field (field node "range") field_name in
-      if field p "spellingLoc" = Json.Null then p else field p "spellingLoc"
-    in
-    let first = location "begin" and last = location "end" in
-    let first_file = text first "file" and last_file = text last "file" in
-    if first_file <> "" && last_file <> "" && first_file <> last_file then reject ();
-    let file = if first_file <> "" then first_file else last_file in
-    let content =
-      if file <> "" && file <> context.source then (try read file with Sys_error _ -> reject ()) else begin
-        if file = "" && field first "includedFrom" <> Json.Null then reject ();
-        context.content
-      end
-    in
-    let coordinates p =
-      match int_of_string_opt (text p "offset"), int_of_string_opt (text p "tokLen") with
-      | Some offset, Some width when offset >= 0 && width >= 0 && offset <= String.length content - width ->
-          offset, width
-      | _ -> reject ()
-    in
-    let first, _ = coordinates first and last, width = coordinates last in
-    if last + width <= first then reject ();
-    String.sub content first (last + width - first)
-  in
+  let source = text node "heresyAssembly" in
   let operands = children node in
   let rec body = function
     | Token word :: rest when List.mem word ["volatile"; "__volatile"; "__volatile__"; "inline"; "__inline"; "__inline__"] ->
@@ -1613,7 +1651,21 @@ and control_flow context body =
         edge (List.map snd entries) ("selection " ^ par (expression context condition) ^ " [" ^ join actions ^ "]")
     | "CaseStmt", ([lo; child] | [lo; _; child]) ->
         let hi = match children node with [_; hi; _] -> hi | _ -> lo in
-        let label = "Just (" ^ par (expression context lo) ^ ", " ^ par (expression context hi) ^ ")" in
+        let rec integer node =
+          if ty node <> "int" then None else
+          match kind node, children node with
+          | "IntegerLiteral", [] ->
+              (match int_of_string_opt (text node "value") with
+               | Some n when n >= 0 && n <= 2147483647 -> Some n
+               | _ -> None)
+          | ("ConstantExpr" | "ParenExpr"), [child] -> integer child
+          | "UnaryOperator", [child] when text node "opcode" = "-" -> Option.map (~-) (integer child)
+          | "UnaryOperator", [child] when text node "opcode" = "+" -> integer child
+          | _ -> None in
+        let bound node = match integer node with
+          | Some n -> par ("pure (Number " ^ par (string_of_int n) ^ ")")
+          | None -> par (expression context node) in
+        let label = "Just (" ^ bound lo ^ ", " ^ bound hi ^ ")" in
         case_target cases node label (descend next child)
     | "DefaultStmt", [child] -> case_target cases node "Nothing" (descend next child)
     | ("NullStmt" | ""), _ -> next
@@ -1728,7 +1780,83 @@ let link_symbols trees =
   ) trees;
   definitions
 
+let lower_initialisers tree =
+  let with_children node inner = match node with
+    | Json.Object fields -> Json.Object (("inner", Json.Array inner) :: List.remove_assoc "inner" fields)
+    | _ -> node in
+  let names = Hashtbl.create 32 in
+  walk (fun node -> if List.mem (kind node) ["VarDecl"; "FunctionDecl"] then
+    Hashtbl.replace names (text node "name") ()) tree;
+  let lift decl =
+    match kind decl, children decl with
+    | "VarDecl", [decay] when text decl "tls" = "" &&
+        kind decay = "ImplicitCastExpr" && text decay "castKind" = "ArrayToPointerDecay" ->
+        (match children decay with
+         | [literal] when kind literal = "CompoundLiteralExpr" && text literal "id" <> "" ->
+             (match children literal with
+              | [init] when kind init = "InitListExpr" ->
+                  let rec fresh index =
+                    let name = "__heresy_literal_" ^ text decl "name" ^ "_" ^ string_of_int index in
+                    if Hashtbl.mem names name then fresh (index + 1) else name in
+                  let fields = ["id", field literal "id"; "name", Json.String (fresh 0);
+                    "type", field literal "type"; "kind", Json.String "VarDecl"] in
+                  let backing = Json.Object (fields @ ["storageClass", Json.String "static";
+                    "init", Json.String "c"; "loc", field decl "loc"; "range", field literal "range";
+                    "inner", Json.Array [init]]) in
+                  let reference = Json.Object ["kind", Json.String "DeclRefExpr"; "type", field literal "type";
+                    "valueCategory", Json.String "lvalue"; "referencedDecl", Json.Object fields] in
+                  [with_children decl [with_children decay [reference]]; backing]
+              | _ -> [decl])
+         | _ -> [decl])
+    | _ -> [decl] in
+  let selected expr = match kind expr with
+    | "GenericSelectionExpr" ->
+        (match List.filter (fun arm -> Json.bool (field arm "selected")) (children expr) with
+         | [arm] -> List.nth_opt (List.rev (children arm)) 0
+         | _ -> None)
+    | _ -> Some expr in
+  let expand stmt = match kind stmt, children stmt with
+    | "DeclStmt", [decl] when kind decl = "VarDecl" && text decl "storageClass" = "" &&
+        List.mem (text (field decl "type") "qualType") ["int"; "unsigned int"; "long"; "unsigned long"] ->
+        (match children decl with
+         | [init] when ty init = ty decl ->
+             (match Option.bind (selected init) (fun expr ->
+               match kind expr, children expr with
+               | "StmtExpr", [block] when kind block = "CompoundStmt" -> Some block
+               | _ -> None) with
+              | Some block ->
+                  let rec finish node = match kind node, children node with
+                    | "LabelStmt", [last] -> Option.map (fun child -> with_children node [child]) (finish last)
+                    | _ when ty node = ty decl && text node "valueCategory" = "prvalue" ->
+                        let t = field decl "type" in
+                        let ref = Json.Object ["id", field decl "id"; "kind", Json.String "VarDecl";
+                          "name", field decl "name"; "type", t] in
+                        let place = Json.Object ["kind", Json.String "DeclRefExpr"; "referencedDecl", ref;
+                          "valueCategory", Json.String "lvalue"; "type", t; "range", field node "range"] in
+                        Some (Json.Object ["kind", Json.String "BinaryOperator"; "opcode", Json.String "=";
+                          "type", t; "valueCategory", Json.String "prvalue"; "range", field node "range";
+                          "inner", Json.Array [place; node]])
+                    | _ -> None in
+                  (match List.rev (children block) with
+                   | last :: preceding ->
+                       (match finish last with
+                        | Some assignment -> [with_children stmt [with_children decl []];
+                            with_children block (List.rev_append preceding [assignment])]
+                        | None -> [stmt])
+                   | [] -> [stmt])
+              | None -> [stmt])
+         | _ -> [stmt])
+    | _ -> [stmt] in
+  let rec visit node = match children node with
+    | [] -> node
+    | inner ->
+        let inner = List.map visit inner in
+        with_children node (if kind node = "CompoundStmt" then List.concat_map expand inner else inner) in
+  let tree = visit tree in
+  with_children tree (List.concat_map lift (children tree))
+
 let context namespace symbols source content frontend_layouts vla_bounds vla_aliases vla_inherited vla_adjusted tree =
+  let tree = lower_initialisers tree in
   let nodes = source_nodes tree in
   let functions = List.filter function_definition nodes in
   let internal_functions = internal_symbols nodes "FunctionDecl" and internal_objects = internal_symbols nodes "VarDecl" in
@@ -1854,6 +1982,7 @@ let context namespace symbols source content frontend_layouts vla_bounds vla_ali
   List.iter (fun n ->
     if not (List.mem (kind n) ["FunctionDecl"; "VarDecl"; "RecordDecl"; "EnumDecl"; "TypedefDecl"; "StaticAssertDecl"; "EmptyDecl"]) then
       fail context n ("unsupported top-level declaration " ^ kind n);
+    let prototype = kind n = "FunctionDecl" && not (List.exists (fun child -> kind child = "CompoundStmt") (children n)) in
     walk (fun d ->
       if String.ends_with ~suffix:"Attr" (kind d) && kind d <> "PackedAttr" &&
         not (Json.bool (field d "inherited") || Json.bool (field d "implicit")) then
@@ -1864,7 +1993,8 @@ let context namespace symbols source content frontend_layouts vla_bounds vla_ali
         if text d "storageClass" = "extern" then bind_external d else assign d;
         if not (Hashtbl.mem vla_bounds (text d "id")) then begin
           let _, modifiers = declarator context (ty d) in
-          if List.exists (function Dimension bound -> bound <> "" && int_of_string_opt bound = None | _ -> false) modifiers then
+          if not (prototype && kind d = "ParmVarDecl") &&
+             List.exists (function Dimension bound -> bound <> "" && int_of_string_opt bound = None | _ -> false) modifiers then
             fail context d "unsupported variable-length declarator without captured bounds";
           ignore (layout context (ty d))
         end
@@ -2104,13 +2234,15 @@ let compiled_support compiler directory options run =
   end;
   entry
 
-let atomic_write path content =
+let atomic_write ?(executable=false) ?(validate=fun _ -> ()) path content =
   let temporary, channel = Filename.open_temp_file ~temp_dir:(Filename.dirname path) ".heresy" ".hs" in
   Fun.protect ~finally:(fun () -> close_out_noerr channel; if Sys.file_exists temporary then Unix.unlink temporary) (fun () ->
     output_string channel content;
     flush channel;
+    if executable then Unix.fchmod (Unix.descr_of_out_channel channel) 0o755;
     Unix.fsync (Unix.descr_of_out_channel channel);
     close_out channel;
+    validate temporary;
     Unix.rename temporary path)
 
 let find_frontend () =
@@ -2157,6 +2289,47 @@ let json_tree tree =
   emit tree;
   add "\n";
   Buffer.contents buffer
+
+let assembly_source source content node =
+  let reject () = raise (Error "unsupported inline assembly source range") in
+  let location field_name =
+    let p = field (field node "range") field_name in
+    if field p "spellingLoc" = Json.Null then p else field p "spellingLoc"
+  in
+  let first = location "begin" and last = location "end" in
+  let first_file = text first "file" and last_file = text last "file" in
+  if first_file <> "" && last_file <> "" && first_file <> last_file then reject ();
+  let file = if first_file <> "" then first_file else last_file in
+  let content =
+    if file <> "" && file <> source then (try read file with Sys_error _ -> reject ()) else begin
+      if file = "" && field first "includedFrom" <> Json.Null then reject ();
+      content
+    end
+  in
+  let coordinates p =
+    match int_of_string_opt (text p "offset"), int_of_string_opt (text p "tokLen") with
+    | Some offset, Some width when offset >= 0 && width >= 0 && offset <= String.length content - width ->
+        offset, width
+    | _ -> reject ()
+  in
+  let first, _ = coordinates first and last, width = coordinates last in
+  if last + width <= first then reject ();
+  String.sub content first (last + width - first)
+
+let capture_assembly source content tree =
+  let statements = Hashtbl.create 8 in
+  List.iter (walk (fun node -> if kind node = "GCCAsmStmt" then
+    Hashtbl.replace statements (text node "id") (assembly_source source content node))) (source_nodes tree);
+  let rec attach = function
+    | Json.Object fields as node ->
+        let fields = List.map (function
+          | ("inner" | "array_filler" as key), Json.Array nodes -> key, Json.Array (List.map attach nodes)
+          | entry -> entry) fields in
+        (match Hashtbl.find_opt statements (text node "id") with
+         | Some raw when kind node = "GCCAsmStmt" -> Json.Object (("heresyAssembly", Json.String raw) :: fields)
+         | _ -> Json.Object fields)
+    | other -> other in
+  if Hashtbl.length statements = 0 then tree else attach tree
 
 let prepare_frontend source content dump =
   let layouts, tree = frontend_dump (dump []) in
@@ -2352,7 +2525,7 @@ let prepare_frontend source content dump =
       Hashtbl.replace bounds id (Hashtbl.find bounds alias);
       Hashtbl.replace inherited id alias
     end) tree;
-  content, layouts, bounds, aliases, inherited, adjusted, tree
+  content, layouts, bounds, aliases, inherited, adjusted, capture_assembly source content tree
 
 type closed_command =
   | Closed_skip
@@ -2582,6 +2755,8 @@ let emit_closed contexts trees =
 let main () =
   let sources = ref [] and output = ref "" and executable = ref "" and ast_directory = ref "" and report = ref false in
   let check = ref false and closed = ref false and timeout = ref 0. and ghc = ref "ghc" in
+  let native = ref false in
+  let observe = ref None and arguments = ref [] and schedule = ref None and file_events = ref None in
   let verify_artifact = ref "" and certificate = ref None in
   let specs = [
     "-o", Arg.Set_string output, "FILE standalone generated Haskell";
@@ -2595,13 +2770,24 @@ let main () =
       if path = "" then raise (Arg.Bad "expected a Lean certificate executable");
       certificate := Some path), "PROGRAM require a Lean certificate before writing or building the module";
     "--closed", Arg.Set closed, " lower a closed integer program for whole-program certification";
+    "--native", Arg.Set native, " emit a Linux x86-64 executable from closed C using the Lean compiler";
+    "--observe", Arg.Int (fun steps -> if steps < 0 then raise (Arg.Bad "negative step budget"); observe := Some steps),
+      "STEPS check one execution of the certified ordinary build against its source observation";
+    "--file-events", Arg.String (fun file -> file_events := Some file), "FILE replay JSON file operations with --observe";
+    "--schedule", Arg.String (fun file -> schedule := Some file), "FILE replay a JSON array of thread identifiers with --observe";
+    "--arg", Arg.String (fun value -> arguments := value :: !arguments), "ARG pass an argument to the observed executable";
     "--explain", Arg.Set report, " report lowering decisions";
     "--timeout", Arg.Set_float timeout, "SECONDS optional tool deadline, zero disables it";
     "--ghc", Arg.Set_string ghc, "PROGRAM select GHC 9.6.7";
     "--version", Arg.Unit (fun () -> Printf.printf "Heresy %s (Fil-C 0.687 -> Haskell)\n" Runtime.version; exit 0), " show compiler version"
   ] in
-  Arg.parse specs (fun path -> sources := path :: !sources) "heresy input.c [other.c ...] [-o Main.hs] [--build executable] [--ast-dir directory] [--check | --verify-artifact FILE] [--certificate PROGRAM] [--explain]";
+  Arg.parse specs (fun path -> sources := path :: !sources) "heresy input.c [other.c ...] [-o Main.hs] [--build executable] [--ast-dir directory] [--check | --verify-artifact FILE] [--certificate PROGRAM] [--closed [--native]] [--observe STEPS [--arg ARG]... [--file-events FILE] [--schedule FILE]] [--explain]";
   if !sources = [] then raise (Error "a Fil-C input file is required");
+  if Option.is_some !observe && (!closed || !native || Option.is_none !certificate || !executable = "") then
+    raise (Error "--observe requires an ordinary --build with --certificate");
+  if Option.is_some !file_events && Option.is_none !observe then raise (Error "--file-events requires --observe");
+  if Option.is_some !schedule && Option.is_none !observe then raise (Error "--schedule requires --observe");
+  if !arguments <> [] && Option.is_none !observe then raise (Error "--arg requires --observe");
   if not (Float.is_finite !timeout) || !timeout < 0. then raise (Error "timeout must be finite and nonnegative");
   if !check && (!output <> "" || !executable <> "" || !ast_directory <> "") then
     raise (Error "--check cannot be combined with -o, --build or --ast-dir");
@@ -2613,8 +2799,27 @@ let main () =
     if not (String.ends_with ~suffix:".c" source) then raise (Error "Fil-C input must have the .c extension");
     if (Unix.stat source).Unix.st_kind <> Unix.S_REG then raise (Error "input must be a regular file")
   ) sources;
-  let frontend = find_frontend () in
   let capture ?(limit=Sys.max_string_length) program args = Process.capture ~timeout:!timeout ~limit program args in
+  if !native then begin
+    let source, checker = match sources, !certificate with
+      | [source], Some checker when !closed -> source, checker
+      | _ -> raise (Error "--native requires one C source, --closed and --certificate") in
+    if !output <> "" || !ast_directory <> "" || !report || !check then
+      raise (Error "--native expects --build or --verify-artifact");
+    match !executable, !verify_artifact with
+    | "", path when path <> "" ->
+        if (Unix.stat path).Unix.st_kind <> Unix.S_REG then raise (Error "artifact must be a regular file");
+        print_string (capture checker ["native-verify"; source; path])
+    | path, "" when path <> "" ->
+        let target = output_path path in
+        if same_file target source then raise (Error "executable would overwrite the input source");
+        let image = capture checker ["native-compile"; source] in
+        let validate path = ignore (capture checker ["native-verify"; source; path]) in
+        atomic_write ~executable:true ~validate target image;
+        Printf.printf "Built %s with Lean's Linux x86-64 backend\n" (Filename.basename target)
+    | _ -> raise (Error "--native requires exactly one of --build and --verify-artifact")
+  end else begin
+  let frontend = find_frontend () in
   let version = capture frontend ["--version"] in
   if not (contains version "Fil-C 0.687") then raise (Error "FILCC must select Fil-C 0.687; ordinary Clang is not accepted");
   let machine = String.trim (capture frontend ["-dumpmachine"]) in
@@ -2633,6 +2838,30 @@ let main () =
     context namespace symbols source content frontend_layouts bounds aliases inherited adjusted tree) prepared in
   let definitions = if !closed then emit_closed contexts trees else emit contexts in
   let generated = if !closed then definitions else Runtime.source ^ "\n" ^ definitions in
+  let observed_arguments = List.rev !arguments in
+  let selected_schedule = Option.map read !schedule in
+  let selected_events = Option.map read !file_events in
+  let write_invocation workspace executable =
+    let path = Filename.concat workspace "argv" in
+    write path (String.concat "\000" (executable :: observed_arguments) ^ "\000");
+    let option_file flag name = function
+      | None -> []
+      | Some contents ->
+          let file = Filename.concat workspace name in
+          write file contents;
+          [flag; file]
+    in
+    path :: option_file "--file-events" "events" selected_events @ option_file "--schedule" "schedule" selected_schedule
+  in
+  let certificate_inputs workspace =
+    let runtime = Filename.concat workspace "Heap.hs" in
+    write runtime Runtime.support;
+    let asts = List.mapi (fun index tree ->
+      let path = Filename.concat workspace (string_of_int index ^ ".json") in
+      write path (json_tree tree);
+      path) trees in
+    runtime, asts
+  in
   let listed = String.concat ", " (List.map Filename.basename sources) in
   let artifact =
     if !verify_artifact = "" then None else begin
@@ -2655,15 +2884,13 @@ let main () =
             ["text"; input; candidate]
         | _ -> raise (Error "closed compilation requires one translation unit")
       end else begin
-        let runtime = Filename.concat workspace "Heap.hs" in
-        write runtime Runtime.support;
-        let asts = List.mapi (fun index tree ->
-          let path = Filename.concat workspace (string_of_int index ^ ".json") in
-          write path (json_tree tree);
-          path) trees in
-        match asts with
-        | [ast] -> ["ordinary"; runtime; ast; candidate]
-        | _ -> ["ordinary-link"; runtime; candidate] @ asts
+        let runtime, asts = certificate_inputs workspace in
+        match !observe, asts with
+        | Some steps, _ ->
+            let argv = write_invocation workspace (output_path !executable) in
+            ["ordinary-ready-argv"; runtime; candidate; string_of_int steps] @ argv @ asts
+        | None, [ast] -> ["ordinary"; runtime; ast; candidate]
+        | None, _ -> ["ordinary-link"; runtime; candidate] @ asts
       end in
       let message = capture checker args in
       print_string message)) !certificate;
@@ -2712,6 +2939,16 @@ let main () =
         run (options @ ["-i"; "-i" ^ workspace; "-outputdir"; workspace; "-c"; main]);
         run (options @ [Filename.concat workspace "Main.o"; Filename.concat workspace "Heap.o"; "-o"; target])
       end;
+      (match !observe, !certificate with
+       | Some steps, Some checker ->
+           let stdout = Filename.concat workspace "stdout" and argv = write_invocation workspace executable in
+           let sink = open_out_bin stdout in
+           let status = Fun.protect ~finally:(fun () -> close_out_noerr sink) (fun () ->
+             Process.observe ~timeout:!timeout ~stdout:(Unix.descr_of_out_channel sink) ~argv0:executable target observed_arguments) in
+           let runtime, asts = certificate_inputs workspace in
+           print_string (capture checker (["ordinary-observe-argv"; runtime; main; string_of_int steps;
+             string_of_int status; stdout] @ argv @ asts))
+       | _ -> ());
       if Option.is_none artifact then atomic_write output generated;
       Unix.rename target executable)
   in
@@ -2722,6 +2959,7 @@ let main () =
   | Some path -> Printf.printf "Verified complete Haskell artifact %s\n" (Filename.basename path));
   Option.iter (fun path -> Printf.printf "Built %s with GHC\n" (Filename.basename path)) executable;
   if !report then List.iter explain contexts
+  end
   end
 
 let () =
