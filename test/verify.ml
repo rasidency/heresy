@@ -56,13 +56,18 @@ let ordinary_fixtures compiler certificate =
   let grouped = List.concat linked in
   let builds = List.filter_map (fun file ->
     if List.mem file grouped then None else Some [file]) all @ linked in
+  let uncertified = ["test/values.c", "unsupported ordinary addition or subtraction types"] in
   let accepted = List.fold_left (fun count files ->
     let code, _, errors = run compiler (files @ ["--certificate"; certificate; "--check"]) in
-    if code = 0 then count + 1 else begin
-      Printf.eprintf "%s\n%s%!" (String.concat " + " files) errors;
-      count
-    end) 0 builds in
-  Printf.printf "%d/%d ordinary fixture builds certified\n%!" accepted (List.length builds);
+    let expected = List.assoc_opt (List.hd files) uncertified in
+    match expected with
+    | Some reason when code <> 0 && contains errors reason -> count + 1
+    | None when code = 0 -> count + 1
+    | _ ->
+        Printf.eprintf "%s %s\n%s%!" (String.concat " + " files)
+          (if Option.is_some expected then "was expected to be rejected" else "was rejected") errors;
+        count) 0 builds in
+  Printf.printf "%d/%d ordinary fixture builds certified or rejected as expected\n%!" accepted (List.length builds);
   accepted = List.length builds
 
 let () =
