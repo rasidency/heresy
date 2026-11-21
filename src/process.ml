@@ -30,13 +30,24 @@ let with_child ~timeout ~stdout ~stderr ?env ?observation program arguments acti
         end
     | pid -> pid
   in
-  let reaped = ref false in
-  let reap () = let _, result = wait pid in reaped := true; result in
-  let alarm = Sys.signal Sys.sigalrm (Sys.Signal_handle (fun _ -> raise (Timeout timeout))) in
-  let interrupt = Sys.signal Sys.sigint (Sys.Signal_handle (fun signal -> raise (Interrupted signal))) in
-  let terminate = Sys.signal Sys.sigterm (Sys.Signal_handle (fun signal -> raise (Interrupted signal))) in
-  let timer = Unix.setitimer Unix.ITIMER_REAL { Unix.it_interval = 0.; it_value = timeout } in
-  Fun.protect ~finally:(fun () ->
+  let reaped = ref false and signalled = ref None in
+  let deadline = if timeout > 0. then Unix.gettimeofday () +. timeout else Float.infinity in
+  let check () =
+    Option.iter (fun signal -> raise (Interrupted signal)) !signalled;
+    if Unix.gettimeofday () >= deadline then raise (Timeout timeout)
+  in
+  let rec reap () =
+    check ();
+    match Unix.waitpid [] pid with
+    | _, result -> reaped := true; result
+    | exception Unix.Unix_error (Unix.EINTR, _, _) -> reap ()
+  in
+  let note signal = if Option.is_none !signalled then signalled := Some signal in
+  let alarm = Sys.signal Sys.sigalrm (Sys.Signal_handle ignore) in
+  let interrupt = Sys.signal Sys.sigint (Sys.Signal_handle note) in
+  let terminate = Sys.signal Sys.sigterm (Sys.Signal_handle note) in
+  let timer = Unix.setitimer Unix.ITIMER_REAL { Unix.it_interval = 0.05; it_value = 0.05 } in
+  let value = Fun.protect ~finally:(fun () ->
     ignore (Unix.setitimer Unix.ITIMER_REAL { Unix.it_interval = 0.; it_value = 0. });
     if not !reaped then begin
       (try Unix.kill (-pid) Sys.sigkill with Unix.Unix_error _ -> (try Unix.kill pid Sys.sigkill with Unix.Unix_error _ -> ()));
@@ -45,16 +56,18 @@ let with_child ~timeout ~stdout ~stderr ?env ?observation program arguments acti
     Sys.set_signal Sys.sigalrm alarm;
     Sys.set_signal Sys.sigint interrupt;
     Sys.set_signal Sys.sigterm terminate;
-    ignore (Unix.setitimer Unix.ITIMER_REAL timer)) (fun () -> action reap)
+    ignore (Unix.setitimer Unix.ITIMER_REAL timer)) (fun () -> action reap check) in
+  Option.iter (fun signal -> raise (Interrupted signal)) !signalled;
+  value
 
 let run ~timeout ?env ?(stdout=Unix.stdout) ?(stderr=Unix.stderr) program arguments =
-  with_child ~timeout ~stdout ~stderr ?env program arguments (fun reap -> status (reap ()))
+  with_child ~timeout ~stdout ~stderr ?env program arguments (fun reap _ -> status (reap ()))
 
 let observe ~timeout ~stdout ~argv0 program arguments =
   let input, output = Unix.pipe ~cloexec:true () in
   let reader = Unix.in_channel_of_descr input and writer = Unix.out_channel_of_descr output in
   Fun.protect ~finally:(fun () -> close_in_noerr reader; close_out_noerr writer) (fun () ->
-    with_child ~timeout ~stdout ~stderr:Unix.stderr ~observation:(argv0, output) program arguments (fun reap ->
+    with_child ~timeout ~stdout ~stderr:Unix.stderr ~observation:(argv0, output) program arguments (fun reap _ ->
       close_out writer;
       let result = reap () in
       (match input_char reader with _ -> raise (Error "observed executable failed to start") | exception End_of_file -> ());
@@ -67,11 +80,12 @@ let capture ~timeout ~limit ?env program arguments =
   let input, output = Unix.pipe ~cloexec:true () in
   let close fd = try Unix.close fd with Unix.Unix_error _ -> () in
   Fun.protect ~finally:(fun () -> close input; close output) (fun () ->
-    with_child ~timeout ~stdout:output ~stderr:Unix.stderr ?env program arguments (fun reap ->
+    with_child ~timeout ~stdout:output ~stderr:Unix.stderr ?env program arguments (fun reap check ->
       Unix.close output;
       let buffer = Buffer.create 4096 in
       let chunk = Bytes.create 16384 in
       let rec receive () =
+        check ();
         try Unix.read input chunk 0 (Bytes.length chunk) with Unix.Unix_error (Unix.EINTR, _, _) -> receive ()
       in
       let rec read () =
