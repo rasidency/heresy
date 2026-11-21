@@ -60,7 +60,7 @@ let run ?(arguments = []) directory program input =
   let descriptor path = Unix.openfile path [ Unix.O_WRONLY; Unix.O_CREAT; Unix.O_TRUNC; Unix.O_CLOEXEC ] 0o600 in
   let out = descriptor output and err = descriptor errors in
   let code = Fun.protect ~finally:(fun () -> Unix.close out; Unix.close err) (fun () ->
-    Process.run ~timeout:60. ~stdout:out ~stderr:err "sh" ([ "-c"; "input=$1; shift; exec \"$0\" \"$@\" < \"$input\""; program; input ] @ arguments)) in
+    Process.run ~timeout:60. ~stdout:out ~stderr:err "sh" ([ "-c"; "input=$1; shift; cd \"$(dirname \"$0\")\" && exec \"./$(basename \"$0\")\" \"$@\" < \"$input\""; program; input ] @ arguments)) in
   code, lines (read output), read errors
 
 let () =
@@ -85,16 +85,15 @@ let () =
           | first :: _ when String.starts_with ~prefix:"pointer " first -> [ String.sub first 8 (String.length first - 8) ]
           | _ -> [] in
         let model, expected, model_errors = run ~arguments:cursor directory lean input in
-        let observed = if status = 70 && String.starts_with ~prefix:"heresy panic:" errors then observed @ [ "fault" ] else observed in
-        if model <> 0 || (status <> 0 && status <> 70) || expected <> observed then begin
+        if model <> 0 || status <> 0 || expected <> observed then begin
           Printf.eprintf "differential: case %d with seed %d disagrees\n%s\nmodel (status %d):\n%s%s\nruntime (status %d):\n%s%s\n"
             case seed text model (String.concat "\n" expected) model_errors status (String.concat "\n" observed) errors;
           exit 1
         end;
         steps := !steps + List.length expected;
-        if List.mem "fault" expected then incr faults
+        faults := !faults + List.length (List.filter (( = ) "fault") expected)
       done;
-      Printf.printf "differential: %d scripts and %d effects agree, %d ending in a fault\n" cases !steps !faults
+      Printf.printf "differential: %d scripts and %d effects agree, %d of them faults\n" cases !steps !faults
   | _ ->
       prerr_endline "usage: differential LEAN-REPLAY RUNTIME-DIRECTORY HARNESS";
       exit 2
