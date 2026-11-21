@@ -20,13 +20,13 @@ let verification = [
   "proof/Proof.lean"; "proof/Execution.lean"; "proof/Semantics.lean"; "proof/Synchronisation.lean";
   "proof/Memory.lean"; "proof/Patricia.lean"; "proof/Containers.lean"; "proof/Runtime.lean";
   "proof/Ordinary.lean"; "proof/Surface.lean"; "proof/Native.lean"; "proof/Schedule.lean";
-  "proof/Certificate.lean"; "assets/pipeline.svg"; "assets/capability.svg"
+  "proof/Checker.lean"; "proof/Replay.lean"; "proof/Certificate.lean"; "assets/pipeline.svg"; "assets/capability.svg"
 ]
 
 let files = verification @ [
   "Containerfile"; ".dockerignore"; ".gitattributes"; ".gitignore"; "dune-project"; "dune"; "heresy.opam";
   "src/dune"; "src/heresy.ml"; "src/process.ml"; "src/process.mli";
-  "tools/dune"; "tools/embed.ml"; "tools/release.ml"; "test/dune"; "test/verify.ml"; "test/fault.ml";
+  "tools/dune"; "tools/embed.ml"; "tools/release.ml"; "test/dune"; "test/verify.ml"; "test/fault.ml"; "test/differential.ml"; "test/Replay.hs"; "test/scenarios.sh";
   "test/arguments.c"; "test/arithmetic.c"; "test/arrays.c"; "test/atomics.c"; "test/callback.c"; "test/captured.c"; "test/closed.c";
   "test/condition.c"; "test/control.c"; "test/dispatch.c"; "test/effects.c"; "test/exit.c"; "test/extended.c"; "test/extents.c";
   "test/fields.c"; "test/frames.c"; "test/handoff.c"; "test/helpers.c"; "test/lowering.c";
@@ -88,5 +88,5 @@ let () =
   with
   | Failure message | Process.Error message | Sys_error message -> prerr_endline ("release: " ^ message); exit 1
   | Process.Timeout _ -> prerr_endline "release: tool timed out"; exit 124
-  | Process.Interrupted _ -> prerr_endline "release: interrupted"; exit 130
+  | Process.Interrupted signal -> prerr_endline "release: interrupted"; exit (128 + Sys.signal_to_int signal)
   | Unix.Unix_error (error, operation, path) -> prerr_endline ("release: " ^ operation ^ " " ^ path ^ ": " ^ Unix.error_message error); exit 1

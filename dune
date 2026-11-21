@@ -13,6 +13,7 @@
   (proof/Surface.lean as proof/Surface.lean)
   (proof/Native.lean as proof/Native.lean)
   (proof/Schedule.lean as proof/Schedule.lean)
+  (proof/Checker.lean as proof/Checker.lean)
   (proof/Certificate.lean as proof/Certificate.lean)
   (runtime/Heap.hs as runtime/Heap.hs)
   (assets/pipeline.svg as assets/pipeline.svg)
@@ -23,3 +24,11 @@
  (deps (source_tree examples) (source_tree test/linkage) test/closed.c test/frames.c test/helpers.c test/recursive.c test/slots.c test/lowering.c test/values.c test/effects.c test/order.c)
  (action (run %{exe:test/verify.exe} %{exe:src/heresy.exe} %{exe:test/fault.exe})))
 
+
+(rule
+ (alias integration)
+ (deps (universe) test/scenarios.sh test/Replay.hs runtime/Heap.hs (source_tree examples) (source_tree test))
+ (action
+  (progn
+   (run sh test/scenarios.sh %{exe:src/heresy.exe} %{env:HERESY_CERTIFICATE=../../.lake/build/bin/certificate})
+   (run %{exe:test/differential.exe} %{env:HERESY_REPLAY=../../.lake/build/bin/replay} runtime test/Replay.hs))))

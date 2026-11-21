@@ -1,6 +1,6 @@
 name = "heresy"
 version = "0.2.0"
-defaultTargets = ["Proof", "Execution", "Semantics", "Synchronisation", "Schedule", "Memory", "Patricia", "Containers", "Runtime", "Ordinary", "Surface", "certificate"]
+defaultTargets = ["Proof", "Execution", "Semantics", "Synchronisation", "Schedule", "Memory", "Patricia", "Containers", "Runtime", "Ordinary", "Surface", "certificate", "replay"]
 
 [[lean_lib]]
 name = "Proof"
@@ -50,7 +50,22 @@ srcDir = "proof"
 name = "Schedule"
 srcDir = "proof"
 
+[[lean_lib]]
+name = "Checker"
+srcDir = "proof"
+needs = ["runtime"]
+
+[[input_file]]
+name = "runtime"
+path = "runtime/Heap.hs"
+text = true
+
 [[lean_exe]]
 name = "certificate"
 root = "Certificate"
+srcDir = "proof"
+
+[[lean_exe]]
+name = "replay"
+root = "Replay"
 srcDir = "proof"

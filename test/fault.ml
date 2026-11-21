@@ -4,4 +4,5 @@ let () =
   | Some "timeout" -> Unix.sleep 10
   | Some "overflow" -> while true do print_string (String.make 16384 'x'); flush stdout done
   | Some "ordinary" -> print_endline "clang version 21.1.0"
+  | Some "signal" -> Unix.kill (Unix.getpid ()) Sys.sigterm; Unix.sleep 10
   | _ -> exit 42

@@ -380,6 +380,11 @@ let () =
     check "timed-out builds preserve existing outputs" (code = 124 && contains errors "timed out" && read hs = "source sentinel" && read exe = "binary sentinel");
     let oversized = try ignore (Process.capture ~timeout:2. ~limit:1024 ~env:(with_environment "HERESY_FAULT" "overflow") fault []); false with Process.Error _ -> true in
     check "tool output limits terminate the child" oversized;
+    let signalled = with_environment "HERESY_FAULT" "signal" in
+    check "signalled tools report the shell status" (Process.run ~timeout:2. ~env:signalled fault [] = 143);
+    let named = try ignore (Process.capture ~timeout:2. ~limit:1024 ~env:signalled fault []); false
+      with Process.Error message -> contains message "terminated by SIGTERM" in
+    check "signalled captures name the signal" named;
     let input = "build/collision.c" in write input "int main(void){return 0;}";
     let code, _, _ = run compiler [input; "-o"; input] in
     check "source collisions preserve the source" (code <> 0 && read input = "int main(void){return 0;}");
