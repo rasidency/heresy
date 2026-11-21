@@ -20,7 +20,7 @@ let verification = [
   "proof/Proof.lean"; "proof/Execution.lean"; "proof/Semantics.lean"; "proof/Synchronisation.lean";
   "proof/Memory.lean"; "proof/Patricia.lean"; "proof/Containers.lean"; "proof/Runtime.lean";
   "proof/Ordinary.lean"; "proof/Surface.lean"; "proof/Native.lean"; "proof/Schedule.lean";
-  "proof/Certificate.lean"; "assets/pipeline.svg"; "assets/capability.svg"
+  "proof/Checker.lean"; "proof/Certificate.lean"; "assets/pipeline.svg"; "assets/capability.svg"
 ]
 
 let files = verification @ [

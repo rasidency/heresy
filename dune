@@ -13,6 +13,7 @@
   (proof/Surface.lean as proof/Surface.lean)
   (proof/Native.lean as proof/Native.lean)
   (proof/Schedule.lean as proof/Schedule.lean)
+  (proof/Checker.lean as proof/Checker.lean)
   (proof/Certificate.lean as proof/Certificate.lean)
   (runtime/Heap.hs as runtime/Heap.hs)
   (assets/pipeline.svg as assets/pipeline.svg)

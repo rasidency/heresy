@@ -50,6 +50,11 @@ srcDir = "proof"
 name = "Schedule"
 srcDir = "proof"
 
+[[lean_lib]]
+name = "Checker"
+srcDir = "proof"
+needs = ["runtime"]
+
 [[input_file]]
 name = "runtime"
 path = "runtime/Heap.hs"
@@ -59,4 +64,3 @@ text = true
 name = "certificate"
 root = "Certificate"
 srcDir = "proof"
-needs = ["runtime"]
