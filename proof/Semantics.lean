@@ -527,6 +527,16 @@ theorem stdout_prefix_correct (terminal : Bool) (initial : StdoutBuffer) (writes
     obtain ⟨same, next_valid⟩ := stdout_write_correct terminal initial bytes valid
     simp only [List.foldl_cons, ih _ next_valid, same]
 
+theorem stdout_chunks_correct (terminal : Bool) (initial : StdoutBuffer) (writes : List (List UInt8))
+    (valid : initial.size = initial.snapshot.pending.length) :
+    let next := writes.foldl (stdout_buffer_write terminal) initial
+    next.snapshot = writes.foldl (stdout_write terminal) initial.snapshot ∧ next.size = next.snapshot.pending.length := by
+  induction writes generalizing initial with
+  | nil => exact ⟨rfl, valid⟩
+  | cons bytes rest ih =>
+    obtain ⟨same, fitted⟩ := stdout_write_correct terminal initial bytes valid
+    simpa only [List.foldl_cons, same] using ih _ fitted
+
 theorem stdout_write_preserves_bytes (terminal : Bool) (state : StdoutState) (bytes : List UInt8) :
     let next := stdout_write terminal state bytes
     next.visible ++ next.pending = state.visible ++ state.pending ++ bytes := by

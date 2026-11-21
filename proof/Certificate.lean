@@ -1,43 +1,20 @@
 import Lean.Data.Json
+import Lean.Elab.Command
+import Lean.Util.CollectAxioms
 import Semantics
+import Containers
 import Synchronisation
 import Runtime
 import Ordinary
 import Surface
+import Native
+import Schedule
 
 set_option warningAsError true
 
 open Lean
 
 namespace Heresy
-
-def operator_text : Operator → String
-  | .add => "+"
-  | .sub => "-"
-  | .mul => "*"
-  | .band => ".&."
-  | .bor => ".|."
-  | .bxor => "`xor`"
-
-def render_expression (render_slot : Nat → String) (strict : Bool) : Target → String
-  | .constant value => toString value
-  | .parameter index => render_slot index
-  | .binary operator left right =>
-    let left := "(" ++ render_expression render_slot strict left ++ ")"
-    let right := "(" ++ render_expression render_slot strict right ++ ")"
-    let operator := operator_text operator
-    if strict then "strictOperands (\\left right -> left " ++ operator ++ " right) " ++ left ++ " " ++ right
-    else left ++ " " ++ operator ++ " " ++ right
-  | .wrap width expression =>
-    "normalise " ++ toString width ++ " False (" ++ render_expression render_slot strict expression ++ ")"
-  | .conditional condition yes no =>
-    "if (" ++ render_expression render_slot strict condition ++ ") == 0 then (" ++ render_expression render_slot strict no ++
-      ") else (" ++ render_expression render_slot strict yes ++ ")"
-  | .invoke slot arguments =>
-    "(" ++ String.intercalate " " (("h_" ++ toString slot) ::
-      arguments.map (fun value => "(" ++ render_expression render_slot strict value ++ ")")) ++ ")"
-
-def render_target := render_expression (fun index => "x" ++ toString index) false
 
 def validates_kernel (expression : Source) (body : String) : Bool :=
   body == render_target (lower expression)
@@ -58,10 +35,16 @@ private def field_text (node : Json) (key : String) : String :=
 private def child_nodes (node : Json) : List Json :=
   ((json_field node "inner").getArr?.toOption.getD #[]).toList
 
-private def type_spelling (node : Json) : String :=
-  let type := json_field node "type"
+private def qualified_spelling (type : Json) : String :=
   let canonical := field_text type "desugaredQualType"
-  if canonical.isEmpty then field_text type "qualType" else canonical
+  let written := field_text type "qualType"
+  let nestedTag := ["struct", "union"].any fun tag =>
+    canonical.startsWith (tag ++ " ") && (canonical.splitOn "::(unnamed at ").length == 2 &&
+      written.startsWith (tag ++ " @") && (written.drop (tag.length + 2)).toNat?.isSome
+  if canonical.isEmpty || nestedTag then written else canonical
+
+private def type_spelling (node : Json) : String :=
+  qualified_spelling (json_field node "type")
 
 private def require (candidate : Option α) (message : String) : Except String α :=
   candidate.elim (.error message) .ok
@@ -131,15 +114,7 @@ private def hex_binding (stem name : String) : String :=
 
 private def kernel_symbol := hex_binding "k"
 
-private def haskell_quote (name : String) : String :=
-  "\"" ++ name.toUTF8.toList.foldl (fun result byte =>
-    result ++ match byte.toNat with
-      | 9 => "\\t"
-      | 10 => "\\n"
-      | 13 => "\\r"
-      | 34 => "\\\""
-      | 92 => "\\\\"
-      | n => if 32 ≤ n && n ≤ 126 then String.singleton (Char.ofNat n) else "\\" ++ toString n ++ "\\&") "" ++ "\""
+private def haskell_quote (name : String) : String := Ordinary.quote_bytes name.toUTF8.toList
 
 private def source_declaration (node : Json) : Bool :=
   let origin := json_field node "loc"
@@ -251,7 +226,7 @@ private def render_link_line (entries : List (String × String)) (count : Nat) (
 private def validates_link_runtime (generated : String) : Bool :=
   let gate := "  gate <- if parallel then Just <$> newMVar () else pure Nothing"
   let setup := String.intercalate "\n" [
-    "      initial = World counter [] S.empty S.empty (S.fromList entries) codes \"startup\" 0 [] False False table (terminal, output) gate threads owner nullPointer initThread",
+    "      initial = World counter [] S.empty literalTable (S.fromList entries) codes \"startup\" 0 [] False False table (terminal, output) gate threads owner nullPointer initThread",
     "      action = do",
     "        initialiser",
     "        when parallel $ do",
@@ -1193,8 +1168,7 @@ private def single_return (block : Json) : Bool :=
   | [statement] => field_text statement "kind" == "ReturnStmt" && (child_nodes statement).length == 1
   | _ => false
 
-def closed_source (frontend : String) : Except String ClosedProgram := do
-  let tree ← Json.parse frontend
+private def closed_tree (budget : Nat) (tree : Json) : Except String ClosedProgram := do
   unless field_text tree "kind" == "TranslationUnitDecl" do
     throw "expected a translation unit"
   let declarations := (child_nodes tree).filter fun node =>
@@ -1210,7 +1184,7 @@ def closed_source (frontend : String) : Except String ClosedProgram := do
   let [body] := child_nodes main | throw "invalid closed main definition"
   unless field_text body "kind" == "CompoundStmt" do
     throw "invalid closed main body"
-  let (ordered, recursive) ← order_helpers (definitions.filter (fun node => field_text node "name" != "main")) frontend.length
+  let (ordered, recursive) ← order_helpers (definitions.filter (fun node => field_text node "name" != "main")) budget
   let headers ← ordered.mapM fun definition => do
     let name := field_text definition "name"
     let (inputs, blocks) := (child_nodes definition).partition (fun node => field_text node "kind" == "ParmVarDecl")
@@ -1233,16 +1207,19 @@ def closed_source (frontend : String) : Except String ClosedProgram := do
   for ((name, identifiers, block), slot) in headers.zipIdx do
     let scope := if framed then available else linked
     let arity := identifiers.length
-    let (code, _) ← read_command (fun callee => List.lookup callee scope) false frontend.length identifiers.zipIdx arity block
+    let (code, _) ← read_command (fun callee => List.lookup callee scope) false budget identifiers.zipIdx arity block
     helpers := ⟨arity, code⟩ :: helpers
     linked := (name, (slot, arity)) :: linked
-  let (entry, _) ← read_command (fun name => List.lookup name linked) true frontend.length [] 0 body
+  let (entry, _) ← read_command (fun name => List.lookup name linked) true budget [] 0 body
   if framed then pure (.framed helpers.reverse entry)
   else
     let direct ← helpers.reverse.mapM fun helper => match helper.body with
       | .result value => pure ⟨helper.arity, value⟩
       | _ => throw "closed helper requires one return statement"
     pure (.direct direct entry)
+
+def closed_source (frontend : String) : Except String ClosedProgram := do
+  closed_tree frontend.length (← Json.parse frontend)
 
 private def exit_definition : List String := ["",
   "normalise :: Int -> Bool -> Integer -> Integer",
@@ -1505,6 +1482,31 @@ theorem closed_text_source_observations (input generated : String) (body : Sourc
     have same := Except.ok.inj (parsed.symm.trans otherParsed)
     subst otherBody
     exact (lowers status).mpr source
+
+def compile_closed_text (input : String) : Except String String := do
+  let body ← Surface.parse input
+  return render_program [] (.result (lower body))
+
+theorem compile_closed_text_sound (input generated : String)
+    (compiled : compile_closed_text input = .ok generated) :
+    ∃ body, validate_closed_text input generated = .ok body ∧
+      ∀ status, (ClosedProgram.direct [] (.result body)).haskell_exit status ↔ closed_text_source_exit input status := by
+  cases parsed : Surface.parse input with
+  | error reason => simp [compile_closed_text, parsed, bind, Except.bind] at compiled
+  | ok body =>
+    have rendered : render_program [] (.result (lower body)) = generated := by
+      simpa [compile_closed_text, parsed, bind, Except.bind, pure, Except.pure] using compiled
+    have accepted : validate_closed_text input generated = .ok body := by
+      simp [validate_closed_text, parsed, rendered, bind, Except.bind, pure, Except.pure]
+    exact ⟨body, accepted, closed_text_source_observations input generated body accepted⟩
+
+theorem closed_native_haskell_agree (input generated : String) (body : Source) (file : List UInt8)
+    (checked : validate_closed_text input generated = .ok body)
+    (verified : Native.verify input file = .ok ()) (registers : Native.Registers) (status : Int) :
+    (Int.ofNat <$> Native.execute file registers) = some status ↔
+      (ClosedProgram.direct [] (.result body)).haskell_exit status := by
+  exact (Native.verify_correct _ _ verified registers status).trans
+    (closed_text_source_observations input generated body checked status).symm
 
 theorem closed_text_executable_exit (input generated : String) (body : Source) (artifact : Executable)
     (ghc : String → Except String Executable) (executable_exit : Executable → Int → Prop)
@@ -1788,19 +1790,44 @@ private def validates_pointer_memory (generated : String) : Bool :=
     "      caps = if ty == PointerType then M.insert displacement converted (shadow object) else shadow object"]
   [width, checked_load, load, checked_store, store].all (fun equation => (generated.splitOn ("\n" ++ equation ++ "\n")).length == 2)
 
+private structure OrdinaryShape where
+  element : String
+  width : Nat
+  dimensions : List String
+
 private inductive OrdinaryStorage where
   | scalar (ty : Ordinary.TypeCode)
   | array (element : String) (ty : Ordinary.TypeCode) (count : Nat)
   | record (layout : Ordinary.RecordLayout)
+  | dynamicArray (shape : OrdinaryShape)
+  | vaList
 
 private def OrdinaryStorage.width : OrdinaryStorage → Nat
   | .scalar ty => ty.width
   | .array _ ty count => count * ty.width
   | .record layout => layout.width
+  | .dynamicArray _ => 0
+  | .vaList => 24
 
-private def OrdinaryStorage.scalar_type : OrdinaryStorage → Option Ordinary.TypeCode
+private def OrdinaryStorage.frame_width : OrdinaryStorage → Option Nat
+  | .dynamicArray _ => none
+  | storage => some storage.width
+
+private def ordinary_record_code (layout : Ordinary.RecordLayout) : Option Ordinary.TypeCode :=
+  match layout.width with
+  | 0 => none
+  | last + 1 => some (.aggregate last layout.alignment)
+
+private def OrdinaryStorage.value_type : OrdinaryStorage → Option Ordinary.TypeCode
   | .scalar ty => some ty
+  | .record layout => ordinary_record_code layout
   | _ => none
+
+private structure OrdinaryPointerShape where
+  probe : String
+  shape : OrdinaryShape
+  skip : Nat
+  bounds : Option (List (Sum Nat Json))
 
 private structure OrdinaryLocal where
   ident : String
@@ -1809,17 +1836,20 @@ private structure OrdinaryLocal where
   storage : OrdinaryStorage
   kind : String
   slot : Nat
+  pointerShape : Option OrdinaryPointerShape := none
 
 private structure OrdinarySignature where
   name : String
   symbol : String
   spelling : String
   result : String
-  ty : Ordinary.TypeCode
+  ty : Option Ordinary.TypeCode
   parameters : List OrdinaryLocal
   declarations : List String
   entry : Json
   records : List Ordinary.RecordLayout
+  variadic : Bool := false
+  functions : List String := []
 
 private structure OrdinaryUnit where
   namespaceName : String
@@ -1829,6 +1859,15 @@ private structure OrdinaryUnit where
   objects : List Json
   records : List Ordinary.RecordLayout
   labels : List (String × String)
+  usesStreams : Bool
+  spawns : Bool
+  statics : List (String × Json) := []
+
+private structure OrdinaryCallback where
+  alias : String
+  reference : String
+  result : String
+  deriving BEq
 
 private structure OrdinaryObject where
   name : String
@@ -1838,59 +1877,234 @@ private structure OrdinaryObject where
   definition : Json
   identities : List String
   recordTarget : Option Ordinary.RecordLayout
+  records : List Ordinary.RecordLayout
+  readOnly : Bool := false
+  callback : Option OrdinaryCallback := none
+  owner : Option String := none
 
-private def ordinary_type : String → Option Ordinary.TypeCode
-  | "unsigned char **" | "unsigned char *" | "char **" | "char *" | "signed char **" | "signed char *"
-  | "int *" | "unsigned long *" | "void *" | "const void *" => some .pointer
-  | "unsigned char" => some .byte
-  | "char" | "signed char" => some .signedByte
+private def array_pointer_parts (spelling : String) : Option (String × String) := do
+  let [element, suffix] := spelling.splitOn " (*)" | none
+  guard (suffix.startsWith "[" && suffix.endsWith "]")
+  return (element, suffix)
+
+private def array_slot_pointee (spelling : String) : Option String := do
+  let [base, suffix] := spelling.splitOn " (" | none
+  let [stars, dimensions] := suffix.splitOn ")" | none
+  guard (stars.length ≥ 2 && stars.toList.all (· == '*') && dimensions.startsWith "[" && dimensions.endsWith "]")
+  return base ++ " (" ++ stars.drop 1 ++ ")" ++ dimensions
+
+private def ordinary_integer_type : String → Option Ordinary.TypeCode
+  | "const unsigned char" | "unsigned char" => some .byte
+  | "const signed char" | "const char" | "char" | "signed char" => some .signedByte
   | "int" => some .integer
   | "unsigned int" => some .unsignedInt
-  | "unsigned long" => some .size
-  | spelling =>
-    if (spelling.startsWith "struct " || spelling.startsWith "union ") && spelling.endsWith " *" then some .pointer else none
+  | "short" | "short int" | "signed short" => some .short
+  | "unsigned short" | "unsigned short int" => some .unsignedShort
+  | "long" | "long int" | "long long" | "long long int" => some .long
+  | "unsigned long" | "unsigned long int" | "unsigned long long" | "unsigned long long int" => some .size
+  | "__int128" => some .wide
+  | "unsigned __int128" => some .unsignedWide
+  | _ => none
 
-private def ordinary_pointee : String → String
-  | "unsigned char **" => "unsigned char *"
-  | "unsigned char *" => "unsigned char"
-  | "char **" => "char *"
-  | "char *" => "char"
-  | "signed char **" => "signed char *"
-  | "signed char *" => "signed char"
-  | "int *" => "int"
-  | "unsigned long *" => "unsigned long"
-  | spelling =>
-    if (spelling.startsWith "struct " || spelling.startsWith "union ") && spelling.endsWith " *" then
-      spelling.take (spelling.length - 2) else ""
+private def atomic_underlying (spelling : String) : Option String := do
+  guard (spelling.startsWith "_Atomic(" && spelling.endsWith ")")
+  return (spelling.drop 8).take (spelling.length - 9)
+
+private def simple_data_pointee (spelling : String) : Option String := do
+  if spelling.endsWith " *" then
+    let base := spelling.take (spelling.length - 2)
+    if (atomic_underlying base).isSome then return base
+  let [base, stars] := spelling.splitOn " *" | none
+  guard (stars.toList.all (· == '*'))
+  let plain := if base.startsWith "const " then base.drop 6 else base
+  guard (["void", "float", "double", "long double"].contains plain || (ordinary_integer_type plain).isSome ||
+    plain.startsWith "struct " || plain.startsWith "union ")
+  return if stars.isEmpty then base else spelling.take (spelling.length - 1)
+
+private def data_pointee (spelling : String) : Option String := do
+  if spelling.endsWith "*const *" then
+    let base := (spelling.take (spelling.length - 2))
+    guard ((simple_data_pointee (base.take (base.length - 5))).isSome)
+    return base
+  if spelling.endsWith "*const" then return ← simple_data_pointee (spelling.take (spelling.length - 5))
+  simple_data_pointee spelling
+
+private def function_prototype (spelling : String) : Option (String × List String) := do
+  let [result, tail] := (spelling.replace "(*const)" "(*)").splitOn "(*)(" | none
+  guard (tail.endsWith ")")
+  let result := result.trim
+  let text := tail.take (tail.length - 1)
+  let args := if text == "void" then [] else text.splitOn ", "
+  let scalar := fun name => (ordinary_integer_type name).isSome || (data_pointee name).isSome
+  guard ((result == "void" || scalar result) && args.all scalar)
+  return (result, args)
+
+private def function_slot_pointee (spelling : String) : Option String := do
+  if let [head, args] := spelling.splitOn "(*const *)(" then
+    if (function_prototype (head ++ "(*)(" ++ args)).isSome then return head ++ "(*const)(" ++ args
+  let [result, stars, arguments] := spelling.splitOn "(" | none
+  guard (stars.endsWith ")" && stars.length ≥ 3 && (stars.take (stars.length - 1)).toList.all (· == '*'))
+  guard ((function_prototype (result ++ "(*)(" ++ arguments)).isSome)
+  return result ++ "(" ++ stars.drop 1 ++ "(" ++ arguments
+
+private def callback_array_pointee (spelling : String) : Option String := do
+  let [head, tail] := spelling.splitOn "(*(*)" | none
+  let [bounds, args] := tail.splitOn ")(" | none
+  guard (bounds.startsWith "[" && bounds.endsWith "]" && (function_prototype (head ++ "(*)(" ++ args)).isSome)
+  return head ++ "(*" ++ bounds ++ ")(" ++ args
+
+private def ordinary_type (spelling : String) : Option Ordinary.TypeCode :=
+  if spelling == "_Complex float" then some .complex32
+  else if spelling == "_Complex double" then some .complex64
+  else if spelling == "_Complex long double" then some .complex80
+  else if spelling == "float" then some .binary32
+  else if spelling == "double" then some .binary64
+  else if spelling == "long double" then some .extended
+  else if (data_pointee spelling).isSome || (array_pointer_parts spelling).isSome || (callback_array_pointee spelling).isSome ||
+      (function_prototype spelling).isSome || (array_slot_pointee spelling).isSome || (function_slot_pointee spelling).isSome then some .pointer
+  else ordinary_integer_type spelling
+
+private def ordinary_pointee (spelling : String) : String :=
+  match array_pointer_parts spelling with
+  | some (element, dimensions) => element ++ dimensions
+  | none => ((data_pointee spelling) <|> callback_array_pointee spelling <|> array_slot_pointee spelling <|> function_slot_pointee spelling).getD ""
+
+private def fixed_dimensions (spelling : String) : Option (String × List Nat) := do
+  let base :: bounds := spelling.splitOn "[" | none
+  guard (!bounds.isEmpty)
+  let sizes ← bounds.mapM fun bound => do
+    guard (bound.endsWith "]")
+    let size ← (bound.take (bound.length - 1)).toNat?
+    guard (0 < size)
+    return size
+  return (base.trim, sizes)
+
+private def callback_array (spelling : String) : Option (String × String × List Nat × String) := do
+  let [head, suffix] := spelling.splitOn "(*" | none
+  let [shape, args] := suffix.splitOn ")(" | none
+  let (qualifier, sizes) ← fixed_dimensions shape
+  guard ((qualifier.isEmpty || qualifier == "const") && (function_prototype (head ++ "(*)(" ++ args)).isSome)
+  return (head, qualifier, sizes, args)
 
 private def ordinary_array (spelling : String) : Option (String × Nat) := do
-  let [element, bound] := spelling.splitOn "[" | none
-  guard (bound.endsWith "]")
-  let extent ← (bound.take (bound.length - 1)).toNat?
-  guard (extent > 0)
-  return (element.trim, extent)
+  if let some (head, qualifier, count :: inner, args) := callback_array spelling then
+    let bounds := String.join (inner.map (fun size => "[" ++ toString size ++ "]"))
+    return (head ++ "(*" ++ qualifier ++ bounds ++ ")(" ++ args, count)
+  let (base, count :: inner) ← fixed_dimensions spelling | none
+  return (base ++ String.join (inner.map (fun size => "[" ++ toString size ++ "]")), count)
+
+private def ordinary_value_type (records : List Ordinary.RecordLayout) (spelling : String) : Option Ordinary.TypeCode :=
+  ordinary_type spelling <|> ((records.find? (·.spelling == spelling)).bind ordinary_record_code)
+
+private def record_has_pointer (records : List Ordinary.RecordLayout) : Nat → String → Bool
+  | 0, _ => false
+  | depth + 1, spelling =>
+    if ordinary_type spelling == some .pointer then true else
+    let base := (fixed_dimensions spelling).map Prod.fst |>.getD spelling
+    ordinary_type base == some .pointer || (records.find? (·.spelling == base)).any fun record =>
+      record.fields.any (fun field => record_has_pointer records depth field.spec.spelling)
+
+private def atomic_record (records : List Ordinary.RecordLayout) (spelling : String) (promote : Bool) :
+    Option Ordinary.TypeCode := do
+  let record ← records.find? (·.spelling == spelling)
+  guard (0 < record.width)
+  let rounded := ([1, 2, 4, 8, 16].find? (record.width ≤ ·)).getD record.width
+  let width := if promote then rounded else record.width
+  let mode := if width > 16 || (!promote && (rounded != width || record.alignment < width)) then Ordinary.AtomicMode.copy
+    else if width == 8 && record.width == 8 && record_has_pointer records (records.length + 1) spelling then .capability
+    else .bytes
+  return .atomicRecord (record.width - 1) record.alignment (width - 1) mode
+
+private def ordinary_element (records : List Ordinary.RecordLayout) (spelling : String) : Option Ordinary.TypeCode := do
+  let spelling := if spelling.startsWith "volatile " then spelling.drop 9 else spelling
+  let spelling := if spelling.endsWith "*volatile" then spelling.dropRight 8 else spelling.replace "*volatile[" "*["
+  if let some ty := ordinary_value_type records spelling then return ty
+  if let some (_, _, bounds, _) := callback_array spelling then
+    let width := bounds.foldl (· * ·) 8
+    guard (0 < width && width ≤ 9223372036854775800)
+    return .aggregate (width - 1) 8
+  let (base, bounds) ← fixed_dimensions spelling
+  let ty ← ordinary_value_type records base
+  let width := bounds.foldl (· * ·) ty.width
+  guard (0 < width && width ≤ 9223372036854775800)
+  return .aggregate (width - 1) ty.alignment
 
 private def ordinary_ident (node : Json) : String :=
   field_text (json_field node "referencedDecl") "id"
 
 private def ordinary_name (name : String) : Bool :=
-  !name.isEmpty && name.toList.all (fun c => c.toNat < 128 && (c.isAlphanum || c == '_'))
+  !name.isEmpty && name.toList.all (fun c => c.isAlphanum || c == '_' || c.toNat ≥ 128)
 
-private def ordinary_record (node : Json) : Option Ordinary.RecordLayout := do
+private def ordinary_packed_record (spelling : String) (node : Json) : Option Ordinary.RecordLayout := do
+  let [size, alignment, dump] := (← (json_field node "heresyLayout").getArr?.toOption).toList | none
+  let width ← size.getNat?.toOption
+  guard (alignment.getNat?.toOption == some 1 && width > 0)
+  let children := child_nodes node
+  let [packedAttr] := children.filter (fun part => field_text part "kind" == "PackedAttr") | none
+  guard ((child_nodes packedAttr).isEmpty)
+  let members := children.filter (fun part => field_text part "kind" != "PackedAttr")
+  let entries := (← dump.getArr?.toOption).toList
+  guard (entries.length == members.length)
+  let mut fields : List Ordinary.Field := []
+  let mut cursor := 0
+  for (member, entry) in members.zip entries do
+    let [offset, count] := (← entry.getArr?.toOption).toList | none
+    let offset ← offset.getNat?.toOption
+    let name := field_text member "name"
+    let id := field_text member "id"
+    let ty ← ordinary_integer_type (type_spelling member)
+    guard (field_text member "kind" == "FieldDecl" && !id.isEmpty)
+    let mut start := cursor
+    let mut bitWidth := none
+    if json_field member "isBitfield" == .bool true then
+      let [constant] := child_nodes member | none
+      guard (field_text constant "kind" == "ConstantExpr" && (ordinary_integer_type (type_spelling constant)).isSome)
+      let bits ← (field_text constant "value").toNat?
+      guard (count.getNat?.toOption == some bits && bits ≤ 8 * ty.width)
+      if bits == 0 then
+        guard (name.isEmpty)
+        start := (aligned_slot cursor 0 (8 * ty.alignment)).1
+      else
+        bitWidth := some (bits - 1)
+      cursor := start + bits
+    else
+      guard (ordinary_name name && count == .null && (child_nodes member).isEmpty)
+      start := (aligned_slot cursor 0 8).1
+      cursor := start + 8 * ty.width
+    guard (offset == start)
+    if !name.isEmpty then
+      guard (ordinary_name name)
+      fields := ⟨⟨id, name, type_spelling member, ty, bitWidth⟩, start / 8, start % 8⟩ :: fields
+  guard ((cursor + 7) / 8 == width && decide ((fields.map (·.spec.identity)).Nodup) &&
+    decide ((fields.map (·.spec.name)).Nodup))
+  Ordinary.checked_packed_layout spelling fields.reverse width
+
+private def ordinary_record (records : List Ordinary.RecordLayout) (node : Json) : Option Ordinary.RecordLayout := do
   let name := field_text node "name"
   let tag := field_text node "tagUsed"
   let named := ordinary_name name || (name.startsWith "@" && (name.drop 1).toNat?.isSome)
   guard (field_text node "kind" == "RecordDecl" && ["struct", "union"].contains tag &&
     json_field node "completeDefinition" == .bool true && named && !(child_nodes node).isEmpty)
-  let fields ← (child_nodes node).mapM fun member => do
+  if (child_nodes node).any (fun part => field_text part "kind" == "PackedAttr") then
+    guard (tag == "struct")
+    let layout ← ordinary_packed_record (tag ++ " " ++ name) node
+    let original := field_text node "heresyRecordTag"
+    return { layout with original := if ordinary_name original then tag ++ " " ++ original else "" }
+  let members := (child_nodes node).filter (fun part => field_text part "kind" != "RecordDecl")
+  guard (members.all (fun member => field_text member "kind" == "FieldDecl" ||
+    (field_text member "kind" == "IndirectFieldDecl" && json_field member "isImplicit" == .bool true &&
+      ordinary_name (field_text member "name") && (child_nodes member).isEmpty)))
+  let fields ← (members.filter (fun part => field_text part "kind" == "FieldDecl")).mapM fun member => do
     let identity := field_text member "id"
     let name := field_text member "name"
     let spelling := type_spelling member
-    let ty ← ordinary_type spelling
-    guard (field_text member "kind" == "FieldDecl" && ordinary_name name && !identity.isEmpty)
+    let ty ← ordinary_element records spelling
+    let anonymous := name.isEmpty && json_field member "isImplicit" == .bool true &&
+      records.any (·.spelling == spelling)
+    guard ((ordinary_name name || anonymous) && !identity.isEmpty)
     let bits ← if json_field member "isBitfield" == .bool true then do
       let [constant] := child_nodes member | none
-      guard (field_text constant "kind" == "ConstantExpr" && ty != .pointer)
+      guard (field_text constant "kind" == "ConstantExpr" && (ordinary_integer_type spelling).isSome)
       let width ← (field_text constant "value").toNat?
       guard (0 < width && width ≤ 8 * ty.width)
       pure (some (width - 1))
@@ -1898,30 +2112,112 @@ private def ordinary_record (node : Json) : Option Ordinary.RecordLayout := do
       guard ((child_nodes member).isEmpty)
       pure none
     pure (⟨identity, name, spelling, ty, bits⟩ : Ordinary.FieldSpec)
-  guard (decide ((fields.map (·.identity)).Nodup) && decide ((fields.map (·.name)).Nodup))
+  guard (!fields.isEmpty && decide ((fields.map (·.identity)).Nodup) &&
+    decide (((fields.map (·.name)).filter (!·.isEmpty)).Nodup))
   let spelling := tag ++ " " ++ name
-  return if tag == "union" then Ordinary.union_layout spelling fields
+  let layout := if tag == "union" then Ordinary.union_layout spelling fields
     else if fields.any (·.bits.isSome) then Ordinary.bit_record_layout spelling fields
     else Ordinary.record_layout spelling fields
+  let original := field_text node "heresyRecordTag"
+  return { layout with original := if ordinary_name original then tag ++ " " ++ original else "" }
+
+private def collect_records : Nat → List Ordinary.RecordLayout → Json → Except String (List Ordinary.RecordLayout)
+  | 0, _, _ => .error "ordinary record nesting exceeds the frontend budget"
+  | depth + 1, records, node => do
+    let nested := (child_nodes node).filter fun child => field_text child "kind" == "RecordDecl"
+    let records ← nested.foldlM (collect_records depth) records
+    return match ordinary_record records node with
+      | some layout => layout :: records
+      | none => records
+
+private def inline_record (records : List Ordinary.RecordLayout) (uses : List Json) (entry : Json) :
+    Option Ordinary.RecordLayout := do
+  let [key, size, alignment, dump] := (← entry.getArr?.toOption).toList | none
+  let spelling ← key.getStr?.toOption
+  let [tag, index] := spelling.splitOn " @layout" | none
+  guard (["struct", "union"].contains tag && index.toNat?.isSome)
+  let width ← size.getNat?.toOption
+  let align ← alignment.getNat?.toOption
+  let union := tag == "union"
+  let mut cursor := 0
+  let mut natural := 1
+  let mut fields : List Ordinary.Field := []
+  for (item, i) in (← dump.getArr?.toOption).toList.zipIdx do
+    let [label, type, position, count] := (← item.getArr?.toOption).toList | none
+    let name ← label.getStr?.toOption
+    let member ← type.getStr?.toOption
+    let ty ← ordinary_element records member
+    let offset ← position.getNat?.toOption
+    let bits ← if count == .null then pure none else some <$> count.getNat?.toOption
+    let unit := 8 * ty.alignment
+    let start := if union then 0 else match bits with
+      | some (n + 1) => if cursor % unit + n + 1 ≤ 8 * ty.width then cursor else (aligned_slot cursor 0 unit).1
+      | _ => (aligned_slot cursor 0 unit).1
+    guard (offset == start)
+    let span := bits.getD (8 * ty.width)
+    cursor := max cursor (start + span)
+    if bits.isSome then
+      guard ((ordinary_integer_type member).isSome && span ≤ 8 * ty.width && (span > 0 || name.isEmpty))
+    if !(name.isEmpty && bits.isSome) then
+      guard (ordinary_name name || (name.isEmpty && records.any (·.spelling == member)))
+      natural := max natural ty.alignment
+      let referenced := uses.filterMap fun node => Id.run do
+        if field_text node "kind" == "InitListExpr" && type_spelling node == spelling then
+          let field := json_field node "field"
+          if field_text field "name" == name && type_spelling field == member then return some (field_text field "id")
+        let [base] := child_nodes node | return none
+        let baseType := if json_field node "isArrow" == .bool true then ordinary_pointee (type_spelling base) else type_spelling base
+        if field_text node "kind" == "MemberExpr" && baseType == spelling && field_text node "name" == name &&
+            type_spelling node == member then return some (field_text node "referencedMemberDecl")
+        return none
+      let identities := referenced.eraseDups
+      guard (identities.length ≤ 1)
+      let identity := identities.head?.getD (spelling ++ "#" ++ toString i)
+      guard (!identity.isEmpty)
+      fields := ⟨⟨identity, name, member, ty, bits.map (· - 1)⟩, start / 8, start % 8⟩ :: fields
+  guard (natural == align && width > 0 && (aligned_slot ((cursor + 7) / 8) 0 align).1 == width &&
+    fields.all (fun field => field.offset + field.access.width ≤ width) &&
+    decide ((fields.map (·.spec.identity)).Nodup) && decide (((fields.map (·.spec.name)).filter (!·.isEmpty)).Nodup))
+  return ⟨spelling, fields.reverse, width, align, union, ""⟩
 
 private def ordinary_storage (records : List Ordinary.RecordLayout) (spelling : String) : Option OrdinaryStorage :=
-  if let some (element, count) := ordinary_array spelling then do
-    return .array element (← ordinary_type element) count
+  if let some inner := atomic_underlying spelling then do
+    let ty ← ordinary_integer_type inner <|> ((data_pointee inner).map fun _ => .pointer) <|> atomic_record records inner true
+    return .scalar ty
+  else if spelling == "struct __va_list_tag[1]" then some .vaList
+  else if (array_pointer_parts spelling).isSome || (array_slot_pointee spelling).isSome || (callback_array_pointee spelling).isSome then some (.scalar .pointer)
+  else if let some (element, count) := ordinary_array spelling then do
+    return .array element (← ordinary_element records element) count
   else if let some ty := ordinary_type spelling then some (.scalar ty)
   else (records.find? (·.spelling == spelling)).map .record
 
-private def ordinary_record_compatible (left right : Ordinary.RecordLayout) : Bool :=
-  let fields := fun (layout : Ordinary.RecordLayout) =>
-    layout.fields.map (fun field => (field.spec.name, field.spec.spelling, field.offset, field.shift, field.spec.bits))
-  left.isUnion == right.isUnion && left.width == right.width && left.alignment == right.alignment && fields left == fields right
+private def ordinary_record_compatible (left right : List Ordinary.RecordLayout) :
+    Nat → Ordinary.RecordLayout → Ordinary.RecordLayout → Bool
+  | 0, _, _ => false
+  | depth + 1, first, other =>
+    first.isUnion == other.isUnion && first.width == other.width && first.alignment == other.alignment &&
+    first.fields.length == other.fields.length && (first.fields.zip other.fields).all fun (a, b) =>
+      a.spec.name == b.spec.name && a.offset == b.offset && a.shift == b.shift && a.spec.bits == b.spec.bits &&
+      a.spec.ty == b.spec.ty &&
+      let (atyp, ashape) := (fixed_dimensions a.spec.spelling).getD (a.spec.spelling, [])
+      let (btyp, bshape) := (fixed_dimensions b.spec.spelling).getD (b.spec.spelling, [])
+      ashape == bshape && match left.find? (·.spelling == atyp), right.find? (·.spelling == btyp) with
+      | none, none => atyp == btyp
+      | some x, some y =>
+        (if x.original.isEmpty && y.original.isEmpty then x.spelling == y.spelling else x.original == y.original) &&
+        ordinary_record_compatible left right depth x y
+      | _, _ => false
 
-private def ordinary_record_pointer_compatible (left right : List Ordinary.RecordLayout) (type : String) : Bool :=
-  let spelling := ordinary_pointee type
-  if !(spelling.startsWith "struct " || spelling.startsWith "union ") then true else
-    match left.find? (·.spelling == spelling), right.find? (·.spelling == spelling) with
-    | none, none => true
-    | some first, some other => ordinary_record_compatible first other
-    | _, _ => false
+private def ordinary_abi_type (left right : List Ordinary.RecordLayout) (expected actual : String) : Bool :=
+  let target := if expected.endsWith " *" then ordinary_pointee expected else expected
+  let incoming := if actual.endsWith " *" then ordinary_pointee actual else actual
+  match left.find? (·.spelling == target), right.find? (·.spelling == incoming) with
+  | none, none => expected == actual
+  | some first, some other =>
+    expected.endsWith " *" == actual.endsWith " *" &&
+      (if first.original.isEmpty && other.original.isEmpty then expected == actual else first.original == other.original) &&
+      ordinary_record_compatible left right (left.length + 1) first other
+  | _, _ => false
 
 private def ordinary_decl (node : Json) (spelling : String) : Bool :=
   !spelling.isEmpty && type_spelling node == spelling
@@ -1932,9 +2228,36 @@ private def ordinary_member (records : List Ordinary.RecordLayout) (node base : 
   let layout ← require (records.find? (·.spelling == recordType)) "unsupported ordinary record member base"
   let identity := field_text node "referencedMemberDecl"
   let member ← require (layout.fields.find? (·.spec.identity == identity)) "unknown ordinary record member identity"
+  let category := field_text node "valueCategory"
   unless ordinary_decl node member.spec.spelling && field_text node "name" == member.spec.name &&
-      (indirect || field_text base "valueCategory" == "lvalue") do throw "ordinary record member type changed"
+      (if indirect then category == "lvalue"
+       else ["lvalue", "prvalue"].contains category && category == field_text base "valueCategory") do
+    throw "ordinary record member type changed"
   return member
+
+private def ordinary_selected (node : Json) : Except String Json := do
+  let control :: ty :: associations := child_nodes node | throw "ordinary generic selection lacks a controlling type"
+  let controlling := type_spelling ty
+  unless field_text ty "kind" == "BuiltinType" && ordinary_decl control controlling &&
+      (ordinary_type controlling).isSome do throw "unsupported ordinary generic controlling type"
+  let mut cases := []
+  let mut defaultCase := none
+  for arm in associations do
+    match field_text arm "associationKind", child_nodes arm with
+    | "case", [candidate, expr] =>
+      let name := type_spelling candidate
+      unless field_text candidate "kind" == "BuiltinType" && (ordinary_type name).isSome &&
+          !(cases.lookup name).isSome do throw "unsupported ordinary generic association"
+      cases := (name, (arm, expr)) :: cases
+    | "default", [expr] =>
+      unless defaultCase.isNone do throw "duplicate ordinary generic default"
+      defaultCase := some (arm, expr)
+    | _, _ => throw "invalid ordinary generic association"
+  let (selected, expr) ← require (cases.lookup controlling <|> defaultCase) "unmatched ordinary generic type"
+  unless (associations.filter (fun arm => json_field arm "selected" == .bool true)) == [selected] &&
+      ordinary_decl expr (type_spelling node) && field_text expr "valueCategory" == field_text node "valueCategory" do
+    throw "ordinary generic result disagrees with its selected association"
+  return expr
 
 private def ordinary_lvalue_field (records : List Ordinary.RecordLayout) : Nat → Json → Except String (Option Ordinary.Field)
   | 0, _ => .error "ordinary member nesting exceeds the frontend budget"
@@ -1942,6 +2265,7 @@ private def ordinary_lvalue_field (records : List Ordinary.RecordLayout) : Nat �
     match field_text node "kind", child_nodes node with
     | "MemberExpr", [base] => some <$> ordinary_member records node base
     | "ParenExpr", [child] => ordinary_lvalue_field records fuel child
+    | "GenericSelectionExpr", _ => do ordinary_lvalue_field records fuel (← ordinary_selected node)
     | _, _ => .ok none
 
 private def ordinary_access (records : List Ordinary.RecordLayout) (budget : Nat) (node : Json)
@@ -1953,42 +2277,101 @@ private def ordinary_reference_type (node : Json) (spelling : String) : Bool :=
   ordinary_decl node spelling || ["struct ", "union "].any (fun tag =>
     (spelling.splitOn (tag ++ "@")).length > 1 && ((type_spelling node).splitOn tag).length > 1)
 
-private def ordinary_slot (scope : List OrdinaryLocal) (node : Json) : Except String Nat := do
+private def ordinary_binding (scope : List OrdinaryLocal) (node : Json) : Except String OrdinaryLocal := do
   let ref := json_field node "referencedDecl"
   let ident := ordinary_ident node
   let binding ← require (scope.find? (fun binding => binding.ident == ident)) "unknown ordinary local reference"
   unless field_text ref "kind" == binding.kind && field_text ref "name" == binding.name &&
       ordinary_reference_type ref binding.spelling && type_spelling node == binding.spelling do
-    throw "ordinary local reference type or name changed"
-  return binding.slot
+    throw ("ordinary local reference differs for " ++ binding.name ++ ": " ++ type_spelling ref ++ " / " ++ type_spelling node ++ " / " ++ binding.spelling)
+  return binding
 
 private def ordinary_address (globals : List OrdinaryObject) (scope : List OrdinaryLocal) (node : Json) :
     Except String Ordinary.Expression := do
   let ident := ordinary_ident node
   if scope.any (fun binding => binding.ident == ident) then
-    return .slotAddress (← ordinary_slot scope node)
+    let binding ← ordinary_binding scope node
+    return match binding.storage with
+      | .dynamicArray _ => .arrayAddress binding.slot
+      | _ => .slotAddress binding.slot
   let object ← require (globals.find? fun object => object.identities.contains ident)
     "unknown ordinary object reference"
   let reference := json_field node "referencedDecl"
   unless field_text reference "kind" == "VarDecl" && field_text reference "name" == object.name &&
-      ordinary_reference_type reference object.spelling && ordinary_decl node object.spelling do
+      (ordinary_reference_type reference object.spelling || object.callback.any (fun callback => ordinary_decl reference callback.reference)) && ordinary_decl node object.spelling do
     throw "ordinary global reference type or name changed"
   return .globalAddress object.symbol
+
+private def ordinary_va_signature : String → String
+  | "__builtin_va_start" => "void (struct __va_list_tag *, ...)"
+  | "__builtin_va_copy" => "void (struct __va_list_tag *, struct __va_list_tag *)"
+  | "__builtin_va_end" => "void (struct __va_list_tag *)"
+  | _ => ""
+
+private def ordinary_va_operand (node : Json) : Bool :=
+  ordinary_decl node "struct __va_list_tag *"
+
+private def ordinary_implicit_va (node : Json) : Option Nat := do
+  let signature := ordinary_va_signature (field_text node "name")
+  let children := child_nodes node
+  let parameters := children.filter (fun child => field_text child "kind" == "ParmVarDecl")
+  let arity := if field_text node "name" == "__builtin_va_copy" then 2 else 1
+  guard (json_field node "isImplicit" == .bool true && ordinary_decl node signature &&
+    children.all (fun child => ["ParmVarDecl", "BuiltinAttr", "NoThrowAttr"].contains (field_text child "kind")) &&
+    parameters.length == arity && parameters.all ordinary_va_operand)
+  return arity
+
+private def pthread_signature : String → Option String
+  | "pthread_create" => some "int (pthread_t *restrict, const pthread_attr_t *restrict, void *(*)(void *), void *restrict)"
+  | "pthread_join" => some "int (pthread_t, void **)"
+  | "pthread_self" => some "pthread_t (void)"
+  | "pthread_equal" => some "int (pthread_t, pthread_t)"
+  | "pthread_mutex_init" => some "int (pthread_mutex_t *restrict, const pthread_mutexattr_t *restrict)"
+  | "pthread_cond_init" => some "int (pthread_cond_t *restrict, const pthread_condattr_t *restrict)"
+  | "pthread_cond_wait" => some "int (pthread_cond_t *restrict, pthread_mutex_t *restrict)"
+  | "pthread_mutex_lock" | "pthread_mutex_trylock" | "pthread_mutex_unlock" | "pthread_mutex_destroy" =>
+    some "int (pthread_mutex_t *)"
+  | "pthread_cond_signal" | "pthread_cond_broadcast" | "pthread_cond_destroy" => some "int (pthread_cond_t *)"
+  | _ => none
+
+private def written_type (node : Json) := field_text (json_field node "type") "qualType"
+
+private def file_signature : String → Option String
+  | "fopen" => some "FILE *(const char *, const char *)"
+  | "fread" => some "unsigned long (void *, unsigned long, unsigned long, FILE *)"
+  | "fwrite" => some "unsigned long (const void *, unsigned long, unsigned long, FILE *)"
+  | "fclose" => some "int (FILE *)"
+  | _ => none
 
 private def ordinary_callee (callee : Json) : Except String (String × String × String) := do
   let [reference] := child_nodes callee | throw "expected ordinary function decay"
   let declaration := json_field reference "referencedDecl"
-  unless field_text callee "kind" == "ImplicitCastExpr" && field_text callee "castKind" == "FunctionToPointerDecay" &&
+  let name := field_text declaration "name"
+  let conversion := field_text callee "castKind"
+  let builtin := conversion == "BuiltinFnToFnPtr" && ordinary_decl declaration (ordinary_va_signature name) &&
+    ordinary_decl reference "<builtin fn type>"
+  let cursorSignature := if ["zhasvalidcap", "zis_readonly"].contains name then " (void *)" else " (struct __va_list_tag *)"
+  let headerAlias := ["zcan_va_arg", "zhasvalidcap", "zis_readonly"].contains name && ordinary_decl declaration ("filc_bool" ++ cursorSignature) &&
+    (type_spelling reference).startsWith "@type" && (type_spelling reference).endsWith cursorSignature
+  let ordinary := conversion == "FunctionToPointerDecay" &&
+    (ordinary_reference_type declaration (type_spelling reference) || headerAlias || file_signature name == some (written_type declaration) || pthread_signature name == some (written_type declaration))
+  unless field_text callee "kind" == "ImplicitCastExpr" && (ordinary || builtin) &&
       field_text reference "kind" == "DeclRefExpr" && (child_nodes reference).isEmpty &&
-      field_text declaration "kind" == "FunctionDecl" && field_text declaration "id" != "" &&
-      ordinary_reference_type declaration (type_spelling reference) do
+      field_text declaration "kind" == "FunctionDecl" && field_text declaration "id" != "" do
     throw "expected a named ordinary function"
-  return (field_text declaration "name", type_spelling reference, field_text declaration "id")
+  return (name, type_spelling reference, field_text declaration "id")
 
 private def ordinary_scalar : String → Option Ordinary.ScalarOp
   | "+" => some .add
   | "-" => some .sub
   | "*" => some .mul
+  | "/" => some .div
+  | "%" => some .rem
+  | "&" => some .band
+  | "|" => some .bor
+  | "^" => some .bxor
+  | "<<" => some .shl
+  | ">>" => some .shr
   | "==" => some .eq
   | "!=" => some .ne
   | "<" => some .lt
@@ -1997,20 +2380,156 @@ private def ordinary_scalar : String → Option Ordinary.ScalarOp
   | ">=" => some .ge
   | _ => none
 
+private def ordinary_unary : String → Option Ordinary.UnaryOp
+  | "+" => some .plus
+  | "-" => some .minus
+  | "~" => some .complement
+  | _ => none
+
+private def ordinary_shift (op : String) : Bool := op == "<<" || op == ">>"
+
+private def ordinary_promoted (ty : Ordinary.TypeCode) : Bool :=
+  ty != .pointer && ty.component.isNone && !ty.floating && 4 ≤ ty.width
+
+private def ordinary_right_operand (op spelling : String) (right : Json) : Bool :=
+  if ordinary_shift op then (ordinary_type (type_spelling right)).any ordinary_promoted
+  else ordinary_decl right spelling
+
+private def ordinary_dimensions : List Char → Nat → List Char → List String → Except String (List String)
+  | [], 0, _, dimensions => .ok dimensions.reverse
+  | [], _ + 1, _, _ => .error "incomplete ordinary array dimension"
+  | char :: rest, depth, reversed, dimensions =>
+    if char == '[' then
+      ordinary_dimensions rest (depth + 1) (if depth == 0 then [] else char :: reversed) dimensions
+    else if char == ']' then
+      if depth == 0 then .error "unmatched ordinary array bracket"
+      else if depth == 1 then do
+        let bound := (String.mk reversed.reverse).trim
+        unless !bound.isEmpty do throw "incomplete ordinary array dimension"
+        ordinary_dimensions rest 0 [] (bound :: dimensions)
+      else ordinary_dimensions rest (depth - 1) (char :: reversed) dimensions
+    else if depth != 0 then ordinary_dimensions rest depth (char :: reversed) dimensions
+    else if char.isWhitespace then ordinary_dimensions rest 0 [] dimensions
+    else .error "unexpected text after an ordinary array dimension"
+
+private def ordinary_shape_parts (spelling : String) : Except String (String × List String) := do
+  let typePrefix := spelling.toList.takeWhile (· != '[')
+  let base := String.intercalate " " (((String.mk typePrefix).splitOn " ").filter
+    (fun word => !word.isEmpty && !["const", "volatile", "restrict", "__restrict", "__restrict__"].contains word))
+  let dimensions ← ordinary_dimensions (spelling.toList.drop typePrefix.length) 0 [] []
+  return (base, dimensions)
+
+private def ordinary_extent_shape (records : List Ordinary.RecordLayout) (spelling : String) :
+    Except String (Nat × Nat × List String) := do
+  if (array_pointer_parts spelling).isSome || (array_slot_pointee spelling).isSome || (callback_array_pointee spelling).isSome then return (8, 8, [])
+  if let some (_, _, bounds, _) := callback_array spelling then return (8, 8, bounds.map toString)
+  let (base, dimensions) ← ordinary_shape_parts spelling
+  let storage ← require (ordinary_storage records base) "unsupported ordinary extent element type"
+  let alignment := match storage with
+    | .scalar ty => ty.alignment
+    | .array _ ty _ => ty.alignment
+    | .record layout => layout.alignment
+    | .dynamicArray _ => 0
+    | .vaList => 8
+  return (storage.width, alignment, dimensions)
+
+private def ordinary_pointer_stride (records : List Ordinary.RecordLayout) (spelling : String) : Except String Nat := do
+  let (width, _, sizes) ← ordinary_extent_shape records (ordinary_pointee spelling)
+  let bounds ← require (sizes.mapM String.toNat?) "ordinary pointer stride requires captured variable dimensions"
+  let stride := bounds.foldl (· * ·) width
+  unless stride > 0 && stride ≤ 9223372036854775807 do throw "ordinary pointer stride exceeds its object representation"
+  return stride
+
+private def dimension_suffix (dimensions : List String) : String :=
+  String.join (dimensions.map (fun bound => "[" ++ bound ++ "]"))
+
+private def OrdinaryShape.array_type (shape : OrdinaryShape) (rank : Nat) : String :=
+  shape.element ++ dimension_suffix (shape.dimensions.drop rank)
+
+private def OrdinaryShape.pointer_type (shape : OrdinaryShape) (rank : Nat) : String :=
+  let tail := shape.dimensions.drop rank
+  if tail.isEmpty then shape.element ++ " *" else shape.element ++ " (*)" ++ dimension_suffix tail
+
+private def OrdinaryShape.fixed_size (shape : OrdinaryShape) (rank : Nat) : Option Nat :=
+  (shape.dimensions.drop rank).mapM String.toNat? |>.map (fun sizes => sizes.foldl (· * ·) shape.width)
+
+private def ordinary_array_alias (scope : List OrdinaryLocal) (type : Json) :
+    Option (OrdinaryLocal × OrdinaryShape) := do
+  let identity := field_text type "typeAliasDeclId"
+  let binding ← scope.find? (fun candidate => candidate.kind == "TypedefDecl" && candidate.ident == identity)
+  let .dynamicArray shape := binding.storage | none
+  guard (binding.spelling == qualified_spelling type)
+  return (binding, shape)
+
+private structure OrdinaryOrigin where
+  slot : Nat
+  shape : OrdinaryShape
+  rank : Nat
+
+private def ordinary_array_origin (scope : List OrdinaryLocal) : Nat → Json → Option OrdinaryOrigin
+  | 0, _ => none
+  | budget + 1, node =>
+    match field_text node "kind", child_nodes node with
+    | "DeclRefExpr", [] => do
+      let binding ← (ordinary_binding scope node).toOption
+      match binding.storage with
+      | .dynamicArray shape => some ⟨binding.slot, shape, 1⟩
+      | _ => binding.pointerShape.map (fun captured => ⟨binding.slot, captured.shape, 0⟩)
+    | "ParenExpr", [child] | "ConstantExpr", [child] | "ImplicitCastExpr", [child] =>
+      ordinary_array_origin scope budget child
+    | "ArraySubscriptExpr", [base, _] =>
+      (ordinary_array_origin scope budget base).map fun origin => { origin with rank := origin.rank + 1 }
+    | "UnaryOperator", [base] =>
+      if field_text node "opcode" == "*" then
+        (ordinary_array_origin scope budget base).map fun origin => { origin with rank := origin.rank + 1 }
+      else none
+    | "BinaryOperator", [left, right] =>
+      if ["+", "-"].contains (field_text node "opcode") then
+        ordinary_array_origin scope budget left <|> ordinary_array_origin scope budget right
+      else none
+    | _, _ => none
+
+private def ordinary_array_pointer (scope : List OrdinaryLocal) (budget : Nat) (node : Json) :
+    Option OrdinaryOrigin := do
+  let origin ← ordinary_array_origin scope budget node
+  guard (origin.rank ≤ origin.shape.dimensions.length && ordinary_decl node (origin.shape.pointer_type origin.rank))
+  return origin
+
+private def OrdinaryOrigin.offset (origin : OrdinaryOrigin) (op : Ordinary.PointerOp) (indexing : Bool)
+    (left right : Ordinary.Expression) : Ordinary.Expression :=
+  match origin.shape.fixed_size origin.rank with
+  | some stride => .offset left right stride op
+  | none => .arrayOffset op indexing origin.slot origin.rank left right
+
+private def OrdinaryOrigin.update (origin : OrdinaryOrigin) (op : Ordinary.ScalarOp) (returnOld : Bool)
+    (address value : Ordinary.Expression) : Ordinary.Expression :=
+  match origin.shape.fixed_size origin.rank with
+  | some stride => .update op .pointer .pointer returnOld address value stride
+  | none => .arrayUpdate op origin.slot origin.rank returnOld address value
+
+private def ordinary_argument (node : Json) (expected : String) : Bool :=
+  ordinary_decl node expected || (Option.isSome (do
+    let (target, dimensions) ← array_pointer_parts expected
+    let (actual, suffix) ← array_pointer_parts (type_spelling node)
+    let (_, required) ← (ordinary_shape_parts (target ++ dimensions)).toOption
+    let (_, provided) ← (ordinary_shape_parts (actual ++ suffix)).toOption
+    guard (field_text node "kind" == "ImplicitCastExpr" && field_text node "castKind" == "BitCast" &&
+      actual == target && required.length == provided.length &&
+      (provided.zip required).all (fun (supplied, wanted) => supplied == "*" || supplied == wanted))))
+
+private def ordinary_extent_bounds (allBounds : Bool) :
+    List String → List Json → Except String (List (Sum Nat Json))
+  | [], [] => .ok []
+  | [], _ :: _ => .error "unexpected ordinary extent bounds"
+  | dimension :: rest, nodes => do
+    match dimension.toNat?, allBounds, nodes with
+    | some fixed, false, _ => return .inl fixed :: (← ordinary_extent_bounds allBounds rest nodes)
+    | some fixed, true, _ :: remaining => return .inl fixed :: (← ordinary_extent_bounds allBounds rest remaining)
+    | none, _, node :: remaining => return .inr node :: (← ordinary_extent_bounds allBounds rest remaining)
+    | _, _, [] => throw "missing ordinary extent bound"
+
 private def ordinary_comparison (op : String) : Bool :=
   ["==", "!=", "<", "<=", ">", ">="].contains op
-
-private def ordinary_record_source (spelling : String) : Nat → Json → Except String Json
-  | 0, _ => .error "incomplete ordinary record expression"
-  | depth + 1, node => do
-    unless ordinary_decl node spelling do throw "ordinary record copy changed type"
-    match field_text node "kind", child_nodes node with
-    | "ParenExpr", [child] => ordinary_record_source spelling depth child
-    | "ImplicitCastExpr", [place] =>
-      unless field_text node "castKind" == "LValueToRValue" && ordinary_decl place spelling do
-        throw "ordinary record copy requires a matching source lvalue"
-      return place
-    | _, _ => throw "ordinary record copy requires a source lvalue"
 
 private def ordinary_zero : Nat → Json → Bool
   | 0, _ => false
@@ -2020,6 +2539,147 @@ private def ordinary_zero : Nat → Json → Bool
     | "ParenExpr", [child] | "ConstantExpr", [child] => ordinary_zero depth child
     | _, _ => false
 
+private def refers_to_common (common opaqueNode : Json) : Bool :=
+  match child_nodes opaqueNode with
+  | [child] => field_text opaqueNode "kind" == "OpaqueValueExpr" && field_text common "id" != "" &&
+      field_text child "id" == field_text common "id" && type_spelling opaqueNode == type_spelling common
+  | _ => false
+
+private def shared_casts (common : Json) : Nat → Json → Except String (String × List Ordinary.TypeCode)
+  | 0, _ => .error "incomplete shared operand"
+  | fuel + 1, node => do
+    if refers_to_common common node then return (field_text node "id", [])
+    let [inner] := child_nodes node | throw "shared operand has no conversion input"
+    unless field_text node "kind" == "ImplicitCastExpr" do throw "unsupported shared operand"
+    let (ident, casts) ← shared_casts common fuel inner
+    match field_text node "castKind" with
+    | "NoOp" =>
+      let source ← require (ordinary_type (type_spelling inner)) "unsupported shared operand type"
+      unless ordinary_type (type_spelling node) == some source do
+        throw "shared no-op conversion changes representation"
+      return (ident, casts)
+    | "IntegralCast" =>
+      let target ← require (ordinary_type (type_spelling node)) "unsupported shared conversion"
+      unless target != .pointer && target.component.isNone && !target.floating &&
+          (ordinary_type (type_spelling inner)).any (fun ty => ty != .pointer && ty.component.isNone && !ty.floating) do
+        throw "shared conversion requires integer operands"
+      return (ident, casts ++ [target])
+    | "IntegralToFloating" =>
+      let target ← require (ordinary_type (type_spelling node)) "unsupported shared floating result"
+      unless target.floating && (ordinary_integer_type (type_spelling inner)).isSome do
+        throw "invalid shared integer-to-floating conversion"
+      return (ident, casts ++ [target])
+    | _ => throw "unsupported shared operand conversion"
+
+private def string_payload (node : Json) : Except String (List UInt8) := do
+  let spelling := (field_text node "value").toUTF8.data.toList
+  let 34 :: rest := spelling | throw "expected ordinary string literal"
+  let 34 :: reversed := rest.reverse | throw "unterminated ordinary string literal"
+  let octal (b : UInt8) := 48 ≤ b && b ≤ 55
+  let rec decode : List UInt8 → Option (List UInt8)
+    | [] => some []
+    | 92 :: b :: tail => do
+      if octal b then
+        let first := b.toNat - 48
+        match tail with
+        | c :: d :: more =>
+          if octal c && octal d then
+            let value := first * 64 + (c.toNat - 48) * 8 + (d.toNat - 48)
+            guard (value < 256)
+            return UInt8.ofNat value :: (← decode more)
+          if octal c then return UInt8.ofNat (first * 8 + (c.toNat - 48)) :: (← decode (d :: more))
+        | [c] => if octal c then return [UInt8.ofNat (first * 8 + (c.toNat - 48))]
+        | [] => pure ()
+        return (b - 48) :: (← decode tail)
+      let value ← match b.toNat with
+        | 110 => some 10 | 116 => some 9 | 114 => some 13 | 97 => some 7
+        | 98 => some 8 | 102 => some 12 | 118 => some 11
+        | 92 | 34 | 39 | 63 => some b | _ => none
+      return value :: (← decode tail)
+    | 92 :: [] | 34 :: _ => none
+    | b :: tail => (b :: ·) <$> decode tail
+  require (decode reversed.reverse) "unsupported ordinary string escape"
+
+private def real_literal_bits (ty : Ordinary.TypeCode) (spelling : String) : Option Nat := do
+  if spelling == "Inf" || spelling == "INF" then return Ordinary.floating_bits ty 1 0
+  let (mantissa, exponent) ← match (spelling.replace "e" "E").splitOn "E" with
+    | [head] => some (head, (0 : Int))
+    | [head, power] => do
+      let exponent ← (if power.startsWith "+" then power.drop 1 else power).toInt?
+      guard (exponent.natAbs ≤ 6000)
+      pure (head, exponent)
+    | _ => none
+  let (whole, fraction) ← match mantissa.splitOn "." with
+    | [whole] => some (whole, "")
+    | [whole, fraction] => do guard (!fraction.isEmpty); pure (whole, fraction)
+    | _ => none
+  guard (!whole.isEmpty && whole.toList.all Char.isDigit && fraction.toList.all Char.isDigit)
+  let digits ← (whole ++ fraction).toNat?
+  let scale := exponent - fraction.length
+  return Ordinary.floating_bits ty (digits * 10 ^ scale.toNat) (10 ^ (-scale).toNat)
+
+private def ordinary_stores (records : List Ordinary.RecordLayout) (parse : Json → Except String Ordinary.Expression) :
+    Nat → OrdinaryStorage → Json → Except String (List Ordinary.Initialiser)
+  | 0, _, _ => .error "ordinary initialiser exceeds the frontend traversal budget"
+  | depth + 1, storage, initializer => do
+    let nested := fun spelling ty offset node => do
+      if field_text node "kind" == "ImplicitValueInitExpr" then return []
+      let sub := ordinary_storage records spelling
+      if (field_text node "kind" == "InitListExpr" || field_text node "kind" == "StringLiteral") &&
+          sub.any (fun | .array .. | .record _ => true | _ => false) then
+        let some aggregate := sub | throw "unknown ordinary aggregate initialiser"
+        let stores ← ordinary_stores records parse depth aggregate node
+        return stores.map (fun init => { init with offsets := offset :: init.offsets })
+      return [⟨[offset], ty, ← parse node⟩]
+    match storage with
+    | .scalar ty =>
+      if let some component := ty.component then
+        if field_text initializer "kind" == "InitListExpr" then
+          let values := child_nodes initializer
+          unless values.length ≤ 2 do throw "ordinary complex initialiser exceeds two components"
+          let stores ← values.zipIdx.mapM fun (value, index) => do
+            unless ordinary_type (type_spelling value) == some component do throw "ordinary complex component has the wrong type"
+            if field_text value "kind" == "ImplicitValueInitExpr" then return none
+            return some (⟨[index * component.width], component, ← parse value⟩ : Ordinary.Initialiser)
+          return stores.filterMap id
+      return [⟨[], ty, ← parse initializer⟩]
+    | .array element ty count =>
+      if field_text initializer "kind" == "StringLiteral" then
+        unless ["char", "unsigned char", "signed char"].contains element && (child_nodes initializer).isEmpty &&
+            ordinary_array (type_spelling initializer) == some (element, count) do
+          throw "invalid ordinary string initialiser destination"
+        let bytes ← string_payload initializer
+        unless bytes.length ≤ count do throw "ordinary string initialiser exceeds the array"
+        return (((bytes ++ [0]).take count).zipIdx.map fun (b, i) => ⟨[i], .byte, .byteLiteral b⟩)
+      unless field_text initializer "kind" == "InitListExpr" do
+        throw "ordinary array initialiser requires an initialiser list"
+      let values := child_nodes initializer
+      let values := if values.isEmpty then ((json_field initializer "array_filler").getArr?.toOption.getD #[]).toList.drop 1
+        else values
+      unless values.length ≤ count do
+        throw "ordinary array initialiser extent does not match its elements"
+      let stores ← values.zipIdx.mapM fun (node, index) => do
+        unless ordinary_decl node element || ordinary_decl node (element.replace "(*const)" "(*)") do throw "ordinary array initialiser element has the wrong type"
+        nested element ty (index * ty.width) node
+      return stores.flatten
+    | .record layout =>
+      unless field_text initializer "kind" == "InitListExpr" do
+        throw "ordinary record initialiser requires an initialiser list"
+      let values := child_nodes initializer
+      let fields ← if !layout.isUnion then pure layout.fields else do
+        let selected := field_text (json_field initializer "field") "id"
+        let member ← require (if selected.isEmpty then layout.fields.head? else
+          layout.fields.find? (·.spec.identity == selected)) "unknown ordinary union initialiser member"
+        pure [member]
+      unless values.length ≤ fields.length do
+        throw "ordinary record initialiser does not cover its fields"
+      let stores ← (fields.zip values).mapM fun (member, node) => do
+        unless ordinary_decl node member.spec.spelling do throw "ordinary record initialiser changed a field type"
+        nested member.spec.spelling member.access member.offset node
+      return stores.flatten
+    | .dynamicArray _ => throw "ordinary variable-length arrays do not have initialiser lists"
+    | .vaList => throw "ordinary variadic cursors are initialised by va_start or va_copy"
+
 private def ordinary_expr (records : List Ordinary.RecordLayout) (symbols : List OrdinarySignature) (globals : List OrdinaryObject)
     (scope : List OrdinaryLocal) : Nat → Bool → Json → Except String Ordinary.Expression
   | 0, _, _ => .error "incomplete ordinary expression"
@@ -2028,131 +2688,520 @@ private def ordinary_expr (records : List Ordinary.RecordLayout) (symbols : List
     let spelling := type_spelling node
     let kind := field_text node "kind"
     let children := child_nodes node
+    if kind == "GenericSelectionExpr" then return ← descend place (← ordinary_selected node)
     if place then
       match kind, children with
+      | "CompoundLiteralExpr", [init] => do
+        let ident := field_text node "id"
+        let binding ← require (scope.find? fun candidate => candidate.ident == ident && candidate.kind == "CompoundLiteralExpr")
+          "ordinary compound literal lacks an automatic allocation"
+        unless !ident.isEmpty && field_text node "valueCategory" == "lvalue" && ordinary_decl init spelling &&
+            binding.spelling == spelling do throw "ordinary compound literal changed its object type"
+        let stores ← ordinary_stores records (descend false) depth binding.storage init
+        unless Ordinary.Initialiser.fits binding.storage.width stores do throw "ordinary compound literal stores exceed their object"
+        return .compound binding.slot binding.storage.width (stores.foldr
+          (fun init rest => .compoundStore binding.slot init.offsets init.ty init.value rest) (.compoundEnd binding.slot))
       | "DeclRefExpr", [] => ordinary_address globals scope node
       | "ParenExpr", [child] =>
         unless ordinary_decl child spelling do throw "parenthesised ordinary lvalue changed type"
         descend true child
       | "UnaryOperator", [operand] =>
-        unless field_text node "opcode" == "*" && ordinary_decl node (ordinary_pointee (type_spelling operand)) do
-          throw "unsupported ordinary dereference"
+        unless field_text node "opcode" == "*" do throw "unsupported ordinary dereference"
+        let pointee := match ordinary_array_pointer scope depth operand with
+          | some origin => origin.shape.array_type origin.rank
+          | none => ordinary_pointee (type_spelling operand)
+        unless ordinary_decl node pointee do throw "ordinary dereference changed the pointee type"
         descend false operand
       | "ArraySubscriptExpr", [base, index] =>
-        let ty ← require (ordinary_type spelling) "unsupported ordinary array element type"
-        unless ordinary_decl node (ordinary_pointee (type_spelling base)) &&
-            ["int", "unsigned long"].contains (type_spelling index) do
+        unless (ordinary_type (type_spelling index)).any ordinary_promoted do
+          throw "ordinary array index is not a promoted integer"
+        if let some origin := ordinary_array_pointer scope depth base then
+          unless ordinary_decl node (origin.shape.array_type origin.rank) do
+            throw "ordinary subscript changed the captured array element type"
+          return origin.offset .add true (← descend false base) (← descend false index)
+        let stride ← ordinary_pointer_stride records (type_spelling base)
+        unless ordinary_decl node (ordinary_pointee (type_spelling base)) do
           throw "unsupported ordinary array subscript"
-        return .offset (← descend false base) (← descend false index) ty.width
+        return .offset (← descend false base) (← descend false index) stride
       | "MemberExpr", [base] =>
         let indirect := json_field node "isArrow" == .bool true
         let member ← ordinary_member records node base
-        return .field (← descend (!indirect) base) member.offset
-      | _, _ => throw "unsupported ordinary lvalue"
+        let address ← if indirect then descend false base
+          else if field_text base "valueCategory" == "lvalue" then descend true base
+          else do
+            let recordType ← require ((records.find? (·.spelling == type_spelling base)).bind ordinary_record_code)
+              "unsupported ordinary temporary record"
+            pure (.materialise recordType (← descend false base))
+        return .field address member.offset
+      | _, _ => throw ("unsupported ordinary lvalue: " ++ kind ++ " of type " ++ spelling)
     else
       match kind, children with
+      | "ConstantExpr", [child] =>
+        unless ordinary_decl child spelling do throw "ordinary constant expression changed type"
+        descend false child
+      | "FloatingLiteral", [] =>
+        let literal := field_text node "value"
+        let ty ← require (ordinary_type spelling) "unsupported ordinary floating literal"
+        unless ty.floating do throw "ordinary floating literal requires a floating type"
+        return .floatingLiteral ty literal (← require (real_literal_bits ty literal) "invalid ordinary floating literal")
       | "IntegerLiteral", [] =>
         let n ← require (field_text node "value").toNat? "invalid ordinary literal"
-        unless spelling == "int" && n < 2147483648 do throw "ordinary literal exceeds int"
+        let ty ← require (ordinary_type spelling) "unsupported ordinary literal type"
+        let limit := modulus (8 * ty.width - if ty.signed then 1 else 0)
+        unless ordinary_promoted ty && (n : Int) < limit do throw "ordinary literal exceeds its integer type"
         return .literal n
       | "CharacterLiteral", [] =>
         let n ← (json_field node "value").getNat?
         unless spelling == "int" && n < 2147483648 do throw "ordinary character exceeds int"
         return .literal n
+      | "UnaryExprOrTypeTraitExpr", _ =>
+        let trait := field_text node "name"
+        unless spelling == "unsigned long" && ["sizeof", "alignof", "__alignof"].contains trait do
+          throw "unsupported ordinary size or alignment query"
+        let typeForm := json_field node "argType" != .null
+        let argument ← if typeForm then pure (qualified_spelling (json_field node "argType")) else do
+          let [operand] := children | throw "ordinary size query requires one operand"
+          pure (type_spelling operand)
+        let (width, alignment, dimensions) ← ordinary_extent_shape records argument
+        if trait != "sizeof" then return .sizeLiteral alignment
+        if let some (binding, _) := ordinary_array_alias scope (json_field node "argType") then
+          return .aliasSize binding.slot
+        if let some fixed := dimensions.mapM String.toNat? then
+          return .sizeLiteral (fixed.foldl (· * ·) width)
+        if !typeForm then
+          let [operand] := children | throw "ordinary variable-length size requires an operand"
+          let origin ← require (ordinary_array_origin scope depth operand) "unresolved ordinary array size"
+          let rank := origin.rank - 1
+          unless 0 < origin.rank && rank < origin.shape.dimensions.length &&
+              ordinary_decl operand (origin.shape.array_type rank) do
+            throw "ordinary size changed the captured array type"
+          return .arraySize origin.slot rank (← descend true operand)
+        let allBounds := children.length == dimensions.length
+        let bounds ← ordinary_extent_bounds allBounds dimensions children
+        let sizes ← bounds.mapM fun bound =>
+          match bound with
+          | .inl fixed => pure (.sizeLiteral fixed)
+          | .inr value => do
+            unless (ordinary_type (type_spelling value)).any (· != .pointer) do
+              throw "ordinary extent bound is not an integer"
+            descend false value
+        return .arrayExtent width (sizes.foldr .dimension .emptyArguments)
       | "DeclRefExpr", [] =>
-        let ty ← require (ordinary_type spelling) "unsupported ordinary local type"
+        if field_text (json_field node "referencedDecl") "kind" == "EnumConstantDecl" then
+          return .literal (← require (field_text node "ordinaryEnumValue").toInt? "unresolved ordinary enumerator")
+        let ty ← require (ordinary_value_type records spelling) ("unsupported ordinary local type: " ++ spelling)
         return .load ty (← ordinary_address globals scope node)
       | "ArraySubscriptExpr", [_, _] | "MemberExpr", [_] =>
-        let ty ← require (ordinary_type spelling) "unsupported ordinary aggregate element type"
+        let ty ← require (ordinary_value_type records spelling) "unsupported ordinary aggregate element type"
         return .load (← ordinary_access records (depth + 1) node ty) (← descend true node)
       | "ParenExpr", [child] =>
         unless ordinary_decl child spelling do throw "parenthesised ordinary expression changed type"
         descend false child
       | "ImplicitCastExpr", [child] | "CStyleCastExpr", [child] =>
-        let ty ← require (ordinary_type spelling) "unsupported ordinary cast target"
+        if kind == "ImplicitCastExpr" && field_text node "castKind" == "FunctionToPointerDecay" then
+          let (result, args) ← require (function_prototype spelling) "unsupported ordinary function pointer prototype"
+          let (name, signature, ident) ← ordinary_callee node
+          let target ← require (symbols.find? (·.name == name)) "ordinary function address has no linked definition"
+          unless target.declarations.contains ident && signature == target.spelling && !target.variadic &&
+              result == target.result && args == target.parameters.map (·.spelling) do
+            throw "ordinary function address disagrees with its linked prototype"
+          let index ← require (target.functions.idxOf? target.symbol) "ordinary function has no registered address"
+          return .functionAddress target.symbol index
         if kind == "ImplicitCastExpr" && field_text node "castKind" == "ArrayToPointerDecay" then
+          if field_text child "kind" == "StringLiteral" && spelling == "char *" && (child_nodes child).isEmpty then
+            let bytes ← string_payload child
+            unless ordinary_array (type_spelling child) == some ("char", bytes.length + 1) do
+              throw "ordinary literal extent differs from its byte length"
+            return .string bytes
+          if ordinary_va_operand node && ordinary_decl child "struct __va_list_tag[1]" then
+            return ← descend true child
+          if let some origin := ordinary_array_origin scope depth child then
+            unless 0 < origin.rank && origin.rank ≤ origin.shape.dimensions.length &&
+                ordinary_decl child (origin.shape.array_type (origin.rank - 1)) &&
+                spelling == origin.shape.pointer_type origin.rank do
+              throw "ordinary array decay changed the captured array shape"
+            return ← descend true child
+          let ty ← require (ordinary_type spelling) "unsupported ordinary array decay target"
           let (element, _) ← require (ordinary_array (type_spelling child)) "ordinary array decay requires a fixed extent"
           unless ty == .pointer && element == ordinary_pointee spelling do
             throw "ordinary array decay changed the element type"
           descend true child
         else
-          let inputType ← require (ordinary_type (type_spelling child)) "unsupported ordinary cast input"
+          let target := if field_text node "castKind" == "NullToPointer" && ordinary_element records spelling == some .pointer
+            then some Ordinary.TypeCode.pointer else ordinary_value_type records spelling
+          let ty ← require target ("unsupported ordinary cast target: " ++ spelling)
+          let inputType ← if field_text node "castKind" == "IntegralCast" && ordinary_decl child "_Bool" then pure .byte
+            else if field_text node "castKind" == "LValueToRValue" && ordinary_decl child ("const " ++ spelling) then pure ty
+            else require (ordinary_value_type records (type_spelling child)) ("unsupported ordinary cast input: " ++ type_spelling child)
           match field_text node "castKind" with
           | "NullToPointer" =>
             unless ty == .pointer && inputType != .pointer && ordinary_zero depth child do
               throw "ordinary null pointer requires an integer zero constant"
             return .nullPointer
           | "LValueToRValue" =>
-            unless kind == "ImplicitCastExpr" && ordinary_decl child spelling do
+            unless kind == "ImplicitCastExpr" && (ordinary_decl child spelling || ordinary_decl child ("const " ++ spelling) ||
+                (ty == .pointer && spelling.endsWith "*" && ordinary_decl child (spelling ++ "const")) ||
+                (type_spelling child).replace "(*const)" "(*)" == spelling) do
               throw "unsupported ordinary load type"
             return .load (← ordinary_access records depth child ty) (← descend true child)
           | "BitCast" =>
             unless ty == .pointer && inputType == .pointer do throw "ordinary bitcast must preserve a data pointer"
             descend false child
+          | "FloatingToIntegral" =>
+            unless inputType.floating && (ordinary_integer_type spelling).isSome do throw "invalid ordinary floating-to-integer conversion"
+            return .truncateReal ty (← descend false child)
+          | "IntegralToFloating" =>
+            unless ty.floating && (ordinary_integer_type (type_spelling child)).isSome do
+              throw "invalid ordinary integer-to-floating conversion"
+            return .cast ty (← descend false child)
           | "IntegralCast" =>
-            unless ty != .pointer && inputType != .pointer do throw "ordinary integer cast has a pointer operand"
+            unless (ordinary_type spelling).isSome && ((ordinary_type (type_spelling child)).isSome || ordinary_decl child "_Bool") &&
+                ty != .pointer && inputType != .pointer && ty.component.isNone && inputType.component.isNone && !ty.floating && !inputType.floating do throw "invalid ordinary integer cast operands"
             return .cast ty (← descend false child)
           | "NoOp" =>
-            unless ordinary_decl child spelling do throw "ordinary no-op cast changed type"
+            unless ordinary_decl child spelling || (spelling.startsWith "const " && ty == .pointer && ordinary_decl child (spelling.drop 6)) do
+              throw "ordinary no-op cast changed type"
             descend false child
           | _ => throw "unsupported ordinary cast"
       | "UnaryOperator", [operand] =>
-        if field_text node "opcode" == "&" then
-          unless ordinary_decl operand (ordinary_pointee spelling) do throw "unsupported ordinary address type"
+        let opcode := field_text node "opcode"
+        if opcode == "&" then
+          unless ordinary_decl operand (ordinary_pointee spelling) ||
+              spelling == written_type operand ++ " *" do throw "unsupported ordinary address type"
           let member ← ordinary_lvalue_field records depth operand
           unless !(member.any (·.spec.bits.isSome)) do throw "ordinary bitfields have no address"
           return ← descend true operand
-        unless field_text node "opcode" == "!" && spelling == "int" &&
-            (ordinary_type (type_spelling operand)).isSome do throw "unsupported ordinary unary expression"
-        return .logicalNot (← descend false operand)
+        else if opcode == "!" then
+          unless spelling == "int" && ((ordinary_type (type_spelling operand)).isSome || ordinary_decl operand "_Bool") do
+            throw "invalid ordinary logical negation"
+          return .logicalNot (← descend false operand)
+        else if opcode == "++" || opcode == "--" then
+          let ty ← require (ordinary_type spelling) "unsupported ordinary update type"
+          unless !ty.floating && ty.component.isNone do throw "floating updates require floating arithmetic"
+          let returnOld ← (json_field node "isPostfix").getBool?
+          unless ordinary_decl operand spelling do throw "invalid ordinary update operand"
+          let op := if opcode == "++" then Ordinary.ScalarOp.add else .sub
+          let address ← descend true operand
+          if let some origin := ordinary_array_pointer scope depth operand then
+            return origin.update op returnOld address (.literal 1)
+          let access ← ordinary_access records depth operand ty
+          let promoted := if ty.width < 4 then Ordinary.TypeCode.integer else ty
+          let stride ← if ty == .pointer then ordinary_pointer_stride records spelling else pure 1
+          return .update op access promoted returnOld address (.literal 1) stride
+        else
+          let op ← require (ordinary_unary opcode) "unsupported ordinary unary expression"
+          let ty ← require (ordinary_type spelling) "unsupported ordinary unary type"
+          unless (ordinary_promoted ty || (opcode == "+" && (ty.floating || ty.component.isSome))) && ordinary_decl operand spelling do throw "invalid ordinary unary operand"
+          return .unary op ty (← descend false operand)
+      | "CompoundAssignOperator", [lhs, rhs] =>
+        let opcode := field_text node "opcode"
+        unless opcode.endsWith "=" && !ordinary_comparison opcode do throw "invalid ordinary compound assignment"
+        let symbol := opcode.take (opcode.length - 1)
+        let op ← require (ordinary_scalar symbol) "unsupported ordinary compound operator"
+        let ty ← require (ordinary_type spelling) "unsupported ordinary compound storage type"
+        let computes := qualified_spelling (json_field node "computeLHSType")
+        let arithmetic ← require (ordinary_type computes) "unsupported ordinary compound computation type"
+        unless ordinary_decl lhs spelling && qualified_spelling (json_field node "computeResultType") == computes do
+          throw "invalid ordinary compound operands"
+        let address ← descend true lhs
+        let value ← descend false rhs
+        let access ← ordinary_access records depth lhs ty
+        if ty == .pointer then
+          unless computes == spelling && ["+", "-"].contains symbol &&
+              (ordinary_type (type_spelling rhs)).any ordinary_promoted do
+            throw "unsupported ordinary compound pointer operands"
+          if let some origin := ordinary_array_pointer scope depth lhs then
+            return origin.update op false address value
+          return .update op access arithmetic false address value (← ordinary_pointer_stride records spelling)
+        unless ordinary_promoted arithmetic && ordinary_right_operand symbol computes rhs do
+          throw "unsupported ordinary compound integer operands"
+        return .update op access arithmetic false address value
+      | "BinaryConditionalOperator", [common, test, reused, fallback] =>
+        let (tested, tests) ← shared_casts common depth test
+        let (converted, casts) ← shared_casts common depth reused
+        unless !tested.isEmpty && tested == converted && (ordinary_type (type_spelling test)).isSome &&
+            ordinary_decl reused spelling && ordinary_decl fallback spelling do
+          throw "conditional operands differ from the shared value"
+        return .shared (← descend false common) (← descend false fallback) tests casts
+      | "ConditionalOperator", [condition, yes, no] =>
+        unless (ordinary_type (type_spelling condition)).isSome &&
+            ordinary_decl yes spelling && ordinary_decl no spelling do
+          throw "invalid ordinary conditional operands"
+        return .conditional (← descend false condition) (← descend false yes) (← descend false no)
       | "BinaryOperator", [lhs, rhs] =>
-        match field_text node "opcode" with
-        | "+" =>
+        let operator := field_text node "opcode"
+        match operator with
+        | "+" | "-" =>
+          let first := ordinary_array_pointer scope depth lhs
+          let second := ordinary_array_pointer scope depth rhs
+          if let some origin := first then
+            if operator == "-" && second.isSome && spelling == "long" && ordinary_decl rhs (type_spelling lhs) then
+              return origin.offset .difference false (← descend false lhs) (← descend false rhs)
+            if spelling == type_spelling lhs && (ordinary_type (type_spelling rhs)).any ordinary_promoted then
+              let op := if operator == "+" then Ordinary.PointerOp.add else .subtract
+              return origin.offset op false (← descend false lhs) (← descend false rhs)
+          if let some origin := second then
+            if operator == "+" && spelling == type_spelling rhs && (ordinary_type (type_spelling lhs)).any ordinary_promoted then
+              return origin.offset .reversedAdd false (← descend false lhs) (← descend false rhs)
           if ordinary_type spelling == some .pointer then
-            let element ← require (ordinary_type (ordinary_pointee spelling)) "unsupported ordinary pointer stride"
-            unless ordinary_decl lhs spelling && ["int", "unsigned long"].contains (type_spelling rhs) do
-              throw "ordinary pointer arithmetic requires a matching pointer and integer index"
-            return .offset (← descend false lhs) (← descend false rhs) element.width
+            let stride ← ordinary_pointer_stride records spelling
+            let mode ← if ordinary_decl lhs spelling && (ordinary_type (type_spelling rhs)).any ordinary_promoted then
+                pure (if operator == "+" then Ordinary.PointerOp.add else .subtract)
+              else if operator == "+" && ordinary_decl rhs spelling && (ordinary_type (type_spelling lhs)).any ordinary_promoted then
+                pure .reversedAdd
+              else throw "ordinary pointer arithmetic requires a matching pointer and integer"
+            return .offset (← descend false lhs) (← descend false rhs) stride mode
+          else if ordinary_type (type_spelling lhs) == some .pointer then
+            unless operator == "-" && spelling == "long" && ordinary_decl rhs (type_spelling lhs) do
+              throw "ordinary pointer difference requires matching pointer types and a signed long result"
+            let stride ← ordinary_pointer_stride records (type_spelling lhs)
+            return .offset (← descend false lhs) (← descend false rhs) stride .difference
           else
             let ty ← require (ordinary_type spelling) "unsupported ordinary arithmetic width"
-            unless [.integer, .unsignedInt, .size].contains ty && ordinary_decl lhs spelling && ordinary_decl rhs spelling do
-              throw "unsupported ordinary addition types"
-            return .scalar .add ty (← descend false lhs) (← descend false rhs)
+            unless ordinary_promoted ty && ordinary_decl lhs spelling && ordinary_decl rhs spelling do
+              throw "unsupported ordinary addition or subtraction types"
+            return .scalar (if operator == "+" then .add else .sub) ty (← descend false lhs) (← descend false rhs)
         | "||" | "&&" =>
           unless spelling == "int" && (ordinary_type (type_spelling lhs)).isSome &&
               (ordinary_type (type_spelling rhs)).isSome do throw "invalid ordinary logical operands"
           return .logic (field_text node "opcode" == "&&") (← descend false lhs) (← descend false rhs)
+        | "," =>
+          unless ordinary_decl rhs spelling do throw "invalid ordinary comma result type"
+          return .comma (← descend false lhs) (← descend false rhs)
         | "=" =>
           unless ordinary_decl lhs spelling && ordinary_decl rhs spelling do
             throw "ordinary assignment operand types differ"
-          if let some layout := records.find? (·.spelling == spelling) then
-            let source ← ordinary_record_source spelling depth rhs
-            return .copyRecord (← descend true lhs) (← descend true source) layout.width layout.alignment
-          else
-            let ty ← require (ordinary_type spelling) "unsupported ordinary assignment type"
-            return .assign (← ordinary_access records depth lhs ty) (← descend true lhs) (← descend false rhs)
+          let ty ← require (ordinary_value_type records spelling) "unsupported ordinary assignment type"
+          return .assign (← ordinary_access records depth lhs ty) (← descend true lhs) (← descend false rhs)
         | opcode =>
           let op ← require (ordinary_scalar opcode) "unsupported ordinary binary expression"
           let operand := type_spelling lhs
-          let ty ← require (ordinary_type operand) "unsupported ordinary arithmetic width"
+          let ty ← require (if (ordinary_array_pointer scope depth lhs).isSome then some .pointer else ordinary_type operand)
+            "unsupported ordinary arithmetic width"
           let result := if ordinary_comparison opcode then "int" else operand
           if ty == .pointer then
-            unless ["==", "!="].contains opcode && ordinary_decl rhs operand && spelling == "int" do
+            unless ordinary_comparison opcode && ordinary_decl rhs operand && spelling == "int" do
               throw "ordinary pointer comparison requires matching pointer types"
-            return .pointerCompare (opcode == "==") (← descend false lhs) (← descend false rhs)
-          unless [.integer, .unsignedInt, .size].contains ty && ordinary_decl rhs operand && spelling == result do
+            return .pointerCompare op (← descend false lhs) (← descend false rhs)
+          unless ordinary_promoted ty && ordinary_right_operand opcode operand rhs && spelling == result do
             throw "unsupported ordinary scalar operand or result type"
           return .scalar op ty (← descend false lhs) (← descend false rhs)
+      | "AtomicExpr", target :: operands => do
+        let name := field_text node "name"
+        let pointee := ordinary_pointee (type_spelling target)
+        let explicit := atomic_underlying pointee
+        unless explicit.isSome || name.startsWith "__atomic_" do throw "ordinary atomic operation requires an atomic object"
+        let plain := explicit.getD pointee
+        let aggregate := atomic_record records plain explicit.isSome
+        let ty ← require (ordinary_integer_type plain <|> ((data_pointee plain).map fun _ => .pointer) <|> aggregate)
+          "unsupported ordinary atomic object"
+        let address ← descend false target
+        let parseOrder := fun order => do
+          unless ordinary_decl order "int" do throw "invalid ordinary atomic order type"
+          descend false order
+        let parseValue := fun value => do
+          unless ordinary_decl value plain do throw "invalid ordinary atomic operand type"
+          descend false value
+        let plainPointer := fun arg => do
+          unless ordinary_pointee (type_spelling arg) == plain do throw "ordinary atomic transfer changed the object type"
+          descend false arg
+        match name, operands with
+        | "__atomic_load", [order, other] | "__atomic_store", [order, other] =>
+          unless spelling == "void" && aggregate.isSome do throw "unsupported ordinary indirect atomic transfer"
+          return .atomicTransfer (if name == "__atomic_load" then .load else .store) ty address
+            (.dimension (← parseOrder order) (.dimension (← plainPointer other) .emptyArguments))
+        | "__atomic_exchange", [order, source, output] =>
+          unless spelling == "void" && aggregate.isSome do throw "unsupported ordinary indirect atomic exchange"
+          return .atomicTransfer .exchange ty address (.dimension (← parseOrder order)
+            (.dimension (← plainPointer source) (.dimension (← plainPointer output) .emptyArguments)))
+        | "__atomic_compare_exchange", [successOrder, expected, failureOrder, desired, weak] =>
+          let [flag] := child_nodes weak | throw "invalid ordinary atomic weak flag"
+          unless spelling == "_Bool" && aggregate.isSome && field_text weak "kind" == "ImplicitCastExpr" &&
+            field_text weak "castKind" == "IntegralToBoolean" && ordinary_decl weak "_Bool" &&
+            (ordinary_integer_type (type_spelling flag)).isSome do throw "unsupported ordinary atomic compare-exchange"
+          return .compareWord ty address (← parseOrder successOrder) (← plainPointer expected)
+            (← parseOrder failureOrder) (.weakDesired (← descend false flag) (← plainPointer desired)) true
+        | "__c11_atomic_compare_exchange_weak", [successOrder, expected, failureOrder, desired]
+        | "__c11_atomic_compare_exchange_strong", [successOrder, expected, failureOrder, desired] =>
+          unless spelling == "_Bool" && ordinary_pointee (type_spelling expected) == plain do
+            throw "invalid ordinary compare-exchange expectation"
+          return .compareWord ty address (← parseOrder successOrder) (← descend false expected)
+            (← parseOrder failureOrder) (← parseValue desired)
+        | "__c11_atomic_load", [order] =>
+          unless spelling == plain do throw "invalid ordinary atomic load result"
+          return .atomic .load ty address (← parseOrder order) (.literal 0)
+        | "__c11_atomic_init", [value] =>
+          unless spelling == "void" do throw "invalid ordinary atomic init result"
+          return .atomic .initialise ty address (.literal 0) (← parseValue value)
+        | _, [order, value] =>
+          let op : Ordinary.AtomicOperation ← match name with
+            | "__c11_atomic_store" => pure .store
+            | "__c11_atomic_exchange" => pure (.fetch .exchange true)
+            | "__c11_atomic_fetch_add" => pure (.fetch .add true)
+            | "__c11_atomic_fetch_sub" => pure (.fetch .sub true)
+            | "__c11_atomic_fetch_and" => pure (.fetch .bitAnd true)
+            | "__c11_atomic_fetch_or" => pure (.fetch .bitOr true)
+            | "__c11_atomic_fetch_xor" => pure (.fetch .bitXor true)
+            | _ => throw ("unsupported ordinary atomic operation: " ++ name)
+          unless spelling == (if name == "__c11_atomic_store" then "void" else plain) do
+            throw "invalid ordinary atomic operation result"
+          if aggregate.isSome then
+            match op with
+            | .store | .fetch .exchange true => pure ()
+            | _ => throw "invalid ordinary aggregate atomic operation"
+          if ty == .pointer then
+            if let .fetch operation returnOld := op then
+              match operation with
+              | .add | .sub =>
+                unless (ordinary_integer_type (type_spelling value)).isSome do throw "ordinary atomic pointer step requires an integer"
+                let stride ← ordinary_pointer_stride records plain
+                return .atomic (.pointerStep operation stride returnOld) ty address (← parseOrder order) (← descend false value)
+              | .exchange => pure ()
+              | _ => throw "invalid ordinary atomic pointer operation"
+          return .atomic op ty address (← parseOrder order) (← parseValue value)
+        | _, _ => throw ("unsupported ordinary atomic operation: " ++ name)
+      | "VAArgExpr", [place] =>
+        unless ordinary_va_operand place do throw "ordinary va_arg requires a cursor"
+        let ty ← require (ordinary_value_type records spelling) "unsupported ordinary va_arg type"
+        return .vaArg ty (← descend false place)
       | "CallExpr", callee :: arguments =>
-        let (name, signature, ident) ← ordinary_callee callee
+        let direct := ordinary_callee callee
+        if direct.toOption.isNone then
+          if let [reference] := child_nodes callee then
+            if let some object := globals.find? (fun object => object.identities.contains (ordinary_ident reference)) then
+              if let some callback := object.callback then
+                unless field_text callee "kind" == "ImplicitCastExpr" && field_text callee "castKind" == "LValueToRValue" &&
+                    field_text reference "kind" == "DeclRefExpr" && (child_nodes reference).isEmpty &&
+                    type_spelling callee == object.spelling.replace "(*const)" "(*)" &&
+                    spelling == callback.result && arguments.isEmpty do throw "ordinary stored callback has an incompatible call"
+                let registry ← require symbols.head? "ordinary indirect call has no linked functions"
+                let address ← ordinary_address globals scope reference
+                return .indirect registry.functions (some .pointer) (.load .pointer address) .emptyArguments
+          let (result, args) ← require (function_prototype (type_spelling callee)) "unsupported ordinary indirect callee"
+          unless result == spelling && args.length == arguments.length do throw "ordinary indirect call signature changed"
+          let registry ← require symbols.head? "ordinary indirect call has no linked functions"
+          let target ← descend false callee
+          let values ← (args.zip arguments).mapM fun (expected, argument) => do
+            unless ordinary_argument argument expected do throw "ordinary indirect argument type changed"
+            let ty ← require (ordinary_type expected) "unsupported ordinary indirect argument type"
+            return (ty, ← descend false argument)
+          return .indirect registry.functions (ordinary_type result) target
+            (values.foldr (fun (ty, expr) tail => .argument ty expr tail) .emptyArguments)
+        let (name, signature, ident) ← direct
+        if let some expected := file_signature name then
+          let [reference] := child_nodes callee | throw "ordinary file call requires a declaration"
+          unless written_type (json_field reference "referencedDecl") == expected do throw "ordinary file declaration differs from stdio"
+        if let some expected := pthread_signature name then
+          let [reference] := child_nodes callee | throw "ordinary pthread call requires a declaration"
+          unless written_type (json_field reference "referencedDecl") == expected do
+            throw "ordinary pthread declaration has an incompatible signature"
+        if let some op := SyncOp.all.find? (·.name == name) then
+          unless spelling == "int" && arguments.length == (if op.binary then 2 else 1) do
+            throw "invalid ordinary pthread synchronisation prototype"
+          let checked ← arguments.mapM fun arg => do
+            unless ordinary_type (type_spelling arg) == some .pointer do throw "expected a pthread object pointer"
+            descend false arg
+          return .library (.synchronise op) (checked.foldr (.argument .pointer) .emptyArguments)
         match name, signature, spelling, arguments with
+        | "pthread_create", _, "int", [dst, attributes, worker, arg] =>
+          let expected := "int (" ++ written_type dst ++ "restrict, " ++ written_type attributes ++
+            "restrict, void *(*)(void *), void *restrict)"
+          let [attr] := child_nodes attributes | throw "ordinary thread attributes require null"
+          unless signature == expected && (written_type dst).endsWith " *" &&
+              field_text attributes "castKind" == "NullToPointer" && ordinary_zero depth attr &&
+              ordinary_decl arg "void *" && ordinary_decl worker "void *(*)(void *)" do
+            throw "ordinary pthread_create signature or attributes changed"
+          let (callback, spelling, identity) ← ordinary_callee worker
+          let target ← require (symbols.find? (·.name == callback)) "ordinary worker has no linked definition"
+          unless spelling == "void *(void *)" && target.spelling == spelling && target.declarations.contains identity do
+            throw "ordinary worker has an incompatible entry point"
+          return .spawn target.symbol (← descend false dst) (← descend false arg)
+        | "pthread_join", _, "int", [handle, dst] =>
+          unless signature == "int (" ++ written_type handle ++ ", void **)" &&
+              ordinary_type (type_spelling handle) == some .pointer && ordinary_decl dst "void **" do
+            throw "ordinary pthread_join signature changed"
+          return .join (← descend false handle) (← descend false dst)
+        | "pthread_self", _, _, [] =>
+          unless signature == written_type node ++ " (void)" && ordinary_type spelling == some .pointer do
+            throw "ordinary pthread_self signature changed"
+          return .self
+        | "pthread_equal", _, "int", [left, right] =>
+          unless signature == "int (" ++ written_type left ++ ", " ++ written_type right ++ ")" &&
+              ordinary_type (type_spelling left) == some .pointer && ordinary_type (type_spelling right) == some .pointer do
+            throw "ordinary pthread_equal signature changed"
+          return .equal (← descend false left) (← descend false right)
+        | "fopen", _, _, [path, mode] =>
+          unless signature == spelling ++ "(const char *, const char *)" && (data_pointee spelling).isSome &&
+              ordinary_decl path "const char *" && ordinary_decl mode "const char *" do throw "invalid ordinary fopen signature"
+          return .library .fopen (.argument .pointer (← descend false path) (.argument .pointer (← descend false mode) .emptyArguments))
+        | "fclose", _, "int", [handle] =>
+          unless signature == "int (" ++ written_type handle ++ ")" && ordinary_type (type_spelling handle) == some .pointer do
+            throw "invalid ordinary fclose signature"
+          return .library .fclose (.argument .pointer (← descend false handle) .emptyArguments)
+        | "fread", _, "unsigned long", [buffer, size, count, handle]
+        | "fwrite", _, "unsigned long", [buffer, size, count, handle] =>
+          let input := name == "fread"
+          let element := if input then "void *" else "const void *"
+          unless signature == "unsigned long (" ++ element ++ ", unsigned long, unsigned long, " ++ written_type handle ++ ")" &&
+              ordinary_decl buffer element && ordinary_decl size "unsigned long" && ordinary_decl count "unsigned long" &&
+              ordinary_type (type_spelling handle) == some .pointer do throw "invalid ordinary file transfer signature"
+          return .library (if input then .fread else .fwrite) (.argument .pointer (← descend false buffer)
+            (.argument .size (← descend false size) (.argument .size (← descend false count)
+            (.argument .pointer (← descend false handle) .emptyArguments))))
+        | "strlen", "unsigned long (const char *)", "unsigned long", [input] =>
+          unless ordinary_decl input "const char *" do throw "invalid ordinary strlen argument"
+          return .library .strlen (.argument .pointer (← descend false input) .emptyArguments)
+        | "strcmp", "int (const char *, const char *)", "int", [lhs, rhs] =>
+          unless ordinary_decl lhs "const char *" && ordinary_decl rhs "const char *" do
+            throw "invalid ordinary strcmp arguments"
+          return .library .strcmp (.argument .pointer (← descend false lhs) (.argument .pointer (← descend false rhs) .emptyArguments))
+        | "calloc", "void *(unsigned long, unsigned long)", "void *", [count, width] =>
+          unless ordinary_decl count "unsigned long" && ordinary_decl width "unsigned long" do throw "invalid ordinary calloc size"
+          return .library .calloc (.argument .size (← descend false count) (.argument .size (← descend false width) .emptyArguments))
+        | "memset", "void *(void *, int, unsigned long)", "void *", [dst, fill, count] =>
+          unless ordinary_decl dst "void *" && ordinary_decl fill "int" && ordinary_decl count "unsigned long" do
+            throw "invalid ordinary memset arguments"
+          return .library .memset (.argument .pointer (← descend false dst) (.argument .integer (← descend false fill)
+            (.argument .size (← descend false count) .emptyArguments)))
+        | "printf", "int (const char *, ...)", "int", pattern :: inputs =>
+          unless ordinary_decl pattern "const char *" do throw "invalid ordinary printf format type"
+          let format ← descend false pattern
+          let .string bytes := format | throw "ordinary printf requires a literal format"
+          let items ← require (Ordinary.format_items bytes) "unsupported ordinary printf conversion"
+          let consumed := items.filterMap fun item => match item with
+            | .byte _ => none | .conversion op .. => some op
+          unless consumed.length ≤ inputs.length do throw "ordinary printf is missing an argument"
+          let values ← inputs.mapM fun input => do
+            let ty ← require (ordinary_type (type_spelling input)) "unsupported ordinary printf argument type"
+            return (ty, ← descend false input)
+          unless (consumed.zip values).all (fun (op, arg) => match op with
+              | .string => arg.1 == .pointer
+              | .fixed .. => arg.1 == .binary64
+              | _ => arg.1 != .pointer && arg.1.component.isNone && !arg.1.floating) do
+            throw "ordinary printf conversion disagrees with its argument"
+          let arguments := values.foldr (fun (ty, expr) tail => .argument ty expr tail) Ordinary.Expression.emptyArguments
+          return .library .printf (.argument .pointer format arguments)
+        | "puts", "int (const char *)", "int", [input] =>
+          unless ordinary_decl input "const char *" do throw "invalid ordinary puts argument"
+          return .library .puts (.argument .pointer (← descend false input) .emptyArguments)
+        | "zhasvalidcap", _, "_Bool", [input] | "zis_readonly", _, "_Bool", [input] =>
+          let [reference] := child_nodes callee | throw "ordinary capability query requires a declaration"
+          unless written_type (json_field reference "referencedDecl") == "filc_bool (void *)" &&
+              ordinary_decl input "void *" do throw "invalid ordinary capability query"
+          return .library (if name == "zis_readonly" then .isReadonly else .hasCapability)
+            (.argument .pointer (← descend false input) .emptyArguments)
+        | "zgetlower", "void *(void *)", "void *", [input] | "zgetupper", "void *(void *)", "void *", [input] =>
+          unless ordinary_decl input "void *" do throw "invalid ordinary capability bound query"
+          return .library (if name == "zgetupper" then .upperBound else .lowerBound)
+            (.argument .pointer (← descend false input) .emptyArguments)
         | "malloc", "void *(unsigned long)", "void *", [size] =>
           unless ordinary_decl size "unsigned long" do throw "invalid ordinary allocation size"
           return .allocate (← descend false size)
+        | "memcpy", "void *(void *, const void *, unsigned long)", "void *", [dst, src, size]
         | "memmove", "void *(void *, const void *, unsigned long)", "void *", [dst, src, size] =>
           unless ordinary_decl dst "void *" && ordinary_decl src "const void *" &&
               ordinary_decl size "unsigned long" do throw "invalid ordinary copy arguments"
-          return .move (← descend false dst) (← descend false src) (← descend false size)
+          return .move (if name == "memcpy" then .memcpy else .memmove) (← descend false dst) (← descend false src) (← descend false size)
         | "putchar", "int (int)", "int", [value] =>
           unless ordinary_decl value "int" do throw "invalid ordinary output argument"
           return .put (← descend false value)
@@ -2162,76 +3211,110 @@ private def ordinary_expr (records : List Ordinary.RecordLayout) (symbols : List
         | "exit", "void (int) __attribute__((noreturn))", "void", [status] =>
           unless ordinary_decl status "int" do throw "invalid ordinary exit argument"
           return .exit (← descend false status)
+        | "__builtin_va_start", "<builtin fn type>", "void", [place, anchor] =>
+          let last ← require (scope.filter (·.kind == "ParmVarDecl")).getLast? "ordinary va_start has no named parameter"
+          unless ordinary_va_operand place && field_text anchor "kind" == "DeclRefExpr" &&
+              ordinary_ident anchor == last.ident do throw "ordinary va_start must use the last named parameter"
+          return .vaStart (← descend false place)
+        | "__builtin_va_copy", "<builtin fn type>", "void", [dst, src] =>
+          unless ordinary_va_operand dst && ordinary_va_operand src do throw "ordinary va_copy requires two cursors"
+          return .vaCopy (← descend false dst) (← descend false src)
+        | "__builtin_va_end", "<builtin fn type>", "void", [place] =>
+          unless ordinary_va_operand place do throw "ordinary va_end requires a cursor"
+          return .vaEnd (← descend false place)
+        | "zcan_va_arg", _, "_Bool", [place] =>
+          unless ordinary_va_operand place do throw "ordinary availability check requires a cursor"
+          return .vaAvailable (← descend false place)
+        | "zargs", "void *(void)", "void *", [] => return .argumentArea
         | _, _, _, _ =>
-          let target ← require (symbols.find? fun target => target.name == name) "unresolved ordinary direct call"
+          let target ← require (symbols.find? fun target => target.name == name) ("unresolved ordinary direct call: " ++ name)
           unless target.declarations.contains ident && signature == target.spelling && spelling == target.result &&
-              arguments.length == target.parameters.length do throw "ordinary call signature or arity changed"
+              (if target.variadic then target.parameters.length ≤ arguments.length
+               else arguments.length == target.parameters.length) do throw "ordinary call signature or arity changed"
           let parsed ← (target.parameters.zip arguments).mapM fun (parameter, argument) => do
-            unless ordinary_decl argument parameter.spelling do throw "ordinary call argument type changed"
-            let ty ← require parameter.storage.scalar_type "unsupported ordinary parameter value type"
+            unless ordinary_argument argument parameter.spelling do throw "ordinary call argument type changed"
+            let ty ← require parameter.storage.value_type "unsupported ordinary parameter value type"
             return (ty, ← descend false argument)
-          return .call target.symbol target.ty (parsed.foldr (fun (ty, expr) tail => .argument ty expr tail) .emptyArguments)
-      | _, _ => throw "unsupported ordinary expression"
+          let extra ← (arguments.drop target.parameters.length).mapM fun argument => do
+            let ty ← require (ordinary_value_type records (type_spelling argument)) "unsupported ordinary variadic argument type"
+            return (ty, ← descend false argument)
+          return .call target.symbol target.ty ((parsed ++ extra).foldr
+            (fun (ty, expr) tail => .argument ty expr tail) .emptyArguments)
+      | _, _ => throw ("unsupported ordinary expression: " ++ kind)
 
 private def ordinary_read_only : Ordinary.Expression → Bool
-  | .literal _ | .nullPointer | .slotAddress _ | .globalAddress _ | .emptyArguments => true
-  | .load _ operand | .cast _ operand | .field operand _ | .logicalNot operand => ordinary_read_only operand
-  | .offset left right _ | .logic _ left right | .pointerCompare _ left right | .scalar _ _ left right | .argument _ left right =>
+  | .floatingLiteral .. | .literal _ | .sizeLiteral _ | .nullPointer | .slotAddress _ | .arrayAddress _ | .globalAddress _
+  | .emptyArguments | .aliasSize _ | .argumentArea | .functionAddress .. => true
+  | .library .hasCapability args | .library .isReadonly args | .library .upperBound args | .library .lowerBound args
+  | .library .strlen args | .library .strcmp args => ordinary_read_only args
+  | .load _ operand | .cast _ operand | .truncateReal _ operand | .field operand _ | .logicalNot operand | .unary _ _ operand
+  | .arrayExtent _ operand | .arraySize _ _ operand | .vaAvailable operand =>
+    ordinary_read_only operand
+  | .offset left right _ _ | .logic _ left right | .pointerCompare _ left right | .scalar _ _ left right
+  | .argument _ left right | .comma left right | .dimension left right | .arrayOffset _ _ _ _ left right =>
     ordinary_read_only left && ordinary_read_only right
+  | .shared common fallback _ _ => ordinary_read_only common && ordinary_read_only fallback
+  | .conditional condition yes no => ordinary_read_only condition && ordinary_read_only yes && ordinary_read_only no
+  | _ => false
+
+private def ordinary_print_value : Ordinary.Expression → Bool
+  | .string _ | .library .isReadonly (.argument .pointer (.string _) .emptyArguments) => true
+  | .cast _ value => ordinary_print_value value
+  | .conditional test yes no => ordinary_read_only test && ordinary_print_value yes && ordinary_print_value no
+  | expr => ordinary_read_only expr
+
+private def ordinary_print_arguments : Ordinary.Expression → Bool
+  | .argument _ value rest => ordinary_print_value value && ordinary_print_arguments rest
+  | .emptyArguments => true
   | _ => false
 
 private def ordinary_root_effect : Ordinary.Expression → Bool
-  | .allocate size | .put size | .release size | .exit size | .call _ _ size => ordinary_read_only size
-  | .assign _ place value => ordinary_read_only place && ordinary_read_only value
-  | .copyRecord destination source _ _ => ordinary_read_only destination && ordinary_read_only source
-  | .move dst src count => ordinary_read_only dst && ordinary_read_only src && ordinary_read_only count
+  | .compound _ _ writes => ordinary_root_effect writes
+  | .compoundStore _ _ _ value rest => ordinary_root_effect value && ordinary_root_effect rest
+  | .compoundEnd _ => true
+  | .self | .string _ => true
+  | .library (.synchronise _) args => ordinary_read_only args
+  | .atomicTransfer _ _ target args => ordinary_read_only target && ordinary_read_only args
+  | .weakDesired weak desired => ordinary_read_only weak && ordinary_read_only desired
+  | .compareWord _ target successOrder expected failureOrder desired _ =>
+    ordinary_read_only target && ordinary_read_only successOrder && ordinary_read_only expected &&
+    ordinary_read_only failureOrder && ordinary_root_effect desired
+  | .atomic _ _ target order value => ordinary_read_only target && ordinary_read_only order && ordinary_root_effect value
+  | .indirect _ _ callee args => ordinary_read_only callee && ordinary_read_only args
+  | .library .printf (.argument .pointer (.string _) rest) => ordinary_root_effect rest
+  | .library .strcmp args | .library .strlen args | .library .isReadonly args => ordinary_print_arguments args
+  | .argument _ value rest => ordinary_root_effect value && ordinary_root_effect rest
+  | .library .puts (.argument .pointer (.string _) .emptyArguments) => true
+  | .library .fopen args | .library .fread args | .library .fwrite args | .library .fclose args => ordinary_root_effect args
+  | .library _ args => ordinary_read_only args
+  | .scalar _ _ left right | .pointerCompare _ left right => ordinary_root_effect left && ordinary_root_effect right
+  | .spawn _ left right | .join left right | .equal left right => ordinary_read_only left && ordinary_read_only right
+  | .call _ _ args => ordinary_root_effect args
+  | .allocate size | .put size | .release size | .exit size => ordinary_read_only size
+  | .assign _ place value | .offset place value _ _ => ordinary_root_effect place && ordinary_root_effect value
+  | .update _ _ _ _ place value _ => ordinary_root_effect place && ordinary_root_effect value
+  | .arrayUpdate _ _ _ _ place value => ordinary_read_only place && ordinary_read_only value
+  | .vaStart place | .vaArg _ place | .vaEnd place => ordinary_read_only place
+  | .vaCopy destination source => ordinary_read_only destination && ordinary_read_only source
+  | .shared common fallback _ _ => ordinary_root_effect common && ordinary_root_effect fallback
+  | .conditional condition yes no =>
+    ordinary_root_effect condition && ordinary_root_effect yes && ordinary_root_effect no
+  | .comma left right | .logic _ left right | .dimension left right =>
+    ordinary_root_effect left && ordinary_root_effect right
+  | .arrayExtent _ bounds => ordinary_root_effect bounds
+  | .arraySize _ _ place | .cast _ place | .truncateReal _ place | .load _ place | .field place _
+  | .materialise _ place | .unary _ _ place | .logicalNot place => ordinary_root_effect place
+  | .move _ dst src count => ordinary_read_only dst && ordinary_read_only src && ordinary_read_only count
   | expression => ordinary_read_only expression
 
-private def ordinary_array_stores (element : String) (count : Nat) (ty : Ordinary.TypeCode)
-    (initializer : Json) (parse : Json → Except String Ordinary.Expression) : Except String (List Ordinary.Initialiser) := do
-  unless field_text initializer "kind" == "InitListExpr" do
-    throw "ordinary array initialiser requires an initialiser list"
-  let values := child_nodes initializer
-  let values := if values.isEmpty then ((json_field initializer "array_filler").getArr?.toOption.getD #[]).toList.drop 1
-    else values
-  unless values.length ≤ count do
-    throw "ordinary array initialiser extent does not match its elements"
-  let stores ← values.zipIdx.mapM fun (node, index) => do
-    unless ordinary_decl node element do throw "ordinary array initialiser element has the wrong type"
-    if field_text node "kind" == "ImplicitValueInitExpr" then pure none
-    else pure (some (⟨some (index * ty.width), ty, ← parse node⟩ : Ordinary.Initialiser))
-  return stores.filterMap id
-
-private def ordinary_stores (storage : OrdinaryStorage) (initializer : Json)
-    (parse : Json → Except String Ordinary.Expression) : Except String (List Ordinary.Initialiser) :=
-  match storage with
-  | .scalar ty => do pure [⟨none, ty, ← parse initializer⟩]
-  | .array element ty count => ordinary_array_stores element count ty initializer parse
-  | .record layout => do
-    unless field_text initializer "kind" == "InitListExpr" do
-      throw "ordinary record initialiser requires an initialiser list"
-    let values := child_nodes initializer
-    let fields ← if !layout.isUnion then pure layout.fields else do
-      let selected := field_text (json_field initializer "field") "id"
-      let member ← require (if selected.isEmpty then layout.fields.head? else
-        layout.fields.find? (·.spec.identity == selected)) "unknown ordinary union initialiser member"
-      pure [member]
-    unless values.length ≤ fields.length do
-      throw "ordinary record initialiser does not cover its fields"
-    let stores ← (fields.zip values).mapM fun (member, node) => do
-      unless ordinary_decl node member.spec.spelling do throw "ordinary record initialiser changed a field type"
-      if field_text node "kind" == "ImplicitValueInitExpr" then pure none
-      else pure (some (⟨some member.offset, member.access, ← parse node⟩ : Ordinary.Initialiser))
-    return stores.filterMap id
-
-private def ordinary_return (records : List Ordinary.RecordLayout) (symbols : List OrdinarySignature)
+private def ordinary_return (arithmetic : Option ClosedProgram) (records : List Ordinary.RecordLayout) (symbols : List OrdinarySignature)
     (globals : List OrdinaryObject) (result : String)
     (scope : List OrdinaryLocal) (budget : Nat) (node : Json) : Except String Ordinary.Expression := do
   let [value] := child_nodes node | throw "missing ordinary return expression"
   unless field_text node "kind" == "ReturnStmt" && ordinary_decl value result do
     throw "ordinary return differs from the function result type"
   let expression ← ordinary_expr records symbols globals scope budget false value
-  unless ordinary_root_effect expression do throw "nested ordinary return effects require a sequencing proof"
+  unless arithmetic.isSome || ordinary_root_effect expression do throw "nested ordinary return effects require a sequencing proof"
   return expression
 
 private def ordinary_case_bound : Nat → Json → Except String Int
@@ -2244,9 +3327,17 @@ private def ordinary_case_bound : Nat → Json → Except String Int
       unless value < 2147483648 do throw "ordinary case bound exceeds int"
       return value
     | "ConstantExpr", [child] | "ParenExpr", [child] => ordinary_case_bound budget child
-    | _, _ => throw "ordinary case bound must be an integer literal"
+    | "UnaryOperator", [operand] =>
+      let value ← ordinary_case_bound budget operand
+      match field_text node "opcode" with
+      | "+" => return value
+      | "-" =>
+        unless value != -2147483648 do throw "ordinary case negation exceeds int"
+        return -value
+      | _ => throw "unsupported ordinary case operator"
+    | _, _ => throw "ordinary case bound must be an integer constant"
 
-private def ordinary_label_choice (guard : Json → Except String Ordinary.Expression) :
+private def ordinary_label_choice (registry : List String) (guard : Json → Except String Ordinary.Expression) :
     Nat → Json → Except String Ordinary.LabelChoice
   | 0, _ => .error "ordinary label choice exceeds the frontend budget"
   | depth + 1, node => do
@@ -2257,80 +3348,441 @@ private def ordinary_label_choice (guard : Json → Except String Ordinary.Expre
       let identity := field_text node "labelDeclId"
       unless !identity.isEmpty do throw "ordinary label address has no identity"
       return .address identity
-    | "ParenExpr", [child] => ordinary_label_choice guard depth child
+    | "ParenExpr", [child] => ordinary_label_choice registry guard depth child
     | "ImplicitCastExpr", [child] =>
+      if field_text node "castKind" == "LValueToRValue" then return .loaded (← guard node) registry []
       unless field_text node "castKind" == "NoOp" do throw "ordinary label pointer conversion changed representation"
-      ordinary_label_choice guard depth child
+      ordinary_label_choice registry guard depth child
     | "ConditionalOperator", [test, yes, no] =>
-      return .conditional (← guard test) (← ordinary_label_choice guard depth yes) (← ordinary_label_choice guard depth no)
+      return .conditional (← guard test) (← ordinary_label_choice registry guard depth yes) (← ordinary_label_choice registry guard depth no)
     | _, _ => throw "ordinary computed goto requires explicit label choices"
 
-private def ordinary_statement (records : List Ordinary.RecordLayout) (symbols : List OrdinarySignature)
+private def ordinary_probe (node : Json) : Option (Nat × Json) := do
+  guard (field_text node "kind" == "DeclStmt")
+  let [probe] := child_nodes node | none
+  let name := field_text probe "name"
+  let stem := "__heresy_vla_"
+  guard (field_text probe "kind" == "TypedefDecl" && name.startsWith stem)
+  let offset :: order :: suffix := (name.drop stem.length).splitOn "_" | none
+  let index ← order.toNat?
+  guard (offset.toNat?.isSome && suffix.all (· == ""))
+  return (index, probe)
+
+private def local_array_order : Nat := 4611686018427387903
+
+private def ordinary_captured_bounds (element : String) : Nat → List String → Json →
+    Except String (List (Sum Nat Json))
+  | 0, _, _ => .error "ordinary array probe exceeds the frontend budget"
+  | depth + 1, dimensions, node => do
+    unless ordinary_decl node (element ++ dimension_suffix dimensions) do
+      throw "ordinary array probe changed its element or dimensions"
+    match dimensions, field_text node "kind", child_nodes node with
+    | [], _, _ => return []
+    | _ :: _, "ParenType", [inner] => ordinary_captured_bounds element depth dimensions inner
+    | _ :: tail, "VariableArrayType", [inner, bound] =>
+      return .inr bound :: (← ordinary_captured_bounds element depth tail inner)
+    | expected :: tail, "ConstantArrayType", [inner] =>
+      let size ← (json_field node "size").getNat?
+      unless expected.toNat? == some size do throw "ordinary array probe changed a fixed dimension"
+      return .inl size :: (← ordinary_captured_bounds element depth tail inner)
+    | _, _, _ => throw "unsupported ordinary array probe"
+
+private def ordinary_bound_list (bounds : List (Sum Nat Json))
+    (parse : Json → Except String Ordinary.Expression) : Except String Ordinary.Expression := do
+  let expressions ← bounds.mapM fun bound => match bound with
+    | .inl fixed => pure (.literal (Int.ofNat fixed))
+    | .inr node => do
+      unless (ordinary_type (type_spelling node)).any (· != .pointer) do
+        throw "ordinary captured bound is not an integer"
+      parse node
+  return expressions.foldr .dimension .emptyArguments
+
+private def ordinary_type_tree : Nat → Json → Except String Json
+  | 0, _ => .error "ordinary type wrapper exceeds the frontend budget"
+  | depth + 1, node =>
+    match field_text node "kind", child_nodes node with
+    | "TypeOfType", [child] | "ParenType", [child] => ordinary_type_tree depth child
+    | _, _ => .ok node
+
+private def ordinary_pointer_probe (budget : Nat) (spelling : String) (probe : Json) :
+    Except String OrdinaryPointerShape := do
+  let [wrapper] := child_nodes probe | throw "ordinary pointer probe lacks a typed declaration"
+  unless field_text wrapper "kind" == "TypeOfType" do
+    throw "invalid or repeated ordinary pointer probe"
+  let raw ← ordinary_type_tree budget wrapper
+  let (array, skip) ← if field_text raw "kind" == "PointerType" then do
+      let [pointee] := child_nodes raw | throw "ordinary pointer probe lacks a pointee"
+      pure ((← ordinary_type_tree budget pointee), 0)
+    else pure (raw, 1)
+  let (element, dimensions) ← ordinary_shape_parts (type_spelling array)
+  let ty ← require (ordinary_type element) "unsupported ordinary parameter array element"
+  let shape : OrdinaryShape := ⟨element, ty.width, dimensions.drop skip⟩
+  unless !dimensions.isEmpty && ordinary_type spelling == some .pointer &&
+      shape.pointer_type 0 == spelling do
+    throw "ordinary pointer probe changed its adjusted pointer type"
+  let bounds ← ordinary_captured_bounds element budget dimensions array
+  let identity := field_text probe "id"
+  unless !identity.isEmpty do throw "ordinary pointer probe lacks an identity"
+  let captured := if skip == 0 || dimensions.any (fun bound => bound.toNat?.isNone) then some bounds else none
+  return ⟨identity, shape, skip, captured⟩
+
+private def ordinary_array_local (probe statement : Json) (budget slot : Nat) (scope : List OrdinaryLocal)
+    (parse : Json → Except String Ordinary.Expression) : Except String (OrdinaryLocal × Ordinary.Statement) := do
+  let [declaration] := child_nodes statement | throw "ordinary array probe must precede a single declaration"
+  let ident := field_text declaration "id"
+  let name := field_text declaration "name"
+  let spelling := type_spelling declaration
+  unless field_text statement "kind" == "DeclStmt" && field_text declaration "kind" == "VarDecl" &&
+      field_text declaration "storageClass" == "" &&
+      ordinary_name name && !ident.isEmpty && !(scope.any (·.ident == ident)) do
+    throw "ordinary array probe has no matching automatic declaration"
+  if (array_pointer_parts spelling).isSome then
+    let captured ← ordinary_pointer_probe budget spelling probe
+    let bounds ← require captured.bounds "ordinary array pointer lacks a captured bound"
+    unless captured.skip == 0 do throw "ordinary local pointer probe adjusted an array parameter"
+    let initializer ← match child_nodes declaration with
+      | [] => pure none
+      | [value] => do
+        unless ordinary_decl value spelling do throw "ordinary array pointer initialiser changed its type"
+        some <$> parse value
+      | _ => throw "ordinary array pointer has multiple initialisers"
+    let expressions ← ordinary_bound_list bounds parse
+    return (⟨ident, name, spelling, .scalar .pointer, "VarDecl", slot, some captured⟩,
+      .initialiseArrayPointer slot captured.shape.width expressions initializer)
+  unless (child_nodes declaration).isEmpty do throw "ordinary automatic array has an initialiser"
+  let (element, dimensions) ← ordinary_shape_parts spelling
+  let ty ← require (ordinary_type element) "unsupported ordinary array element"
+  unless dimensions.any (fun bound => bound.toNat?.isNone) && spelling == element ++ dimension_suffix dimensions do
+    throw "ordinary captured array requires a variable dimension"
+  let [wrapper] := child_nodes probe | throw "ordinary array probe lacks a typed declaration"
+  let [declared] := child_nodes wrapper | throw "ordinary array probe lacks an array type"
+  unless field_text wrapper "kind" == "TypeOfType" do throw "invalid ordinary array probe wrapper"
+  let bounds ← ordinary_captured_bounds element budget dimensions declared
+  let shape : OrdinaryShape := ⟨element, ty.width, dimensions⟩
+  return (⟨ident, name, spelling, .dynamicArray shape, "VarDecl", slot, none⟩,
+    .declareArray slot ty.width (← ordinary_bound_list bounds parse))
+
+private def effect_diagnostic (message : String) (node : Json) : String :=
+  let start := json_field (json_field node "range") "begin"
+  let offset := (json_field start "offset").getNat?.toOption
+  message ++ " in " ++ field_text node "kind" ++ (offset.map fun n => " at byte " ++ toString n).getD ""
+
+private def ordinary_literals (records : List Ordinary.RecordLayout) (budget slot : Nat) (node : Json) :
+    Except String (List OrdinaryLocal) := do
+  let nodes ← startup_nodes budget node
+  (nodes.filter (fun node => field_text node "kind" == "CompoundLiteralExpr")).zipIdx.mapM fun (node, index) => do
+    let id := field_text node "id"
+    let name := type_spelling node
+    let shape ← require (ordinary_storage records name) ("unsupported ordinary compound literal type: " ++ name)
+    unless !id.isEmpty && shape.frame_width.isSome && shape.width ≤ 9223372036854775792 do
+      throw "invalid ordinary compound literal storage"
+    return (⟨id, "", name, shape, "CompoundLiteralExpr", slot + index, none⟩ : OrdinaryLocal)
+
+private inductive AssemblyToken where
+  | atom (name : String)
+  | literal (value : String)
+  deriving BEq
+
+private def assembly_tokens (source : String) : Option (List AssemblyToken) := do
+  let rec quoted : List Char → List Char → Option (String × List Char)
+    | [], _ => none
+    | '"' :: rest, acc => some (String.mk ('"' :: acc).reverse, rest)
+    | '\\' :: c :: rest, acc => quoted rest (c :: '\\' :: acc)
+    | c :: rest, acc => quoted rest (c :: acc)
+  let word := fun c : Char => c.isAlphanum || c == '_'
+  let rec scan : Nat → List Char → Option (List AssemblyToken)
+    | _, [] => some []
+    | 0, _ => none
+    | fuel + 1, '"' :: rest => do
+      let (raw, tail) ← quoted rest ['"']
+      let bytes ← (string_payload (Json.mkObj [("value", .str raw)])).toOption
+      let spelling ← String.fromUTF8? ⟨bytes.toArray⟩
+      return .literal spelling :: (← scan fuel tail)
+    | fuel + 1, c :: rest => do
+      if c.isWhitespace then return ← scan fuel rest
+      if word c then
+        let name := rest.takeWhile word
+        return .atom (String.mk (c :: name)) :: (← scan fuel (rest.drop name.length))
+      guard (!['/', '\'', '\\'].contains c)
+      return .atom (String.singleton c) :: (← scan fuel rest)
+  scan (source.length + 1) source.toList
+
+private abbrev AssemblyOperand := Option String × String
+
+private def assembly_section (tokens : List AssemblyToken) : Option (List AssemblyOperand × List AssemblyToken) := do
+  let rec balance : Nat → List AssemblyToken → Option (List AssemblyToken)
+    | _, [] => none
+    | 0, .atom ")" :: rest => some rest
+    | depth + 1, .atom ")" :: rest => balance depth rest
+    | depth, .atom "(" :: rest => balance (depth + 1) rest
+    | depth, _ :: rest => balance depth rest
+  let rec entries : Nat → List AssemblyToken → Option (List AssemblyOperand × List AssemblyToken)
+    | 0, _ => none
+    | fuel + 1, tokens => do
+      let (name, tokens) := match tokens with
+        | .atom "[" :: .atom name :: .atom "]" :: rest => (some name, rest)
+        | other => (none, other)
+      let .literal constraint :: .atom "(" :: rest := tokens | none
+      let tail ← balance 0 rest
+      if let .atom "," :: more := tail then
+        let (others, tail) ← entries fuel more
+        return ((name, constraint) :: others, tail)
+      return ([(name, constraint)], tail)
+  match tokens with
+  | .atom ":" :: rest =>
+    if rest.head? == some (.atom ":") || rest.head? == some (.atom ")") then return ([], rest)
+    entries (rest.length + 1) rest
+  | _ => return ([], tokens)
+
+private def assembly_syntax (raw : String) : Option (List String × List AssemblyOperand × List AssemblyOperand) := do
+  let .atom keyword :: prefixTokens ← assembly_tokens raw | none
+  guard (["asm", "__asm", "__asm__"].contains keyword)
+  let .atom "(" :: body := prefixTokens.dropWhile (fun t => match t with
+    | .atom q => ["volatile", "__volatile", "__volatile__", "inline", "__inline", "__inline__"].contains q
+    | _ => false) | none
+  let quoted := body.takeWhile (fun t => match t with | .literal _ => true | _ => false)
+  guard (!quoted.isEmpty)
+  let template := String.join (quoted.filterMap (fun t => match t with | .literal s => some s | _ => none))
+  let (outputs, rest) ← assembly_section (body.drop quoted.length)
+  let (inputs, rest) ← assembly_section rest
+  let rec clobbers : List AssemblyToken → Bool
+    | [.atom ")"] => true
+    | [.literal c, .atom ")"] => ["memory", "cc"].contains c
+    | .literal c :: .atom "," :: more => ["memory", "cc"].contains c && clobbers more
+    | _ => false
+  guard (rest == [.atom ")"] || (rest.head? == some (.atom ":") && clobbers rest.tail!))
+  let instructions := ((template.replace "\r" "\n").replace ";" "\n").splitOn "\n"
+  return (instructions.map String.trim, outputs, inputs)
+
+private def assembly_instruction (operands : List AssemblyOperand) (types : List Ordinary.TypeCode)
+    (registers : List Nat) (count : Nat) (line : String) : Option (Option Ordinary.RegisterInstruction) := do
+  if ["", "nop", "pause", "lfence", "sfence", "mfence"].contains line then return none
+  let flag : Option Ordinary.RegisterOp := match line with
+    | "stc" => some .stc | "clc" => some .clc | "cmc" => some .cmc | _ => none
+  if let some op := flag then return some ⟨op, 0, 0, .inr 0⟩
+  let mnemonic := String.mk (line.toList.takeWhile (!·.isWhitespace))
+  let args := ((line.drop mnemonic.length).splitOn ",").map String.trim
+  let (width, name) ← if ["setc", "setb", "setnae"].contains mnemonic then some (8, "setc") else do
+    let w ← match mnemonic.toList.getLast? with
+      | some 'b' => some 8 | some 'w' => some 16 | some 'l' => some 32 | some 'q' => some 64 | _ => none
+    pure (w, mnemonic.dropRight 1)
+  let resolve := fun (raw : String) => do
+    guard (raw.startsWith "%")
+    let key := raw.drop 1
+    if key.startsWith "[" && key.endsWith "]" then
+      let name := (key.drop 1).dropRight 1
+      operands.findIdx? (fun spec => spec.1 == some name)
+    else key.toNat?
+  let widthAt := fun index => do
+    let ty ← types[index]?
+    guard (ty != .pointer && ty.width * 8 == width)
+  let (dst, op, src) ← match args with
+    | [destination] => do
+      let op ← match name with
+        | "inc" => some .inc | "dec" => some .dec | "neg" => some .neg
+        | "not" => some .inv | "setc" => some .setc | _ => none
+      pure (← resolve destination, op, .inr (0 : Int))
+    | [source, destination] => do
+      let op : Ordinary.RegisterOp ← match name with
+        | "mov" => some .mov | "add" => some .add | "sub" => some .sub | "adc" => some .adc
+        | "sbb" => some .sbb | "cmp" => some .cmp | "and" => some .band | "or" => some .bor
+        | "xor" => some .bxor | "sal" | "shl" => some .shl | "shr" => some .shr | "sar" => some .sar
+        | "rol" => some .rol | "ror" => some .ror | _ => none
+      let counted := [.shl, .shr, .sar, .rol, .ror].contains op
+      let src ← if source.startsWith "$%" then do
+          let key ← resolve (source.drop 1)
+          let (_, constraint) ← operands[key]?
+          guard (key ≥ count && ["i", "n"].contains constraint)
+          pure (.inl (← registers[key]?))
+        else if source.startsWith "$" then do
+          let n ← (source.drop 1).toInt?
+          let bits := min width 32
+          guard (if counted then -128 ≤ n && n ≤ 255 else
+            -(2 ^ (bits - 1) : Int) ≤ n && n < 2 ^ (if width == 64 then bits - 1 else bits))
+          pure (.inr n)
+        else do
+          let key ← resolve source
+          widthAt key
+          let (_, constraint) ← operands[key]?
+          guard (!counted && !["i", "n"].contains constraint)
+          pure (.inl (← registers[key]?))
+      pure (← resolve destination, op, src)
+    | _ => none
+  widthAt dst
+  let target ← registers[dst]?
+  guard (target < count || op == .cmp)
+  return some ⟨op, width, target, src⟩
+
+private def ordinary_assembly (raw : String) (children : List Json)
+    (decode : Bool → Json → Except String Ordinary.Expression) : Except String Ordinary.Statement := do
+  let (lines, outputs, inputs) ← require (assembly_syntax raw) "invalid ordinary assembly template or constraints"
+  let operands := outputs ++ inputs
+  let names := operands.filterMap Prod.fst
+  unless operands.length == children.length && decide names.Nodup do throw "ordinary assembly operand list differs"
+  let types ← children.mapM fun child =>
+    let spelling := type_spelling child
+    require ((ordinary_integer_type spelling).orElse (fun _ => do
+      guard ((ordinary_type spelling) == some .pointer)
+      return .pointer)) "ordinary assembly requires integer or pointer operands"
+  let results ← outputs.zipIdx.mapM fun ((_, constraint), key) => do
+    unless ["+r", "+&r", "=r", "=&r"].contains constraint do throw "invalid ordinary assembly output"
+    let ty ← require types[key]? "missing assembly output"
+    return (ty, constraint.startsWith "+")
+  let arguments ← inputs.zipIdx.mapM fun ((_, constraint), key) => do
+    if ["r", "n", "i"].contains constraint then return outputs.length + key
+    let tied ← require (if constraint.startsWith "[" && constraint.endsWith "]" then
+      outputs.findIdx? (fun spec => spec.1 == some ((constraint.drop 1).dropRight 1)) else constraint.toNat?)
+      "invalid ordinary assembly input constraint"
+    unless tied < outputs.length && types[tied]? == types[outputs.length + key]? do
+      throw "ordinary assembly tied operands differ"
+    return tied
+  let registers := List.range outputs.length ++ arguments
+  let ops ← lines.mapM fun line => require (assembly_instruction operands types registers outputs.length line)
+    ("unsupported ordinary assembly instruction: " ++ line)
+  let values ← children.zipIdx.mapM fun (child, index) => do
+    let expr ← decode (index < outputs.length) child
+    unless ordinary_root_effect expr do throw "unsequenced assembly operand"
+    return expr
+  unless values.length ≤ 1 || values.all ordinary_read_only do throw "unsequenced assembly operands"
+  return .assembly ⟨results, arguments, ops.reduceOption⟩ (values.foldr .dimension .emptyArguments)
+
+private def ordinary_statement (arithmetic : Option ClosedProgram) (records : List Ordinary.RecordLayout) (symbols : List OrdinarySignature)
     (globals : List OrdinaryObject) (result : String) :
     Nat → Bool → Bool → List OrdinaryLocal → Nat → Json → Except String (List OrdinaryLocal × Ordinary.Statement)
   | 0, _, _, _, _, _ => .error "ordinary statement nesting exceeds the frontend budget"
   | budget + 1, inLoop, inSwitch, scope, slot, node => do
-    let decode := ordinary_statement records symbols globals result budget
+    let decode := ordinary_statement arithmetic records symbols globals result budget
     let descend := decode inLoop inSwitch scope
     let expression := fun scope message node => do
       let value ← ordinary_expr records symbols globals scope (budget + 1) false node
-      unless ordinary_root_effect value do throw message
+      unless arithmetic.isSome || ordinary_root_effect value do throw (effect_diagnostic message node)
       return value
     let guard := fun scope node => do
-      unless ordinary_decl node "int" do throw "ordinary guard must be an int"
+      unless (ordinary_type (type_spelling node)).isSome do throw "ordinary guard must be scalar"
       let value ← ordinary_expr records symbols globals scope (budget + 1) false node
-      unless ordinary_read_only value do throw "ordinary guard may only read state"
+      unless arithmetic.isSome || ordinary_root_effect value do throw (effect_diagnostic "nested ordinary guard effects require a sequencing proof" node)
       return value
     match field_text node "kind", child_nodes node with
+    | "GCCAsmStmt", operands =>
+      let literals ← ordinary_literals records (budget + 1) slot node
+      let decode := ordinary_expr records symbols globals (scope ++ literals) (budget + 1)
+      return (literals, ← ordinary_assembly (field_text node "heresyAssembly") operands decode)
     | "CompoundStmt", children =>
-      let (locals, _, reversed) ← children.foldlM (fun (locals, visible, reversed) child => do
-        let (newLocals, statement) ← decode inLoop inSwitch visible (slot + locals.length) child
-        let visible := if field_text child "kind" == "DeclStmt" then visible ++ newLocals else visible
-        return (locals ++ newLocals, visible, statement :: reversed)) ([], scope, [])
+      let (locals, _, reversed, pending) ← children.foldlM (fun (locals, visible, reversed, pending) child => do
+        let next := slot + locals.length
+        if let some probe := pending then
+          let parse := expression visible "nested ordinary array bound effects require a sequencing proof"
+          let (binding, statement) ← ordinary_array_local probe child (budget + 1) next visible parse
+          return (locals ++ [binding], visible ++ [binding], statement :: reversed, none)
+        else if let some (index, probe) := ordinary_probe child then
+          if index == local_array_order then
+            return (locals, visible, .arrayProbe :: reversed, some probe)
+          else
+            unless scope.any (fun binding => binding.kind == "ParmVarDecl" && binding.slot == index &&
+                binding.pointerShape.any (·.probe == field_text probe "id")) do
+              throw "ordinary parameter probe is outside its function"
+            return (locals, visible, .arrayProbe :: reversed, none)
+        else
+          let (newLocals, statement) ← decode inLoop inSwitch visible next child
+          let visible := if field_text child "kind" == "DeclStmt" then visible ++ newLocals else visible
+          return (locals ++ newLocals, visible, statement :: reversed, none)) ([], scope, [], none)
+      unless pending.isNone do throw "ordinary array probe has no declaration"
       return (locals, .block (reversed.foldl (fun rest stmt => .sequence stmt rest) .empty))
+    | "DeclStmt", declarations@(_ :: _ :: _) =>
+      let (locals, actions) ← declarations.foldlM (fun (locals, actions) declaration => do
+        let inner := Json.mkObj [("kind", .str "DeclStmt"), ("inner", .arr #[declaration])]
+        let (bound, action) ← decode inLoop inSwitch (scope ++ locals) (slot + locals.length) inner
+        return (locals ++ bound, action :: actions)) ([], [])
+      return (locals, .declarations (actions.foldl (fun rest action => .sequence action rest) .empty))
     | "DeclStmt", [declaration] =>
+      if field_text declaration "kind" == "EnumDecl" then return ([], .arrayProbe)
+      if field_text declaration "kind" == "RecordDecl" then
+        let tag := field_text declaration "tagUsed" ++ " " ++ field_text declaration "name"
+        unless records.any (·.spelling == tag) do throw ("unsupported ordinary block-scope record: " ++ tag)
+        return ([], .arrayProbe)
       let name := field_text declaration "name"
       let ident := field_text declaration "id"
       let spelling := type_spelling declaration
-      let [initializer] := child_nodes declaration | throw "ordinary local requires an initializer"
-      let storage ← require (ordinary_storage records spelling) "unsupported ordinary local type"
-      let width := storage.width
-      unless field_text declaration "kind" == "VarDecl" && field_text declaration "storageClass" == "" &&
-          ordinary_name name && !ident.isEmpty && !(scope.any (fun value => value.ident == ident)) &&
-          ordinary_decl initializer spelling do
+      unless ordinary_name name && !ident.isEmpty && !(scope.any (fun value => value.ident == ident)) do
+        throw "invalid ordinary declaration identity"
+      if field_text declaration "kind" == "VarDecl" && field_text declaration "storageClass" == "static" then
+        unless globals.any (fun object => object.owner.isSome && object.identities == [ident] &&
+            object.definition == declaration) do throw "unknown ordinary block-scope static"
+        return ([], .arrayProbe)
+      if field_text declaration "kind" == "TypedefDecl" then
+        if records.any (·.spelling == spelling) || (ordinary_integer_type spelling).isSome ||
+            (array_pointer_parts spelling).any (fun (element, bounds) => (fixed_dimensions (element ++ bounds)).isSome) ||
+            (fixed_dimensions spelling).any (fun (base, _) => (ordinary_integer_type base).isSome) then
+          return ([], .arrayProbe)
+        let (element, dimensions) ← ordinary_shape_parts spelling
+        let ty ← require (ordinary_type element) "unsupported ordinary array alias element"
+        unless dimensions.any (fun bound => bound.toNat?.isNone) do
+          throw "ordinary local typedef requires a variable-length array shape"
+        let [type] := child_nodes declaration | throw "ordinary array alias lacks a type"
+        let bounds ← ordinary_captured_bounds element (budget + 1) dimensions type
+        let parse := expression scope "nested ordinary array bound effects require a sequencing proof"
+        let captured ← ordinary_bound_list bounds parse
+        let shape : OrdinaryShape := ⟨element, ty.width, dimensions⟩
+        return ([⟨ident, name, spelling, .dynamicArray shape, "TypedefDecl", slot, none⟩],
+          .declareArray slot ty.width captured true)
+      if let some (alias, shape) := ordinary_array_alias scope (json_field declaration "type") then
+        unless field_text declaration "kind" == "VarDecl" && field_text declaration "storageClass" == "" &&
+            (child_nodes declaration).isEmpty do
+          throw "invalid ordinary declaration from a captured array alias"
+        return ([⟨ident, name, spelling, .dynamicArray shape, "VarDecl", slot, none⟩], .arrayFromAlias slot alias.slot)
+      let storage ← require (ordinary_storage records spelling) ("unsupported ordinary local type: " ++ spelling)
+      unless field_text declaration "kind" == "VarDecl" && field_text declaration "storageClass" == "" do
         throw "unsupported ordinary local declaration"
+      let width := storage.width
       unless width ≤ 9223372036854775792 do throw "ordinary local size exceeds host limits"
-      let parse := expression scope "nested ordinary initializer effects require a sequencing proof"
+      let children := child_nodes declaration
+      if children.isEmpty then
+        return ([⟨ident, name, spelling, storage, "VarDecl", slot, none⟩], .uninitialised slot)
+      let [initializer] := children | throw "unsupported ordinary local initializer"
+      unless ordinary_decl initializer spelling do throw "unsupported ordinary local declaration"
+      let literals ← ordinary_literals records (budget + 1) (slot + 1) initializer
+      let parse := expression (scope ++ literals) "nested ordinary initializer effects require a sequencing proof"
       let initialise := do
-        let stores ← ordinary_stores storage initializer parse
+        let stores ← ordinary_stores records parse (budget + 1) storage initializer
         unless Ordinary.Initialiser.fits width stores do throw "ordinary local initialiser spans overlap or exceed the object"
         pure (Ordinary.Statement.initialiseAggregate slot width stores)
       let action ← match storage with
-        | .scalar ty => pure (.initialise slot ty (← parse initializer))
+        | .scalar ty =>
+          if let some plain := atomic_underlying spelling then
+            let [value] := child_nodes initializer | throw "ordinary atomic initializer requires a value"
+            unless field_text initializer "kind" == "ImplicitCastExpr" && field_text initializer "castKind" == "NonAtomicToAtomic" &&
+                ordinary_decl value plain do throw "incorrect ordinary atomic initializer type"
+            pure (.initialiseAtomic slot ty (← parse value))
+          else if ty.component.isSome && field_text initializer "kind" == "InitListExpr" then initialise
+          else pure (.initialise slot ty (← parse initializer))
         | .array .. => initialise
         | .record layout =>
           if field_text initializer "kind" == "InitListExpr" then initialise
           else
-            let source ← ordinary_record_source spelling (budget + 1) initializer
-            let value ← ordinary_expr records symbols globals scope (budget + 1) true source
-            unless ordinary_read_only value do throw "ordinary record source may only read state"
-            pure (Ordinary.Statement.initialiseCopy slot value width layout.alignment)
-      return ([⟨ident, name, spelling, storage, "VarDecl", slot⟩], action)
+            let ty ← require (ordinary_record_code layout) "ordinary record has no value representation"
+            pure (.initialise slot ty (← parse initializer))
+        | .dynamicArray _ => throw "ordinary dynamic arrays require a typed probe"
+        | .vaList => throw "ordinary variadic cursor has a declaration initialiser"
+      return (⟨ident, name, spelling, storage, "VarDecl", slot, none⟩ :: literals, action)
     | "IfStmt", condition :: chosen :: fallback =>
-      let tested ← guard scope condition
-      let (yesLocals, yes) ← descend slot chosen
+      let literals ← ordinary_literals records (budget + 1) slot condition
+      let tested ← guard (scope ++ literals) condition
+      let after := slot + literals.length
+      let (yesLocals, yes) ← descend after chosen
       let (noLocals, no) ← match fallback with
         | [] => pure ([], .empty)
-        | [other] => descend (slot + yesLocals.length) other
+        | [other] => descend (after + yesLocals.length) other
         | _ => throw "invalid ordinary branch"
-      return (yesLocals ++ noLocals, .branch tested yes no)
+      return (literals ++ yesLocals ++ noLocals, .branch tested yes no)
     | "WhileStmt", [condition, body] =>
-      let tested ← guard scope condition
-      let (locals, action) ← decode true inSwitch scope slot body
-      return (locals, .whileDo tested action)
+      let literals ← ordinary_literals records (budget + 1) slot condition
+      let tested ← guard (scope ++ literals) condition
+      let (locals, action) ← decode true inSwitch scope (slot + literals.length) body
+      return (literals ++ locals, .whileDo tested action)
     | "DoStmt", [body, condition] =>
       let (locals, action) ← decode true inSwitch scope slot body
-      return (locals, .doWhile action (← guard scope condition))
+      let literals ← ordinary_literals records (budget + 1) (slot + locals.length) condition
+      return (locals ++ literals, .doWhile action (← guard (scope ++ literals) condition))
     | "ForStmt", [initial, conditionVariable, condition, advance, body] =>
       unless field_text conditionVariable "kind" == "" && (child_nodes conditionVariable).isEmpty do
         throw "ordinary for loop requires an expression guard"
@@ -2339,27 +3791,33 @@ private def ordinary_statement (records : List Ordinary.RecordLayout) (symbols :
         throw "ordinary for loop requires a declaration or expression initialiser"
       let (initialLocals, start) ← descend slot initial
       let visible := scope ++ initialLocals
+      let first := slot + initialLocals.length
+      let testLocals ← ordinary_literals records (budget + 1) first condition
+      let stepLocals ← ordinary_literals records (budget + 1) (first + testLocals.length) advance
       let tested ← if field_text condition "kind" == "" && (child_nodes condition).isEmpty then pure none
-        else some <$> guard visible condition
+        else some <$> guard (visible ++ testLocals) condition
       let step ← if field_text advance "kind" == "" && (child_nodes advance).isEmpty then pure none
-        else some <$> expression visible "nested ordinary advance effects require a sequencing proof" advance
-      let (bodyLocals, action) ← decode true inSwitch visible (slot + initialLocals.length) body
-      return (initialLocals ++ bodyLocals, .forDo start tested action step)
+        else some <$> expression (visible ++ stepLocals) "nested ordinary advance effects require a sequencing proof" advance
+      let bounds := initialLocals ++ testLocals ++ stepLocals
+      let (bodyLocals, action) ← decode true inSwitch visible (slot + bounds.length) body
+      return (bounds ++ bodyLocals, .forDo start tested action step)
     | "GotoStmt", [] =>
       let identity := field_text node "targetLabelDeclId"
       unless !identity.isEmpty do throw "ordinary goto lacks a label identity"
       return ([], .gotoLabel identity)
     | "IndirectGotoStmt", [address] =>
-      return ([], .indirect (← ordinary_label_choice (guard scope) (budget + 1) address))
+      let locals ← ordinary_literals records (budget + 1) slot address
+      return (locals, .indirect (← ordinary_label_choice ((symbols.head?.map (·.functions)).getD []) (guard (scope ++ locals)) (budget + 1) address))
     | "LabelStmt", [child] =>
       let identity := field_text node "declId"
       unless !identity.isEmpty do throw "ordinary label lacks a declaration identity"
       let (locals, action) ← descend slot child
       return (locals, .label identity action)
     | "SwitchStmt", [condition, body] =>
-      let selector ← guard scope condition
-      let (locals, action) ← decode inLoop true scope slot body
-      return (locals, .select selector action)
+      let literals ← ordinary_literals records (budget + 1) slot condition
+      let selector ← guard (scope ++ literals) condition
+      let (locals, action) ← decode inLoop true scope (slot + literals.length) body
+      return (literals ++ locals, .select selector action)
     | "CaseStmt", lower :: tail =>
       unless inSwitch do throw "ordinary case outside a switch"
       let (upper, child) ← match tail with
@@ -2382,38 +3840,74 @@ private def ordinary_statement (records : List Ordinary.RecordLayout) (symbols :
       unless inLoop do throw "ordinary continue outside a loop"
       return ([], .restart)
     | "NullStmt", [] | "", [] => return ([], .skip)
-    | "ReturnStmt", _ =>
-      return ([], .result (← ordinary_return records symbols globals result scope (budget + 1) node))
+    | "ReturnStmt", [] =>
+      unless result == "void" do throw "ordinary nonvoid return requires a value"
+      return ([], .result (.sizeLiteral 0))
+    | "ReturnStmt", [value] =>
+      if let [compound] := child_nodes value then
+        if field_text compound "kind" == "CompoundLiteralExpr" then
+          let [initializer] := child_nodes compound | throw "ordinary compound literal requires an initialiser"
+          let ident := field_text compound "id"
+          unless field_text value "kind" == "ImplicitCastExpr" && field_text value "castKind" == "LValueToRValue" &&
+              !ident.isEmpty && ordinary_decl value result && ordinary_decl compound result && ordinary_decl initializer result do
+            throw "ordinary compound literal differs from its result type"
+          let layout ← require (records.find? (·.spelling == result)) "ordinary compound return requires a record"
+          let ty ← require (ordinary_record_code layout) "ordinary compound return requires a complete record"
+          let nested ← ordinary_literals records (budget + 1) (slot + 1) initializer
+          let stores ← ordinary_stores records (expression (scope ++ nested) "unsequenced ordinary compound initialiser") (budget + 1) (.record layout) initializer
+          unless Ordinary.Initialiser.fits layout.width stores do throw "ordinary compound literal stores exceed its layout"
+          return (⟨ident, "", result, .record layout, "CompoundLiteralExpr", slot, none⟩ :: nested,
+            .initialiseAggregate slot layout.width stores (some ty))
+      let literals ← ordinary_literals records (budget + 1) slot value
+      return (literals, .result (← ordinary_return arithmetic records symbols globals result (scope ++ literals) (budget + 1) node))
     | _, _ =>
-      let value ← expression scope "nested ordinary effects require a sequencing proof" node
-      return ([], .discard value)
+      let literals ← ordinary_literals records (budget + 1) slot node
+      let value ← expression (scope ++ literals) "nested ordinary effects require a sequencing proof" node
+      return (literals, .discard value)
 
-private def ordinary_parameter (node : Json) : Except String OrdinaryLocal := do
+private def ordinary_parameter (records : List Ordinary.RecordLayout) (node : Json) : Except String OrdinaryLocal := do
   let name := field_text node "name"
   let ident := field_text node "id"
   let spelling := type_spelling node
-  let ty ← require (ordinary_type spelling) "unsupported ordinary parameter type"
+  let storage ← require (ordinary_storage records spelling) ("unsupported ordinary parameter type: " ++ spelling)
+  unless storage.value_type.isSome do throw "ordinary parameter lacks an ABI value type"
   unless field_text node "kind" == "ParmVarDecl" && ordinary_name name && !ident.isEmpty &&
       field_text node "storageClass" == "" && (child_nodes node).isEmpty do
     throw "unsupported ordinary parameter"
-  return ⟨ident, name, spelling, .scalar ty, "ParmVarDecl", 0⟩
+  return ⟨ident, name, spelling, storage, "ParmVarDecl", 0, none⟩
+
+private def ordinary_parameters_with_shapes (budget : Nat) (parameters : List OrdinaryLocal) (body : Json) :
+    Except String (List OrdinaryLocal) := do
+  let probes := (child_nodes body).takeWhile (fun child =>
+    (ordinary_probe child).any (fun (index, _) => index != local_array_order))
+  probes.foldlM (fun parameters child => do
+    let (index, probe) ← require (ordinary_probe child) "invalid ordinary parameter probe"
+    let parameter ← require parameters[index]? "ordinary parameter probe has no parameter"
+    unless parameter.pointerShape.isNone do throw "duplicate ordinary parameter probe"
+    let shape ← ordinary_pointer_probe budget parameter.spelling probe
+    return parameters.set index { parameter with pointerShape := some shape }) parameters
 
 private def ordinary_signature (unit : OrdinaryUnit) (node : Json) : Except String OrdinarySignature := do
   let name := field_text node "name"
   let spelling := type_spelling node
-  let [rawResult, tail] := spelling.splitOn "(" | throw "ordinary callee requires a nonvariadic function type"
+  let rawResult :: signature := spelling.splitOn "(" | throw "missing ordinary function type"
+  let tail := String.intercalate "(" signature
   let result := rawResult.trim
-  let ty ← require (ordinary_type result) "unsupported ordinary result type"
+  let ty ← if result == "void" then pure none
+    else some <$> require (ordinary_value_type unit.records result) ("unsupported ordinary result type in " ++ name ++ ": " ++ result)
   let body :: arguments := (child_nodes node).reverse | throw "ordinary callee requires a body"
-  let parameters ← arguments.reverse.mapM ordinary_parameter
+  let parameters ← arguments.reverse.mapM (ordinary_parameter unit.records)
   let parameters := parameters.zipIdx.map fun (parameter, slot) => { parameter with slot }
-  let parameterText := if parameters.isEmpty then "void" else String.intercalate ", " (parameters.map (·.spelling))
+  let variadic := json_field node "variadic" == .bool true
+  let parameterText := if parameters.isEmpty && !variadic then "void"
+    else String.intercalate ", " (parameters.map (·.spelling) ++ if variadic then ["..."] else [])
   unless ordinary_name name && field_text body "kind" == "CompoundStmt" && tail == parameterText ++ ")" &&
       ["", "static"].contains (field_text node "storageClass") &&
       decide ((parameters.map (·.ident)).Nodup) do
     throw "unsupported ordinary function definition"
+  let parameters ← ordinary_parameters_with_shapes unit.budget parameters body
   let symbol := unit_function_key unit.namespaceName unit.declarations name
-  return ⟨name, symbol, spelling, result, ty, parameters, [], body, unit.records⟩
+  return ⟨name, symbol, spelling, result, ty, parameters, [], body, unit.records, variadic, []⟩
 
 private def ordinary_prototype (symbol : OrdinarySignature) (node : Json) : Except String Nat := do
   let children := child_nodes node
@@ -2426,29 +3920,65 @@ private def ordinary_prototype (symbol : OrdinarySignature) (node : Json) : Exce
     throw "ordinary prototype differs from its definition"
   return children.length
 
-private def ordinary_procedures (records : List Ordinary.RecordLayout) (symbols : List OrdinarySignature)
+private def ordinary_parameter_shape (records : List Ordinary.RecordLayout) (symbols : List OrdinarySignature)
+    (globals : List OrdinaryObject) (parameters : List OrdinaryLocal) (budget : Nat) (parameter : OrdinaryLocal) :
+    Except String (Option Ordinary.ParameterShape) := do
+  let some captured := parameter.pointerShape | return none
+  let some bounds := captured.bounds | return none
+  let expressions ← ordinary_bound_list bounds fun node => do
+    let expression ← ordinary_expr records symbols globals (parameters.take parameter.slot) budget false node
+    unless ordinary_root_effect expression do throw "nested ordinary parameter effects require a sequencing proof"
+    return expression
+  return some ⟨parameter.slot, captured.shape.width, captured.skip, expressions⟩
+
+private def ordinary_introspects : Nat → Json → Bool
+  | 0, _ => false
+  | depth + 1, node =>
+    let children := child_nodes node
+    let here := match field_text node "kind", children with
+      | "CallExpr", target :: _ => (ordinary_callee target).toOption.any (fun (name, _, _) =>
+          ["__builtin_va_start", "zargs"].contains name)
+      | _, _ => false
+    here || children.any (ordinary_introspects depth)
+
+private def ordinary_atomic_builtin (node : Json) : Bool :=
+  let name := field_text node "name"
+  (name.startsWith "__c11_atomic_" || name.startsWith "__atomic_") &&
+    json_field node "isImplicit" == .bool true && ordinary_decl node "void ()" &&
+    (child_nodes node).map (fun child => field_text child "kind") == ["BuiltinAttr"]
+
+private def ordinary_procedures (arithmetic : Option ClosedProgram) (records : List Ordinary.RecordLayout) (symbols : List OrdinarySignature)
     (globals : List OrdinaryObject) (namespaceName : String) (labels : List (String × String)) (budget slot graphCount : Nat) :
     List Json → Except String (List Ordinary.Procedure)
   | [] => .ok []
   | declaration :: rest => do
+    if ordinary_atomic_builtin declaration then
+      return ← ordinary_procedures arithmetic records symbols globals namespaceName labels budget slot graphCount rest
+    if let some arity := ordinary_implicit_va declaration then
+      return ← ordinary_procedures arithmetic records symbols globals namespaceName labels budget (slot + arity) graphCount rest
     let symbol ← require (symbols.find? fun symbol => symbol.name == field_text declaration "name")
-      "ordinary prototype has no checked definition"
+      ("ordinary prototype has no checked definition: " ++ field_text declaration "name")
     if (child_nodes declaration).any (fun node => field_text node "kind" == "CompoundStmt") then
-      let (locals, statements) ← ordinary_statement records symbols globals symbol.result budget false false symbol.parameters
-        symbol.parameters.length symbol.entry
+      let visible := globals.filter fun object => object.owner.isNone || object.owner == some symbol.name
+      let (locals, statements) ← (ordinary_statement arithmetic records symbols visible symbol.result budget false false
+        symbol.parameters symbol.parameters.length symbol.entry).mapError (fun why => symbol.name ++ ": " ++ why)
       let bindings := symbol.parameters ++ locals
       unless decide ((bindings.map (·.ident)).Nodup) do throw "ordinary locals share a declaration identity"
       let slots := bindings.map fun binding => namespaceName ++ binding.name ++ "." ++ toString (slot + binding.slot)
       let graphName := "g_" ++ namespaceName.replace ":" "_" ++ toString graphCount
       let dispatch ← if statements.needs_dispatch then some <$> Ordinary.compile_dispatch graphName statements labels else pure none
-      let parameters ← symbol.parameters.mapM fun parameter => require parameter.storage.scalar_type "ordinary parameter must be scalar"
+      let parameters ← symbol.parameters.mapM fun parameter =>
+        require parameter.storage.value_type "ordinary parameter lacks an ABI value type"
+      let shapes ← symbol.parameters.mapM (ordinary_parameter_shape records symbols visible symbol.parameters budget)
       let procedure : Ordinary.Procedure :=
-        ⟨symbol.symbol, symbol.ty, parameters, locals.map (·.storage.width), slots, statements, dispatch⟩
-      return procedure :: (← ordinary_procedures records symbols globals namespaceName labels budget (slot + bindings.length)
+        ⟨symbol.symbol, symbol.ty, parameters, locals.map (·.storage.frame_width), slots, statements, dispatch,
+          shapes.filterMap id, locals.any (·.pointerShape.isSome), ordinary_introspects budget symbol.entry,
+          (kernel_source declaration budget).toOption.map fun (term, _) => ⟨term⟩⟩
+      return procedure :: (← ordinary_procedures arithmetic records symbols globals namespaceName labels budget (slot + bindings.length)
         (graphCount + if dispatch.isSome then 1 else 0) rest)
     else
       let used ← ordinary_prototype symbol declaration
-      ordinary_procedures records symbols globals namespaceName labels budget (slot + used) graphCount rest
+      ordinary_procedures arithmetic records symbols globals namespaceName labels budget (slot + used) graphCount rest
 
 private def ordinary_objects (unit : OrdinaryUnit) : List Json :=
   unit.objects.filter (fun node => field_text node "storageClass" != "extern" || field_text node "init" != "")
@@ -2456,92 +3986,461 @@ private def ordinary_objects (unit : OrdinaryUnit) : List Json :=
 private def ordinary_private_object (unit : OrdinaryUnit) (name : String) : Bool :=
   unit.objects.any (fun node => field_text node "name" == name && field_text node "storageClass" == "static")
 
+private def ordinary_availability_definition (node : Json) : Bool := Id.run do
+  let [cursor, body] := child_nodes node | return false
+  let [returned] := child_nodes body | return false
+  let [call] := child_nodes returned | return false
+  let [primitive, loaded, count] := child_nodes call | return false
+  let [reference] := child_nodes primitive | return false
+  let [dereference] := child_nodes loaded | return false
+  let [cast] := child_nodes dereference | return false
+  let [argument] := child_nodes cast | return false
+  let [binding] := child_nodes argument | return false
+  let [width] := child_nodes count | return false
+  return field_text node "storageClass" == "static" && json_field node "inline" == .bool true &&
+    field_text cursor "kind" == "ParmVarDecl" && ordinary_va_operand cursor &&
+    field_text body "kind" == "CompoundStmt" && field_text returned "kind" == "ReturnStmt" &&
+    field_text call "kind" == "CallExpr" && ordinary_decl call "_Bool" &&
+    field_text primitive "castKind" == "FunctionToPointerDecay" && field_text reference "kind" == "DeclRefExpr" &&
+    field_text (json_field reference "referencedDecl") "name" == "zvalinbounds" &&
+    field_text loaded "castKind" == "LValueToRValue" && ordinary_decl loaded "void *" &&
+    field_text dereference "opcode" == "*" && ordinary_decl dereference "void *" &&
+    field_text cast "castKind" == "BitCast" && ordinary_decl cast "void **" &&
+    field_text argument "castKind" == "LValueToRValue" && ordinary_va_operand argument &&
+    field_text binding "kind" == "DeclRefExpr" && ordinary_ident binding == field_text cursor "id" &&
+    field_text count "castKind" == "IntegralCast" && ordinary_decl count "unsigned long" &&
+    field_text width "kind" == "IntegerLiteral" && ordinary_decl width "int" && field_text width "value" == "8" &&
+    (child_nodes binding).isEmpty && (child_nodes width).isEmpty && (child_nodes reference).isEmpty
+
+private abbrev TypeAliases := Std.HashMap String String
+
+private structure OrdinaryEnums where
+  types : TypeAliases := {}
+  constants : Std.HashMap String (String × String × Int) := {}
+
+private def enum_base (spelling : String) : String := Id.run do
+  if !spelling.startsWith "enum " then return ""
+  if spelling.startsWith "enum (" then
+    let first :: _ := spelling.splitOn ")" | return ""
+    return first ++ ")"
+  return String.mk (spelling.toList.take 5 ++ (spelling.drop 5).toList.takeWhile (fun c => c.isAlphanum || c == '_'))
+
+private def OrdinaryEnums.expand (enums : OrdinaryEnums) (spelling : String) : String := Id.run do
+  if !spelling.startsWith "enum " then return spelling
+  let tag := enum_base spelling
+  let some ty := enums.types[tag]? | return spelling
+  return ty ++ spelling.drop tag.length
+
+private def enum_members (node : Json) : Option (String × List (String × String × String × Int)) := do
+  let members := child_nodes node
+  guard (!members.isEmpty && json_field node "fixedUnderlyingType" == .null)
+  let fits := fun width isSigned value => (if isSigned then signed else unsigned) (8 * width) value == value
+  let mut next := (0 : Int)
+  let mut width := 4
+  let mut entries := []
+  for member in members do
+    let spelling := type_spelling member
+    let ty ← ordinary_integer_type spelling
+    guard (field_text member "kind" == "EnumConstantDecl" && !((field_text member "id").isEmpty) &&
+      ordinary_name (field_text member "name") && ty.width ≤ 8)
+    let value ← match child_nodes member with
+      | [] => pure next
+      | [expr] => do
+        guard (field_text expr "kind" == "ConstantExpr")
+        (field_text expr "value").toInt?
+      | _ => none
+    guard (fits ty.width ty.signed value)
+    next := value + 1
+    width := max width ty.width
+    entries := (field_text member "id", field_text member "name", spelling, value) :: entries
+  let signed := entries.any (fun entry => entry.2.2.2 < 0)
+  guard (entries.all (fun entry => fits width signed entry.2.2.2))
+  return ((if signed then "" else "unsigned ") ++ (if width == 4 then "int" else "long"), entries)
+
+private def ordinary_enums (nodes : List Json) : Except String OrdinaryEnums := do
+  let mut result : OrdinaryEnums := {}
+  let mut ids : TypeAliases := {}
+  let mut anonymous := []
+  let add := fun (types : TypeAliases) (tag value : String) => do
+    if let some old := types[tag]? then
+      unless old == value do throw "ambiguous ordinary enum layout"
+    pure (types.insert tag value)
+  for node in nodes do
+    if field_text node "kind" != "EnumDecl" then continue
+    let some (ty, members) := enum_members node | continue
+    ids := ids.insert (field_text node "id") ty
+    for (ident, name, spelling, value) in members do
+      result := { result with constants := result.constants.insert ident (name, spelling, value) }
+    let name := field_text node "name"
+    if name.isEmpty then
+      let range := json_field node "range"
+      if let .ok first := (json_field (json_field range "begin") "offset").getNat? then
+        if let .ok last := (json_field (json_field range "end") "offset").getNat? then
+          anonymous := (first, last, ty) :: anonymous
+    else result := { result with types := ← add result.types ("enum " ++ name) ty }
+  for node in nodes do
+    let tag := enum_base (type_spelling node)
+    if tag.isEmpty then continue
+    if let some ty := ids[field_text (json_field node "ownedTagDecl") "id"]? then
+      result := { result with types := ← add result.types tag ty }
+    if tag.startsWith "enum (" && ["VarDecl", "FieldDecl"].contains (field_text node "kind") then
+      let .ok first := (json_field (json_field (json_field node "range") "begin") "offset").getNat? | continue
+      let .ok name := (json_field (json_field node "loc") "offset").getNat? | continue
+      let [(_, _, ty)] := anonymous.filter (fun entry => entry.1 == first && entry.2.1 < name) | continue
+      let key := tag.replace "unnamed enum at " "unnamed at "
+      let types ← add result.types key ty
+      result := { result with types := ← add types (key.replace "unnamed at " "unnamed enum at ") ty }
+  return result
+
+private def ordinary_aliases (enums : OrdinaryEnums) (nodes : List Json) : TypeAliases :=
+  nodes.foldl (fun aliases node => Id.run do
+    let key := field_text node "heresyAlias"
+    let target := enums.expand (type_spelling node)
+    if field_text node "kind" != "TypedefDecl" || key.isEmpty then return aliases
+    let supported := (fixed_dimensions target).any (fun (base, _) => (ordinary_integer_type base).isSome) ||
+      target != type_spelling node || ["__int128", "unsigned __int128"].contains target || (function_prototype target).isSome ||
+      (["struct ", "union "].any target.startsWith && !target.contains '*' && !target.contains '[')
+    if !supported then return aliases
+    let name := field_text node "name"
+    let aliases := aliases.insert key target
+    if (nodes.filter (fun other => field_text other "kind" == "TypedefDecl" && field_text other "name" == name)).length == 1 then
+      return aliases.insert name target
+    return aliases) {}
+
+private def leading_type (spelling : String) : String :=
+  String.mk (spelling.toList.takeWhile (fun c => c.isAlphanum || c == '_' || c == '@'))
+
+private def expand_alias (aliases : TypeAliases) (spelling : String) (reference : Bool) : String := Id.run do
+  let qualified := spelling.startsWith "const "
+  let plain := if qualified then spelling.drop 6 else spelling
+  let word := leading_type plain
+  if !reference && !word.startsWith "@type" then return spelling
+  let some target := aliases[word]? | return spelling
+  let suffix := plain.drop word.length
+  if let [head, tail] := target.splitOn "(*)(" then
+    let qualifier := if qualified then "const" else ""
+    if suffix.startsWith "[" || suffix.isEmpty then return head ++ "(*" ++ qualifier ++ suffix ++ ")(" ++ tail
+    if suffix.startsWith " *" && suffix.trim.toList.all (· == '*') then
+      return head ++ "(*" ++ qualifier ++ (if qualified then " " else "") ++ suffix.trim ++ ")(" ++ tail
+    return spelling
+  if qualified then
+    if ["struct ", "union "].any target.startsWith && !target.contains '*' && !target.contains '[' then
+      return "const " ++ target ++ suffix
+    return spelling
+  let some (base, sizes) := fixed_dimensions target | return target ++ suffix
+  let bounds := String.join (sizes.map (fun n => "[" ++ toString n ++ "]"))
+  if suffix.isEmpty then return target
+  if suffix.startsWith "[" && (fixed_dimensions ("x" ++ suffix)).isSome then return base ++ suffix ++ bounds
+  if suffix.startsWith " *" && suffix.trim.toList.all (· == '*') then return base ++ " (" ++ suffix.trim ++ ")" ++ bounds
+  return spelling
+
+private abbrev DeclaredTypes := Std.HashMap String (String × String)
+
+private def declared_types (aliases names : TypeAliases) (nodes : List Json) : DeclaredTypes :=
+  nodes.foldl (fun types node => Id.run do
+    let ident := field_text node "id"
+    let spelling := type_spelling node
+    let word := leading_type spelling
+    let some name := names[word]? | return types
+    let canonical := expand_alias aliases spelling false
+    if ident.isEmpty || canonical == spelling then return types
+    return types.insert ident (name ++ spelling.drop word.length, canonical)) {}
+
+private def store_block_result (decl : Json) : Nat → Json → Option Json
+  | 0, _ => none
+  | depth + 1, node => do
+    if field_text node "kind" == "LabelStmt" then
+      let [child] := child_nodes node | none
+      return node.setObjVal! "inner" (.arr #[← store_block_result decl depth child])
+    guard (ordinary_decl node (type_spelling decl) && field_text node "valueCategory" == "prvalue")
+    let ty := json_field decl "type"
+    let ref := Json.mkObj [("id", json_field decl "id"), ("kind", .str "VarDecl"),
+      ("name", json_field decl "name"), ("type", ty)]
+    let place := Json.mkObj [("kind", .str "DeclRefExpr"), ("referencedDecl", ref),
+      ("type", ty), ("valueCategory", .str "lvalue")]
+    return Json.mkObj [("kind", .str "BinaryOperator"), ("opcode", .str "="), ("type", ty),
+      ("valueCategory", .str "prvalue"), ("inner", .arr #[place, node])]
+
+private def block_initialiser (budget : Nat) (stmt : Json) : Option (List Json) := do
+  let [decl] := child_nodes stmt | none
+  guard (field_text stmt "kind" == "DeclStmt" && field_text decl "kind" == "VarDecl" &&
+    field_text decl "storageClass" == "" && ["int", "unsigned int", "long", "unsigned long"].contains (written_type decl))
+  let [init] := child_nodes decl | none
+  let expr ← if field_text init "kind" == "GenericSelectionExpr" then (ordinary_selected init).toOption else some init
+  guard (field_text expr "kind" == "StmtExpr" && ordinary_decl expr (type_spelling decl))
+  let [block] := child_nodes expr | none
+  guard (field_text block "kind" == "CompoundStmt")
+  let last :: preceding := (child_nodes block).reverse | none
+  let assignment ← store_block_result decl budget last
+  let declaration := stmt.setObjVal! "inner" (.arr #[decl.setObjVal! "inner" (.arr #[])])
+  return [declaration, block.setObjVal! "inner" (.arr (preceding.reverse ++ [assignment]).toArray)]
+
+private def ordinary_types (enums : OrdinaryEnums) (aliases : TypeAliases) (declarations : DeclaredTypes) : Nat → Bool → Json → Except String Json
+  | 0, _, _ => .error "incomplete ordinary type traversal"
+  | fuel + 1, reference, node => do
+    let mut result := node
+    if field_text node "kind" == "DeclRefExpr" && field_text (json_field node "referencedDecl") "kind" == "EnumConstantDecl" then
+      let ref := json_field node "referencedDecl"
+      let value := do
+        let (name, ty, value) ← enums.constants[ordinary_ident node]?
+        guard (name == field_text ref "name" && type_spelling node == ty && type_spelling ref == ty)
+        return Json.str (toString value)
+      result := result.setObjVal! "ordinaryEnumValue" (value.getD .null)
+    for key in ["type", "argType"] do
+      let ty := json_field node key
+      let spelling := qualified_spelling ty
+      if !spelling.isEmpty then
+        let canonical := match reference, declarations[field_text node "id"]? with
+          | true, some (written, target) => if written == spelling then target else expand_alias aliases spelling reference
+          | _, _ => enums.expand (expand_alias aliases spelling reference)
+        if canonical != spelling then
+          result := result.setObjVal! key (ty.setObjVal! "desugaredQualType" (.str canonical))
+    for key in ["inner", "array_filler"] do
+      if let .arr entries := json_field node key then
+        result := result.setObjVal! key (.arr (← entries.mapM (ordinary_types enums aliases declarations fuel false)))
+    for key in ["referencedDecl", "field"] do
+      if let .obj _ := json_field node key then
+        result := result.setObjVal! key (← ordinary_types enums aliases declarations fuel true (json_field node key))
+    if field_text result "kind" == "CompoundStmt" then
+      let children := (child_nodes result).flatMap (fun child => (block_initialiser (fuel + 1) child).getD [child])
+      return result.setObjVal! "inner" (.arr children.toArray)
+    return result
+
+private def literal_object (occupied : Std.HashSet String) (decl : Json) : Option (List Json) := do
+  guard (field_text decl "kind" == "VarDecl" && (field_text decl "tls").isEmpty)
+  let [decay] := child_nodes decl | none
+  guard (field_text decay "kind" == "ImplicitCastExpr" && field_text decay "castKind" == "ArrayToPointerDecay")
+  let [literal] := child_nodes decay | none
+  guard (field_text literal "kind" == "CompoundLiteralExpr" && field_text literal "valueCategory" == "lvalue" &&
+    !(field_text literal "id").isEmpty)
+  let [init] := child_nodes literal | none
+  guard (field_text init "kind" == "InitListExpr" && ordinary_decl init (type_spelling literal))
+  let stem := "__heresy_literal_" ++ field_text decl "name" ++ "_"
+  let rec fresh : Nat → Nat → Option String
+    | 0, _ => none
+    | fuel + 1, i =>
+      let candidate := stem ++ toString i
+      if occupied.contains candidate then fresh fuel (i + 1) else some candidate
+  let name ← fresh (occupied.size + 1) 0
+  let ty := json_field literal "type"
+  let fields : List (String × Json) := [("kind", .str "VarDecl"), ("id", json_field literal "id"), ("type", ty), ("name", .str name)]
+  let ref := Json.mkObj fields
+  let address := Json.mkObj [("kind", .str "DeclRefExpr"), ("valueCategory", .str "lvalue"), ("type", ty), ("referencedDecl", ref)]
+  let backing := Json.mkObj (fields ++ [("storageClass", .str "static"), ("init", .str "c"),
+    ("loc", json_field decl "loc"), ("inner", .arr #[init])])
+  return [decl.setObjVal! "inner" (.arr #[decay.setObjVal! "inner" (.arr #[address])]), backing]
+
 private def ordinary_unit (namespaceName : String) (budget : Nat) (tree : Json) : Except String OrdinaryUnit := do
-  let nodes := child_nodes tree
+  let all ← startup_nodes (budget + 1) tree
+  let typedefs := all.filter (fun node => field_text node "kind" == "TypedefDecl")
+  let enums ← ordinary_enums all
+  let aliases := ordinary_aliases enums typedefs
+  let names : TypeAliases := typedefs.foldl (fun names node => names.insert (field_text node "heresyAlias") (field_text node "name")) {}
+  let tree ← ordinary_types enums aliases (declared_types aliases names all) (budget + 1) false tree
+  let occupied : Std.HashSet String := (all.filter (fun node => ["VarDecl", "FunctionDecl"].contains (field_text node "kind"))).foldl
+    (fun names node => names.insert (field_text node "name")) {}
+  let nodes := (child_nodes tree).flatMap (fun decl => (literal_object occupied decl).getD [decl])
+  let tree := tree.setObjVal! "inner" (.arr nodes.toArray)
   let declarations := unit_function_declarations tree
   let objects := nodes.filter (fun node => source_declaration node && field_text node "kind" == "VarDecl")
-  let records := nodes.filterMap ordinary_record
-  unless decide ((records.map (·.spelling)).Nodup) do throw "ambiguous ordinary record definition"
-  let builtin := ["malloc", "memmove", "putchar", "free", "exit"]
-  unless !(declarations.any (fun node => builtin.contains (field_text node "name"))) &&
+  let builtin := ["fopen", "fread", "fwrite", "fclose", "calloc", "memset", "strlen", "strcmp", "printf", "puts", "zhasvalidcap", "zis_readonly", "zgetupper", "zgetlower", "malloc", "memcpy", "memmove", "putchar", "free", "exit", "__builtin_va_start", "__builtin_va_copy",
+    "__builtin_va_end", "zargs", "zcan_va_arg", "pthread_create", "pthread_join", "pthread_self", "pthread_equal"] ++ SyncOp.all.map SyncOp.name
+  let standard := fun node =>
+    let name := field_text node "name"
+    if name == "zcan_va_arg" then ordinary_availability_definition node
+    else !builtin.contains name
+  unless !(declarations.any (fun node => builtin.contains (field_text node "name") && (ordinary_implicit_va node).isNone)) &&
       !(objects.any (fun node => builtin.contains (field_text node "name"))) &&
-      !((function_definitions nodes).any (fun node => builtin.contains (field_text node "name"))) do
+      (function_definitions nodes).all standard do
     throw "ordinary certificate requires standard builtins"
-  let functions ← (function_definitions declarations).mapM (fun node =>
+  let functions : List (String × List Json) ← (function_definitions declarations).mapM (fun node =>
     (field_text node "name", ·) <$> startup_nodes (budget + 1) node)
-  return ⟨namespaceName, budget, tree, declarations, objects, records, label_names namespaceName functions⟩
+  let localTags := functions.flatMap fun (_, body) =>
+    (body.filter (fun stmt => field_text stmt "kind" == "DeclStmt")).flatMap child_nodes
+  let tags := (nodes ++ localTags).filter (fun node => field_text node "kind" == "RecordDecl")
+  let records ← tags.foldlM (collect_records (budget + 1)) []
+  let inlineEntries := ((json_field tree "heresyInlineRecords").getArr?.toOption.getD #[]).toList
+  let members := functions.flatMap fun (_, body) => body.filter (fun node => field_text node "kind" == "MemberExpr" || json_field node "field" != .null)
+  let records := inlineEntries.foldl (fun layouts entry => match inline_record layouts members entry with
+    | some layout => layout :: layouts
+    | none => layouts) records
+  let recordNames : List String := List.map Ordinary.RecordLayout.spelling records
+  unless decide recordNames.Nodup do throw "ambiguous ordinary record definition"
+  let references := functions.flatMap (fun entry => entry.2.filterMap (fun node =>
+    if field_text node "kind" == "DeclRefExpr" then some (field_text (json_field node "referencedDecl") "name") else none))
+  return ⟨namespaceName, budget, tree, declarations, objects, records, label_names namespaceName functions,
+    references.any (fun name => (file_signature name).isSome), references.contains "pthread_create",
+    functions.flatMap (fun (owner, nodes) => nodes.filterMap fun node =>
+      if field_text node "kind" == "VarDecl" && field_text node "storageClass" == "static" then some (owner, node) else none)⟩
 
-private def ordinary_object_definition (unit : OrdinaryUnit) (node : Json) (index : Nat) :
+private def ordinary_alias (unit : OrdinaryUnit) (key : String) : Option String := do
+  guard (key.startsWith "@type" && (key.drop 5).toNat?.isSome)
+  let [entry] := (child_nodes unit.tree).filter (fun node => field_text node "kind" == "TypedefDecl" &&
+    field_text node "heresyAlias" == key) | none
+  return type_spelling entry
+
+private def ordinary_callback (unit : OrdinaryUnit) (spelling : String) : Option OrdinaryCallback := do
+  let [head, tail] := spelling.splitOn "(*" | none
+  guard (tail == "const)(void)" || tail == ")(void)")
+  let key := head.trim
+  let result ← ordinary_alias unit key
+  guard (ordinary_type result == some .pointer)
+  let entry ← (child_nodes unit.tree).find? (fun node => field_text node "heresyAlias" == key)
+  let original := field_text entry "name"
+  guard (ordinary_name original)
+  return ⟨key, spelling.replace key original, result⟩
+
+private def ordinary_global_storage (unit : OrdinaryUnit) (spelling : String) : Option (OrdinaryStorage × Bool) := do
+  if let [head, tail] := spelling.splitOn "(*" then
+    if let [qualifier, suffix] := tail.splitOn "[" then
+      let [count, arguments] ← pure (suffix.splitOn "]") | none
+      guard (qualifier == "" || qualifier == "const")
+      let count ← count.toNat?
+      guard (0 < count)
+      let element := head ++ "(*" ++ arguments
+      guard ((function_prototype element).isSome)
+      return (.array element .pointer count, qualifier == "const")
+  if let some (element, count) := ordinary_array spelling then
+    let readOnly := element.startsWith "const "
+    let name := if readOnly then element.drop 6 else element
+    if element.endsWith "*const" && (data_pointee element).isSome then
+      return (.array (element.take (element.length - 5)) .pointer count, true)
+    if let some target := ordinary_alias unit name then
+      if (function_prototype target).isSome then return (.array target .pointer count, readOnly)
+  let readOnly := (spelling.splitOn "(*const)").length == 2 ||
+    (spelling.startsWith "const " && !spelling.contains '*')
+  let plain := if (spelling.splitOn "(*const)").length == 2 then spelling.replace "(*const)" "(*)"
+    else if readOnly then spelling.drop 6 else spelling
+  if let [head, tail] := plain.splitOn "(*)(" then
+    if let some result := ordinary_alias unit head.trim then
+      if (function_prototype (result ++ "(*)(" ++ tail)).isSome then return (.scalar .pointer, readOnly)
+  return (← ordinary_storage unit.records plain, readOnly)
+
+private def ordinary_object_definition (unit : OrdinaryUnit) (node : Json) (index : Nat) (owner : Option String := none) :
     Except String OrdinaryObject := do
   let name := field_text node "name"
   let spelling := type_spelling node
-  let storage ← require (ordinary_storage unit.records spelling) "unsupported ordinary global type"
+  let (storage, readOnly) ← require (ordinary_global_storage unit spelling) ("unsupported ordinary global type for " ++ name ++ ": " ++ spelling)
   unless storage.width ≤ 9223372036854775800 do throw "ordinary global size exceeds host limits"
-  unless ordinary_name name && field_text node "id" != "" && field_text node "tls" == "" &&
+  unless ordinary_name name && field_text node "id" != "" && ["", "static"].contains (field_text node "tls") &&
       ["", "extern", "static"].contains (field_text node "storageClass") do
     throw "unsupported ordinary global storage"
-  let symbol := if ordinary_private_object unit name then unit.namespaceName ++ name ++ "." ++ toString index
+  let symbol := if owner.isSome || ordinary_private_object unit name then unit.namespaceName ++ name ++ "." ++ toString index
     else "extern:" ++ name
   let pointed := unit.records.find? (·.spelling == ordinary_pointee spelling)
-  return ⟨name, symbol, spelling, storage, node, [], pointed⟩
+  return ⟨name, symbol, spelling, storage, node, [], pointed, unit.records, readOnly, ordinary_callback unit spelling, owner⟩
 
 private def ordinary_global_scope (unit : OrdinaryUnit) (definitions localDefinitions : List OrdinaryObject) :
     Except String (List OrdinaryObject) := do
   let visible := (child_nodes unit.tree).filter (fun node => field_text node "kind" == "VarDecl")
-  let selected := definitions.filter (fun object =>
+  let selected := definitions.filter (fun object => object.owner.isNone &&
     if ordinary_private_object unit object.name then
       localDefinitions.any (fun resident => resident.symbol == object.symbol)
     else object.symbol == "extern:" ++ object.name)
   let bindings : List OrdinaryObject ← (selected.filter (fun object => visible.any (fun node => field_text node "name" == object.name))).mapM
     fun object => do
       let declarations := visible.filter (fun node => field_text node "name" == object.name)
+      unless ordinary_callback unit object.spelling == object.callback do throw "ordinary callback declarations differ across units"
       unless declarations.all (fun node => ordinary_decl node object.spelling && field_text node "id" != "" &&
-          field_text node "tls" == "") do
+          field_text node "tls" == field_text object.definition "tls") do
         throw "ordinary global declaration differs from its definition"
       let layout := match object.storage with
         | .record layout => some layout
+        | .array .. => (fixed_dimensions object.spelling).bind fun (element, _) =>
+            object.records.find? (·.spelling == element)
         | _ => object.recordTarget
       if let some expected := layout then
         unless unit.records.any (fun actual => actual.spelling == expected.spelling &&
-            ordinary_record_compatible expected actual) do throw "ordinary global record layout disagrees with its definition"
+            ordinary_record_compatible object.records unit.records (object.records.length + 1) expected actual) do
+          throw "ordinary global record layout disagrees with its definition"
       return { object with identities := declarations.map (field_text · "id") }
+  let statics := localDefinitions.filterMap fun object =>
+    if object.owner.isSome then some { object with identities := [field_text object.definition "id"] } else none
+  let bindings := bindings ++ statics
   let ids : List String := bindings.flatMap (·.identities)
   unless decide ids.Nodup && unit.objects.all (fun node => ids.contains (field_text node "id")) do
     throw "unresolved or ambiguous ordinary global declaration"
   return bindings
 
 private def ordinary_static_value : Ordinary.Expression → Bool
-  | .literal _ | .nullPointer | .globalAddress _ => true
-  | .cast _ child => ordinary_static_value child
+  | .floatingLiteral .. | .literal _ | .sizeLiteral _ | .nullPointer | .globalAddress _ | .functionAddress .. => true
+  | .cast _ child | .unary _ _ child => ordinary_static_value child
   | _ => false
 
-private def ordinary_initialiser (records : List Ordinary.RecordLayout) (globals : List OrdinaryObject)
+private def ordinary_initialiser (unit : OrdinaryUnit) (functions : List String) (symbols : List OrdinarySignature) (globals : List OrdinaryObject)
     (budget : Nat) (object : OrdinaryObject) :
     Except String Ordinary.Global := do
   let scalar := fun (node : Json) => do
-    let expression ← ordinary_expr records [] globals [] budget false node
-    unless ordinary_static_value expression do throw "ordinary global initialiser must be a literal or global address"
+    if field_text node "kind" == "AddrLabelExpr" then
+      let owner ← require object.owner "ordinary label address has no enclosing function"
+      let ident := field_text node "labelDeclId"
+      let symbol ← require (unit.labels.lookup ident) "unregistered ordinary label address"
+      unless ordinary_decl node "void *" && (child_nodes node).isEmpty &&
+          symbol.startsWith ("label:" ++ unit.namespaceName ++ owner ++ ":") do throw "ordinary label address has a different owner"
+      let procedure ← require (symbols.find? (·.name == owner)) "missing ordinary label owner"
+      let nodes ← startup_nodes budget procedure.entry
+      unless nodes.any (fun label => field_text label "kind" == "LabelStmt" && field_text label "declId" == ident &&
+          field_text label "name" == field_text node "name") do throw "ordinary label address has no matching statement"
+      let index ← require (functions.idxOf? symbol) "ordinary label address has no code"
+      return .functionAddress symbol index
+    if let some callback := object.callback then
+      if let .ok ("pthread_self", signature, ident) := ordinary_callee node then
+        let [reference] := child_nodes node | throw "ordinary pthread function requires a declaration"
+        let declaration := json_field reference "referencedDecl"
+        unless ordinary_decl declaration "pthread_t (void)" && signature == callback.alias ++ " (void)" &&
+            ordinary_decl node (object.spelling.replace "(*const)" "(*)") &&
+            (child_nodes unit.tree).any (fun entry => field_text entry "kind" == "FunctionDecl" &&
+              field_text entry "name" == "pthread_self" && field_text entry "id" == ident && ordinary_decl entry signature) do
+          throw "ordinary pthread function address has an incompatible declaration"
+        let index ← require (functions.idxOf? "pthread_self") "ordinary pthread function has no registered address"
+        return .functionAddress "pthread_self" index
+    let expression ← ordinary_expr unit.records symbols globals [] budget false node
+    unless ordinary_static_value expression do throw "ordinary global initialiser requires a constant or static address"
     return expression
   let stores : List Ordinary.Initialiser ← match child_nodes object.definition with
     | [] => pure []
     | [initializer] => do
-      unless ordinary_decl initializer object.spelling do throw "ordinary global initialiser has the wrong type"
-      ordinary_stores object.storage initializer scalar
+      unless ordinary_decl initializer object.spelling || (object.readOnly &&
+          ordinary_decl initializer (object.spelling.replace "(*const)" "(*)")) ||
+          (object.readOnly && object.spelling.startsWith "const " && ordinary_decl initializer (object.spelling.drop 6)) do throw "ordinary global initialiser has the wrong type"
+      ordinary_stores unit.records scalar budget object.storage initializer
     | _ => throw "unsupported ordinary global initialiser"
-  return ⟨object.symbol, object.storage.width, stores⟩
+  return ⟨object.symbol, object.storage.width, stores, field_text object.definition "tls" == "static", object.readOnly⟩
 
-private def ordinary_imports (unit : OrdinaryUnit) (exports : List OrdinarySignature) : List OrdinarySignature :=
+private def ordinary_local_signature (unit : OrdinaryUnit) (definition : OrdinarySignature) (node : Json) :
+    Option OrdinarySignature := do
+  let spelling := type_spelling node
+  let result :: parametersText := spelling.splitOn "(" | none
+  let result := result.trim
+  let arguments := (child_nodes node).filter (fun argument => field_text argument "kind" == "ParmVarDecl")
+  guard (arguments.length == definition.parameters.length &&
+    ordinary_abi_type definition.records unit.records definition.result result)
+  let parameters ← (definition.parameters.zip arguments).mapM fun (parameter, argument) => do
+    let actual := type_spelling argument
+    guard (ordinary_abi_type definition.records unit.records parameter.spelling actual)
+    let storage ← ordinary_storage unit.records actual
+    guard (storage.value_type == parameter.storage.value_type)
+    return { parameter with spelling := actual, storage }
+  let suffix := if parameters.isEmpty && !definition.variadic then "void"
+    else String.intercalate ", " (parameters.map (·.spelling) ++ if definition.variadic then ["..."] else [])
+  guard (String.intercalate "(" parametersText == suffix ++ ")")
+  return { definition with spelling, result, parameters }
+
+private def ordinary_imports (unit : OrdinaryUnit) (exports : List OrdinarySignature) (functions : List String) : List OrdinarySignature :=
   let declarations := (child_nodes unit.tree).filter (fun node => field_text node "kind" == "FunctionDecl")
   exports.filterMap fun definition => do
     guard (unit_function_key unit.namespaceName unit.declarations definition.name == definition.symbol)
-    guard ((definition.result :: definition.parameters.map (·.spelling)).all
-      (ordinary_record_pointer_compatible definition.records unit.records))
     let visible := declarations.filter fun declaration =>
-      field_text declaration "name" == definition.name && type_spelling declaration == definition.spelling &&
+      field_text declaration "name" == definition.name &&
         (source_declaration declaration || ["", "extern"].contains (field_text declaration "storageClass"))
-    let identities := visible.map (field_text · "id")
+    let compatible := visible.filterMap fun declaration => do
+      let signature ← ordinary_local_signature unit definition declaration
+      return (signature, field_text declaration "id")
+    let (localSignature, _) :: _ := compatible | none
+    guard (compatible.all (fun (signature, _) => signature.spelling == localSignature.spelling))
+    let identities := compatible.map Prod.snd
     guard (!identities.isEmpty && identities.all (!·.isEmpty) && decide identities.Nodup)
-    return { definition with declarations := identities }
+    return { localSignature with declarations := identities, functions }
 
 private def ordinary_link (frontends : List String) :
     Except String { program : Ordinary.Program // ∃ trees,
@@ -2557,6 +4456,7 @@ private def ordinary_link (frontends : List String) :
       ordinary_unit (unit_namespace trees.length index) (frontends[index]?.getD "").utf8ByteSize tree
     let exports := (← units.mapM fun unit => (function_definitions unit.declarations).mapM (ordinary_signature unit)).flatten
     unless decide ((exports.map (·.symbol)).Nodup) do throw "multiple definitions of an ordinary function"
+    unless exports.length ≤ 2 ^ 63 do throw "ordinary function addresses exceed the code space"
     let [entry] := exports.filter (fun definition => definition.symbol == "main")
       | throw "ordinary certificate requires exactly one externally visible main definition"
     unless ["int (void)", "int (int, char **)"].contains entry.spelling do
@@ -2565,16 +4465,29 @@ private def ordinary_link (frontends : List String) :
       let definitions := ordinary_objects unit
       unless decide ((definitions.map (field_text · "name")).Nodup) do
         throw "ordinary certificate requires one definition per global"
-      (definitions.zipIdx).mapM (fun (node, index) => ordinary_object_definition unit node index)
+      let objects ← definitions.zipIdx.mapM (fun (node, index) => ordinary_object_definition unit node index)
+      let statics ← unit.statics.zipIdx.mapM fun ((owner, node), index) =>
+        ordinary_object_definition unit node (objects.length + index) (some owner)
+      return objects ++ statics
     let allObjects := byUnit.flatten
     unless decide ((allObjects.map (·.symbol)).Nodup) do throw "multiple definitions of an ordinary global"
+    let arithmetic := match frontends, units with
+      | [text], [unit] => (closed_tree text.length unit.tree).toOption
+      | _, _ => none
+    let functions := exports.map (·.symbol) ++ (units.flatMap (fun unit => unit.labels.map Prod.snd)).mergeSort ++
+      ["pthread_create", "pthread_join", "pthread_self"]
+    unless functions.length ≤ 2 ^ 63 do throw "ordinary linked symbols exceed the code space"
     let bodies ← (units.zip byUnit).mapM fun (unit, definitions) => do
       let globals ← ordinary_global_scope unit allObjects definitions
-      let initialisers ← definitions.mapM (ordinary_initialiser unit.records globals (unit.budget + 1))
-      let procedures ← ordinary_procedures unit.records (ordinary_imports unit exports) globals unit.namespaceName
+      let symbols := ordinary_imports unit exports functions
+      let initialisers ← definitions.mapM fun object =>
+        let visible := globals.filter fun other => other.owner.isNone || other.owner == object.owner
+        ordinary_initialiser unit functions symbols visible (unit.budget + 1) object
+      let procedures ← ordinary_procedures arithmetic unit.records symbols globals unit.namespaceName
         unit.labels (unit.budget + 1) (globals.flatMap (·.identities)).length 0 unit.declarations
       pure (⟨unit.namespaceName, procedures, initialisers, unit.labels.map Prod.snd⟩ : Ordinary.UnitBody)
-    let program : Ordinary.Program := ⟨bodies⟩
+    let startup ← link_startup (units.map fun unit => (unit.budget + 1, unit.tree))
+    let program : Ordinary.Program := ⟨bodies, startup.parallel⟩
     if valid : program.procedures.map (·.name) = (link_entries trees).map Prod.fst ∧
         (program.procedures.map (·.name)).Nodup ∧ (program.globals.map (·.name)).Nodup then
       if control : program.procedures.all Ordinary.Procedure.control_checked = true then
@@ -2611,6 +4524,13 @@ private def ordinary_location (c : Char) : Bool :=
   c.toNat < 128 && (c.isAlphanum || ['.', '/', ':', '_', '-', ' ', '@'].contains c)
 
 private def ordinary_locations (body : String) : Except String String :=
+  let rec quoted : List Char → List Char → Except String (String × List Char)
+    | '"' :: rest, value => .ok (String.mk ('"' :: ('"' :: value).reverse), rest)
+    | '\\' :: c :: rest, value =>
+      if c == '\n' || c == '\r' then .error "newline in ordinary string"
+      else quoted rest (c :: '\\' :: value)
+    | '\n' :: _, _ | '\r' :: _, _ | [], _ => .error "unterminated ordinary string"
+    | c :: rest, value => quoted rest (c :: value)
   let rec scan : Nat → List Char → List String → Except String String
     | _, [], output => .ok (String.join output.reverse)
     | 0, _, _ => .error "ordinary token budget exhausted"
@@ -2627,11 +4547,9 @@ private def ordinary_locations (body : String) : Except String String :=
             | _ => .error "invalid ordinary location literal"
           | _ => .error "missing ordinary location literal"
         else scan fuel remaining (token :: output)
-      else if head == '"' then
-        let value := tail.takeWhile (fun c => c != '"' && c != '\\' && c != '\n' && c != '\r')
-        match tail.drop value.length with
-        | '"' :: suffix => scan fuel suffix ((String.mk ('"' :: value ++ ['"'])) :: output)
-        | _ => .error "unsupported ordinary string escape"
+      else if head == '"' then do
+        let (value, suffix) ← quoted tail []
+        scan fuel suffix (value :: output)
       else scan fuel tail (String.singleton head :: output)
   scan (body.length + 1) body.toList []
 
@@ -2686,7 +4604,7 @@ theorem ordinary_observation_sound (runtime : String) (frontends : List String) 
     ordinary_source frontends = .ok program ∧
       program.observation fuel terminal invocation = program.source_observation fuel terminal invocation := by
   refine ⟨(ordinary_certificate_sound runtime frontends generated program accepted).1, ?_⟩
-  exact Ordinary.prefix_refines program terminal fuel invocation ⟨[], ⟨1, 4096⟩⟩ ⟨[], [], 0, true⟩ rfl id (by intro a b eq; exact eq)
+  exact Ordinary.prefix_refines program terminal fuel invocation ⟨[], ⟨1, 4096⟩, [], [], { events := invocation.files }⟩ ⟨[], [], 0, true⟩ rfl id (by intro a b eq; exact eq)
 
 theorem ordinary_completed_behaviour (runtime : String) (frontends : List String) (generated : String)
     (program : Ordinary.Program) (accepted : validate_ordinary runtime frontends generated = .ok program)
@@ -2697,6 +4615,107 @@ theorem ordinary_completed_behaviour (runtime : String) (frontends : List String
   unfold Ordinary.Observes
   simp only [agrees]
 
+def process_status : TraceOutcome → Option Nat
+  | .returned code => some code.toNat
+  | .fault _ => some 70
+  | .paused => none
+
+theorem ordinary_scheduled_behaviour (accepted : validate_ordinary runtime frontends generated = .ok program)
+    (context : ThreadCode α → ScheduleState α HeapImage StdoutBuffer)
+    (blocks : Nat → Option (ThreadCode α)) (schedule : List Nat) (terminal : Bool)
+    (depth : Nat) (invocation : Ordinary.Invocation) (reference : Nat → Nat)
+    (distinct : Function.Injective reference)
+    (valid : ∀ code, (context code).stdout.size = (context code).stdout.snapshot.pending.length) :
+    ordinary_source frontends = .ok program ∧
+      (run_schedule (sparse_machine reference) terminal blocks schedule
+        (context (.fromTrace (program.target depth invocation)))).snapshot reference =
+      run_schedule abstract_machine terminal blocks schedule
+        ((context (.fromTrace ((program.source depth invocation).emit .finish))).snapshot reference) :=
+  ⟨(ordinary_certificate_sound _ _ _ _ accepted).1,
+    scheduled_lowering _ _ _ _ _ _ _ reference distinct valid⟩
+
+def matches_observation (program : Ordinary.Program) (budget : Nat) (invocation : Ordinary.Invocation)
+    (status : Nat) (stdout : List UInt8) : Bool :=
+  let (outcome, visible) := program.observation budget false invocation
+  process_status outcome == some status && stdout == visible
+
+theorem checked_process_observation (accepted : validate_ordinary runtime frontends generated = .ok program)
+    (checked : matches_observation program budget invocation status stdout = true) :
+    ∃ outcome, process_status outcome = some status ∧
+      Ordinary.Observes (fun fuel => program.source_observation fuel false invocation) (outcome, stdout) ∧
+      ∀ other, Ordinary.Observes (fun fuel => program.source_observation fuel false invocation) other →
+        other = (outcome, stdout) := by
+  rcases ran : program.observation budget false invocation with ⟨actual, bytes⟩
+  simp only [matches_observation, ran, Bool.and_eq_true, beq_iff_eq] at checked
+  obtain ⟨status_eq, rfl⟩ := checked
+  have done_ : actual ≠ .paused := by rintro rfl; contradiction
+  have target : Ordinary.Observes (fun fuel => program.observation fuel false invocation) (actual, stdout) :=
+    ⟨done_, budget, ran⟩
+  have agrees := ordinary_completed_behaviour _ _ _ _ accepted invocation false
+  exact ⟨actual, status_eq, (agrees _).mp target, fun other observed =>
+    Ordinary.completed_observations_unique _ _ _ _ _ ((agrees other).mpr observed) target⟩
+
+def invocation_observation (program : Ordinary.Program) (budget : Nat) (invocation : Ordinary.Invocation)
+    (witness : Option (List Nat) := none) : TraceOutcome × List UInt8 :=
+  if program.parallel then
+    program.threadObservation budget false invocation (witness.getD (program.threadSchedule budget false invocation))
+  else program.observation budget false invocation
+
+def matches_invocation (program : Ordinary.Program) (budget : Nat) (invocation : Ordinary.Invocation)
+    (status : Nat) (stdout : List UInt8) (witness : Option (List Nat) := none) :=
+  let (result, bytes) := invocation_observation program budget invocation witness
+  process_status result == some status && bytes == stdout
+
+theorem checked_thread_invocation (accepted : validate_ordinary runtime frontends generated = .ok program)
+    (parallel : program.parallel = true) (checked : matches_invocation program budget invocation status stdout witness = true) :
+    ordinary_source frontends = .ok program ∧ ∃ schedule result, process_status result = some status ∧
+      program.sourceThreadObservation budget false invocation schedule = (result, stdout) := by
+  let schedule := witness.getD (program.threadSchedule budget false invocation)
+  rcases ran : program.threadObservation budget false invocation schedule with ⟨result, bytes⟩
+  simp only [matches_invocation, invocation_observation, parallel, if_true] at checked
+  change (process_status (program.threadObservation budget false invocation schedule).1 == some status &&
+    (program.threadObservation budget false invocation schedule).2 == stdout) = true at checked
+  rw [ran] at checked
+  simp only [Bool.and_eq_true, beq_iff_eq] at checked
+  obtain ⟨statusEq, bytesEq⟩ := checked
+  exact ⟨(ordinary_certificate_sound _ _ _ _ accepted).1, schedule, result, statusEq,
+    by rw [← thread_observation_correct, ran, bytesEq]⟩
+
+def Ordinary.Program.sourceBehaviour (program : Ordinary.Program) (invocation : Ordinary.Invocation)
+    (terminal : Bool) (result : TraceOutcome × List UInt8) : Prop :=
+  if program.parallel then result.1 ≠ .paused ∧ ∃ depth schedule,
+    program.sourceThreadObservation depth terminal invocation schedule = result
+  else Ordinary.Observes (fun fuel => program.source_observation fuel terminal invocation) result
+
+def Ordinary.Program.targetBehaviour (program : Ordinary.Program) (invocation : Ordinary.Invocation)
+    (terminal : Bool) (result : TraceOutcome × List UInt8) : Prop :=
+  if program.parallel then result.1 ≠ .paused ∧ ∃ depth schedule,
+    program.threadObservation depth terminal invocation schedule = result
+  else Ordinary.Observes (fun fuel => program.observation fuel terminal invocation) result
+
+theorem certified_behaviours (accepted : validate_ordinary runtime frontends generated = .ok program)
+    (invocation : Ordinary.Invocation) (terminal : Bool) (result : TraceOutcome × List UInt8) :
+    program.targetBehaviour invocation terminal result ↔ program.sourceBehaviour invocation terminal result := by
+  cases mode : program.parallel with
+  | true => simp only [Ordinary.Program.targetBehaviour, Ordinary.Program.sourceBehaviour, mode, if_true,
+      thread_observation_correct]
+  | false => exact (by simpa only [Ordinary.Program.targetBehaviour, Ordinary.Program.sourceBehaviour, mode,
+      Bool.false_eq_true, if_false] using ordinary_completed_behaviour _ _ _ _ accepted invocation terminal result)
+
+theorem distinct_native_results_preclude_adequacy
+    (accepted : validate_ordinary runtime frontends generated = .ok program)
+    (sequential : program.parallel = false) (invocation : Ordinary.Invocation) (terminal : Bool)
+    (native : TraceOutcome × List UInt8 → Prop) (left : native first) (right : native second)
+    (different : first ≠ second) :
+    ¬ (∀ result, native result ↔ program.sourceBehaviour invocation terminal result) := by
+  intro adequate
+  have observed result (possible : native result) :=
+    (certified_behaviours accepted invocation terminal result).mpr ((adequate result).mp possible)
+  have a := observed first left
+  have b := observed second right
+  simp only [Ordinary.Program.targetBehaviour, sequential, Bool.false_eq_true, if_false] at a b
+  exact different (Ordinary.completed_observations_unique program terminal invocation first second a b)
+
 theorem ordinary_executable_behaviour (input : Input) (artifact : Executable) (runtime : String)
     (frontends : List String) (generated : String) (program : Ordinary.Program)
     (frontend : Input → Except String (List String)) (ghc : String → Except String Executable)
@@ -2706,11 +4725,11 @@ theorem ordinary_executable_behaviour (input : Input) (artifact : Executable) (r
     (accepted : validate_ordinary runtime frontends generated = .ok program)
     (frontend_adequate : frontend input = .ok frontends → ordinary_source frontends = .ok program →
       ∀ invocation terminal result, native_observes input invocation terminal result ↔
-        Ordinary.Observes (fun fuel => program.source_observation fuel terminal invocation) result)
+        program.sourceBehaviour invocation terminal result)
     (ghc_adequate : ∀ prelude body, standalone_runtime runtime = .ok prelude → runtime = ordinary_runtime →
       generated = prelude ++ "\n" ++ body → ordinary_locations body = .ok program.moduleBody → ghc generated = .ok artifact →
       ∀ invocation terminal result, executable_observes artifact invocation terminal result ↔
-        Ordinary.Observes (fun fuel => program.observation fuel terminal invocation) result) :
+        program.targetBehaviour invocation terminal result) :
     ∀ invocation terminal result, executable_observes artifact invocation terminal result ↔
       native_observes input invocation terminal result := by
   obtain ⟨decoded, checks, ⟨prelude, body, runtimeOk, exactBody, normal⟩, _⟩ :=
@@ -2721,7 +4740,7 @@ theorem ordinary_executable_behaviour (input : Input) (artifact : Executable) (r
     exact beq_iff_eq.mp checks.1
   intro invocation terminal result
   exact (ghc_adequate prelude body runtimeOk pinned exactBody normal built invocation terminal result).trans
-    ((ordinary_completed_behaviour runtime frontends generated program accepted invocation terminal result).trans
+    ((certified_behaviours accepted invocation terminal result).trans
       (frontend_adequate dumped decoded invocation terminal result).symm)
 
 theorem ordinary_registered_call (runtime : String) (frontends : List String) (generated : String)
@@ -2744,7 +4763,7 @@ theorem ordinary_global_initialiser_in_bounds (runtime : String) (frontends : Li
     (program : Ordinary.Program) (accepted : validate_ordinary runtime frontends generated = .ok program)
     (object : Ordinary.Global) (allocated : object ∈ program.globals)
     (init : Ordinary.Initialiser) (present : init ∈ object.initialisers) :
-    init.offset.getD 0 + init.ty.width ≤ object.width := by
+    init.offsets.sum + init.ty.width ≤ object.width := by
   obtain ⟨_, _, _, _, _, _, stores, _⟩ := ordinary_link_order frontends program
     (ordinary_certificate_sound runtime frontends generated program accepted).1
   exact object.initialiser_in_bounds (List.all_eq_true.mp stores object allocated) init present
@@ -2796,12 +4815,6 @@ private def SharedExpression.haskell : SharedExpression → String
   | .call name => "invoke (Just (IntegerType 32 True)) (function " ++ haskell_quote name ++ ") []"
   | .choose common fallback => "conditional (" ++ common.haskell ++
       ") (\\shared -> pure shared) (\\shared -> pure shared) (" ++ fallback.haskell ++ ")"
-
-private def refers_to_common (common opaqueNode : Json) : Bool :=
-  match child_nodes opaqueNode with
-  | [child] => field_text opaqueNode "kind" == "OpaqueValueExpr" && field_text common "id" != "" &&
-      field_text child "id" == field_text common "id" && type_spelling opaqueNode == "int"
-  | _ => false
 
 private def read_shared : Nat → Json → Except String SharedExpression
   | 0, _ => .error "incomplete shared expression"
@@ -2910,6 +4923,9 @@ end Heresy
 #print axioms Heresy.ordinary_computed_labels_checked
 #print axioms Heresy.ordinary_observation_sound
 #print axioms Heresy.ordinary_executable_behaviour
+#print axioms Heresy.checked_thread_invocation
+#print axioms Heresy.checked_process_observation
+#print axioms Heresy.ordinary_scheduled_behaviour
 
 #print axioms Heresy.kernel_certificate_sound
 #print axioms Heresy.kernel_return_preserves_result
@@ -2919,6 +4935,8 @@ end Heresy
 #print axioms Heresy.framed_program_certificate_sound
 #print axioms Heresy.closed_executable_exit_refines
 #print axioms Heresy.closed_text_executable_exit
+#print axioms Heresy.closed_native_haskell_agree
+#print axioms Heresy.compile_closed_text_sound
 #print axioms Heresy.certified_helper_uses_bound_arguments
 #print axioms Heresy.link_schedule_order
 #print axioms Heresy.linkage_certificate_routes
@@ -2926,20 +4944,58 @@ end Heresy
 #print axioms Heresy.linkage_certificate_line
 #print axioms Heresy.linkage_validation_sound
 
+private def schedule_inputs (steps : String) (inputs : List String) : IO (Except String (Option (List Nat) × List String)) := do
+  match inputs with
+  | "--schedule" :: file :: frontends =>
+    let text ← IO.FS.readFile file
+    return do
+      let threads : List Nat ← Lean.fromJson? (← Lean.Json.parse text)
+      let some budget := steps.toNat? | throw "expected a numeric step budget"
+      unless threads.length ≤ budget do throw "thread schedule exceeds the step budget"
+      unless !frontends.isEmpty do throw "expected a typed frontend"
+      return (some threads, frontends)
+  | "--schedule" :: _ | [] => return .error "expected a schedule file and a typed frontend"
+  | frontends => return .ok (none, frontends)
+
+private def event_bytes (node : Lean.Json) : Except String (List UInt8) := do
+  if let .str text := node then return text.toUTF8.toList
+  let values : List Nat ← Lean.fromJson? node
+  unless values.all (· < 256) do throw "file event contains an out-of-range byte"
+  return values.map UInt8.ofNat
+
+private def file_event (node : Lean.Json) : Except String Heresy.FileEvent := do
+  let fields ← node.getArr?
+  match fields.toList with
+  | [.str "open", path, mode, ok] => return .opened (← event_bytes path) (← event_bytes mode) (← ok.getBool?)
+  | [.str "read", handle, size, data] =>
+    let payload ← if data == .null then pure none else some <$> event_bytes data
+    return .input (← handle.getNat?) (← size.getNat?) payload
+  | [.str "write", handle, data, ok] => return .output (← handle.getNat?) (← event_bytes data) (← ok.getBool?)
+  | [.str "close", handle, ok] => return .closed (← handle.getNat?) (← ok.getBool?)
+  | _ => throw "expected an open, read, write or close file event"
+
+private def observation_inputs (steps : String) (inputs : List String) :
+    IO (Except String (List Heresy.FileEvent × Option (List Nat) × List String)) := do
+  match inputs with
+  | "--file-events" :: file :: rest =>
+    let text ← IO.FS.readFile file
+    let scheduled ← schedule_inputs steps rest
+    return do
+      let events ← (← (← Lean.Json.parse text).getArr?).toList.mapM file_event
+      return (events, ← scheduled)
+  | _ => return (← schedule_inputs steps inputs).map (fun result => ([], result))
+
 private def check_observation (runtime haskell steps status stdout : String) (frontends : List String)
-    (invocation : Heresy.Ordinary.Invocation) : IO UInt32 := do
+    (invocation : Heresy.Ordinary.Invocation) (witness : Option (List Nat) := none) : IO UInt32 := do
   match steps.toNat?, status.toNat? with
   | some budget, some observedStatus =>
     match Heresy.validate_ordinary (← IO.FS.readFile runtime)
         (← frontends.mapM (fun (path : String) => IO.FS.readFile path)) (← IO.FS.readFile haskell) with
     | .error message => IO.eprintln message; pure 1
     | .ok program =>
-      let (outcome, visible) := program.observation budget false invocation
-      let expected := match outcome with
-        | .returned code => some code.toNat
-        | .fault _ => some 70
-        | .paused => none
-      if expected == some observedStatus && (← IO.FS.readBinFile stdout).data.toList == visible then
+      if witness.isSome && !program.parallel then
+        IO.eprintln "an explicit schedule requires a threaded program"; return 1
+      if Heresy.matches_invocation program budget invocation observedStatus (← IO.FS.readBinFile stdout).data.toList witness then
         IO.println "checked the linked program's exit status and stdout"
         pure 0
       else
@@ -2959,18 +5015,40 @@ def main (arguments : List String) : IO UInt32 := do
   | "ordinary-link" :: runtime :: haskell :: ast :: rest =>
     match Heresy.validate_ordinary (← IO.FS.readFile runtime)
         (← (ast :: rest).mapM (fun (path : String) => IO.FS.readFile path)) (← IO.FS.readFile haskell) with
-    | .ok _ => IO.println "checked all ordinary function bodies, direct calls, and startup"; pure 0
+    | .ok _ => IO.println "checked ordinary function bodies, calls and startup"; pure 0
     | .error message => IO.eprintln message; pure 1
   | "ordinary-observe" :: runtime :: haskell :: steps :: status :: stdout :: ast :: rest =>
     check_observation runtime haskell steps status stdout (ast :: rest) {}
-  | "ordinary-observe-argv" :: runtime :: haskell :: steps :: status :: stdout :: argv :: ast :: rest =>
-    match Heresy.Ordinary.Invocation.decode (← IO.FS.readBinFile argv).data.toList with
-    | some invocation => check_observation runtime haskell steps status stdout (ast :: rest) invocation
-    | none => IO.eprintln "expected NUL-terminated argv entries, including argv[0]"; pure 1
+  | "ordinary-observe-argv" :: runtime :: haskell :: steps :: status :: stdout :: argv :: inputs =>
+    match ← observation_inputs steps inputs with
+    | .error why => IO.eprintln why; pure 1
+    | .ok (events, witness, frontends) =>
+      match Heresy.Ordinary.Invocation.decode (← IO.FS.readBinFile argv).data.toList events with
+      | some invocation => check_observation runtime haskell steps status stdout frontends invocation witness
+      | none => IO.eprintln "expected NUL-terminated argv entries, including argv[0]"; pure 1
+  | "ordinary-ready-argv" :: runtime :: haskell :: steps :: argv :: inputs =>
+    match ← observation_inputs steps inputs with
+    | .error why => IO.eprintln why; pure 1
+    | .ok (events, witness, frontends) =>
+      match steps.toNat?, Heresy.Ordinary.Invocation.decode (← IO.FS.readBinFile argv).data.toList events with
+      | some budget, some invocation =>
+        match Heresy.validate_ordinary (← IO.FS.readFile runtime)
+            (← frontends.mapM (fun (path : String) => IO.FS.readFile path)) (← IO.FS.readFile haskell) with
+        | .error message => IO.eprintln message; pure 1
+        | .ok program =>
+          if witness.isSome && !program.parallel then
+            IO.eprintln "an explicit schedule requires a threaded program"; return 1
+          if (Heresy.process_status (Heresy.invocation_observation program budget invocation witness).1).isSome then
+            IO.println "checked the ordinary lowering and model termination for this invocation"; pure 0
+          else
+            IO.eprintln (if witness.isSome then "the supplied schedule did not reach a process outcome"
+              else "ordinary invocation exceeded its step budget")
+            pure 1
+      | _, _ => IO.eprintln "expected a numeric step budget and NUL-terminated argv entries"; pure 1
   | ["ordinary", runtime, ast, haskell] =>
     match Heresy.validate_ordinary (← IO.FS.readFile runtime) [← IO.FS.readFile ast]
         (← IO.FS.readFile haskell) with
-    | .ok _ => IO.println "checked all ordinary function bodies, direct calls, and startup"; pure 0
+    | .ok _ => IO.println "checked ordinary function bodies, calls and startup"; pure 0
     | .error message => IO.eprintln message; pure 1
   | ["effects", runtime, ast, haskell, stdout] =>
     match Heresy.validate_ordinary (← IO.FS.readFile runtime) [← IO.FS.readFile ast]
@@ -3049,6 +5127,18 @@ def main (arguments : List String) : IO UInt32 := do
     match Heresy.validate_closed_text (← IO.FS.readFile source) (← IO.FS.readFile haskell) with
     | .ok body => IO.println s!"checked closed C source and lowering, exit status {Heresy.source_status body}"; pure 0
     | .error message => IO.eprintln message; pure 1
+  | ["text-compile", source] =>
+    match Heresy.compile_closed_text (← IO.FS.readFile source) with
+    | .ok generated => IO.print generated; pure 0
+    | .error message => IO.eprintln message; pure 1
+  | ["native-compile", source] =>
+    match Heresy.Native.compile (← IO.FS.readFile source) with
+    | .ok image => (← IO.getStdout).write ⟨image.toArray⟩; pure 0
+    | .error message => IO.eprintln message; pure 1
+  | ["native-verify", source, executable] =>
+    match Heresy.Native.verify (← IO.FS.readFile source) (← IO.FS.readBinFile executable).data.toList with
+    | .ok () => IO.println "checked the complete ELF image against the closed C source"; pure 0
+    | .error message => IO.eprintln message; pure 1
   | [ast, haskell] =>
     let frontend ← IO.FS.readFile ast
     let generated ← IO.FS.readFile haskell
@@ -3056,5 +5146,19 @@ def main (arguments : List String) : IO UInt32 := do
     | .ok count => IO.println s!"checked {count} emitted integer kernel(s)"; pure 0
     | .error message => IO.eprintln message; pure 1
   | _ =>
-    IO.eprintln "usage: certificate [program] AST.json Module.hs | certificate text SOURCE.c Module.hs | certificate shared FUNCTION AST.json Module.hs | certificate (dispatch|memory|process) Module.hs | certificate linkage Module.hs AST.json ... | certificate module Heap.hs Module.hs AST.json ... | certificate ordinary Heap.hs AST.json Module.hs | certificate ordinary-link Heap.hs Module.hs AST.json ... | certificate ordinary-observe Heap.hs Module.hs STEPS STATUS STDOUT AST.json ... | certificate ordinary-observe-argv Heap.hs Module.hs STEPS STATUS STDOUT ARGV AST.json ... | certificate effects [Heap.hs AST.json Module.hs] STDOUT"
+    IO.eprintln "usage: certificate [program] AST.json Module.hs | certificate text SOURCE.c Module.hs | certificate (text-compile|native-compile) SOURCE.c | certificate native-verify SOURCE.c ELF | certificate shared FUNCTION AST.json Module.hs | certificate (dispatch|memory|process) Module.hs | certificate linkage Module.hs AST.json ... | certificate module Heap.hs Module.hs AST.json ... | certificate ordinary Heap.hs AST.json Module.hs | certificate ordinary-link Heap.hs Module.hs AST.json ... | certificate ordinary-ready-argv Heap.hs Module.hs STEPS ARGV [--file-events FILE] [--schedule FILE] AST.json ... | certificate ordinary-observe Heap.hs Module.hs STEPS STATUS STDOUT AST.json ... | certificate ordinary-observe-argv Heap.hs Module.hs STEPS STATUS STDOUT ARGV [--file-events FILE] [--schedule FILE] AST.json ... | certificate effects [Heap.hs AST.json Module.hs] STDOUT"
     pure 2
+
+run_cmd
+  let env ← getEnv
+  let mut checked := 0
+  let mut dependencies : CollectAxioms.State := {}
+  for (name, _) in env.constants.toList do
+    unless (`Heresy).isPrefixOf ((privateToUserName? name).getD name) do continue
+    unless getOriginalConstKind? env name matches some .thm | some .axiom do continue
+    checked := checked + 1
+    dependencies := (((CollectAxioms.collect name).run env).run dependencies).2
+  if checked == 0 then throwError "no heresy theorems found"
+  let extra := dependencies.axioms.filter fun name => ![``propext, ``Classical.choice, ``Quot.sound].contains name
+  unless extra.isEmpty do throwError "unverified axioms in heresy proofs: {extra}"
+  logInfo m!"checked {checked} declarations against the kernel axiom set"

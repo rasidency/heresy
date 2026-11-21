@@ -276,6 +276,160 @@ theorem condition_queued_reacquire (thread signal ticket owner : Nat) (condition
   exact ⟨by simp [condition_reacquire, posted, mutex_acquire, different],
     mutex_handoffs_serve_fifo owner thread ticket earlier⟩
 
+structure JoinState (α : Type) where
+  claimant : Option Nat := none
+  result : Option α := none
+  received : Option (Nat × α) := none
+
+def JoinState.published : JoinState α := ⟨none, none, none⟩
+
+inductive JoinEvent (α : Type) where
+  | claim (caller : Nat)
+  | finish (result : α)
+  | receive (caller : Nat) (result : α)
+
+def JoinEvent.claimant : JoinEvent α → Option Nat
+  | .claim caller => some caller
+  | _ => none
+
+def JoinEvent.result : JoinEvent α → Option α
+  | .finish result => some result
+  | _ => none
+
+def JoinEvent.received : JoinEvent α → Option (Nat × α)
+  | .receive caller result => some (caller, result)
+  | _ => none
+
+inductive JoinStep (child : Nat) : JoinState α → JoinEvent α → JoinState α → Prop where
+  | claim : caller ≠ child → before.claimant = none →
+      JoinStep child before (.claim caller) { before with claimant := some caller }
+  | publish : before.result = none →
+      JoinStep child before (.finish result) { before with result := some result }
+  | receive : before.claimant = some caller → before.result = some result → before.received = none →
+      JoinStep child before (.receive caller result) { before with received := some (caller, result) }
+
+inductive JoinTrace (child : Nat) : JoinState α → List (JoinEvent α) → JoinState α → Prop where
+  | empty : JoinTrace child state [] state
+  | step : JoinTrace child initial history before → JoinStep child before event after →
+      JoinTrace child initial (history ++ [event]) after
+
+def JoinState.valid (child : Nat) (state : JoinState α) : Prop :=
+  (∀ caller, state.claimant = some caller → caller ≠ child) ∧
+    ∀ caller result, state.received = some (caller, result) →
+      state.claimant = some caller ∧ state.result = some result
+
+private theorem join_step_valid (step : JoinStep child before event after) (valid : before.valid child) :
+    after.valid child := by
+  cases step with
+  | claim different absent =>
+    constructor
+    · intro caller owned
+      have same := Option.some.inj owned
+      rwa [← same]
+    · intro caller result received
+      have claimed := (valid.2 caller result received).1
+      simp [absent] at claimed
+  | publish absent =>
+    refine ⟨valid.1, ?_⟩
+    intro caller result received
+    have finished := (valid.2 caller result received).2
+    simp [absent] at finished
+  | receive claimed finished _ =>
+    refine ⟨valid.1, ?_⟩
+    intro caller result received
+    obtain ⟨rfl, rfl⟩ := Prod.mk.inj (Option.some.inj received)
+    exact ⟨claimed, finished⟩
+
+theorem join_trace_prefix (history : List (JoinEvent α)) (after : JoinState α)
+    (trace : JoinTrace child .published history after) :
+    history.filterMap JoinEvent.claimant = after.claimant.toList ∧
+      history.filterMap JoinEvent.result = after.result.toList ∧
+      history.filterMap JoinEvent.received = after.received.toList ∧ after.valid child := by
+  generalize fresh : JoinState.published = initial at trace
+  induction trace with
+  | empty => subst initial; simp [JoinState.published, JoinState.valid]
+  | step _ step prior =>
+    obtain ⟨claims, results, receives, valid⟩ := prior
+    refine ⟨?_, ?_, ?_, join_step_valid step valid⟩ <;>
+      cases step <;> simp_all [JoinEvent.claimant, JoinEvent.result, JoinEvent.received]
+
+theorem join_claim_and_post_commute (before : JoinState α) (caller child : Nat) (result : α)
+    (different : caller ≠ child) (unclaimed : before.claimant = none)
+    (unfinished : before.result = none) (undelivered : before.received = none) :
+    let finished : JoinState α := ⟨some caller, some result, some (caller, result)⟩
+    JoinTrace child before [.claim caller, .finish result, .receive caller result] finished ∧
+      JoinTrace child before [.finish result, .claim caller, .receive caller result] finished := by
+  cases before
+  simp only at unclaimed unfinished undelivered
+  subst_vars
+  exact ⟨.step (.step (.step .empty (.claim different rfl)) (.publish rfl)) (.receive rfl rfl rfl),
+    .step (.step (.step .empty (.publish rfl)) (.claim different rfl)) (.receive rfl rfl rfl)⟩
+
+structure JoinCell (α : Type) where
+  registered : Bool
+  running : Bool
+  waiter : Option Nat
+  contents : Option α
+
+inductive CellStep (child : Nat) : JoinCell α → JoinEvent α → JoinCell α → Prop where
+  | claim : caller ≠ child → CellStep child ⟨true, running, none, contents⟩ (.claim caller)
+      ⟨false, running, some caller, contents⟩
+  | post : CellStep child ⟨registered, true, waiter, none⟩ (.finish result)
+      ⟨registered, false, waiter, some result⟩
+  | take : CellStep child ⟨false, running, some caller, some result⟩ (.receive caller result)
+      ⟨false, running, none, none⟩
+
+inductive CellView : JoinCell α → JoinState α → Prop where
+  | fresh : CellView ⟨true, true, none, none⟩ ⟨none, none, none⟩
+  | waiting : CellView ⟨false, true, some caller, none⟩ ⟨some caller, none, none⟩
+  | posted : CellView ⟨true, false, none, some result⟩ ⟨none, some result, none⟩
+  | ready : CellView ⟨false, false, some caller, some result⟩ ⟨some caller, some result, none⟩
+  | taken : CellView ⟨false, false, none, none⟩ ⟨some caller, some result, some (caller, result)⟩
+
+private theorem cell_step_sound (view : CellView cell state) (step : CellStep child cell event next) :
+    ∃ after, JoinStep child state event after ∧ CellView next after := by
+  cases view <;> cases step
+  all_goals first
+    | exact ⟨_, .claim (by assumption) rfl, .waiting⟩
+    | exact ⟨_, .claim (by assumption) rfl, .ready⟩
+    | exact ⟨_, .publish rfl, .posted⟩
+    | exact ⟨_, .publish rfl, .ready⟩
+    | exact ⟨_, .receive rfl rfl rfl, .taken⟩
+
+private theorem cell_step_complete (view : CellView cell state) (step : JoinStep child state event after) :
+    ∃ next, CellStep child cell event next ∧ CellView next after := by
+  cases view <;> cases step <;> simp_all
+  all_goals first
+    | exact ⟨_, .claim (by assumption), .waiting⟩
+    | exact ⟨_, .claim (by assumption), .ready⟩
+    | exact ⟨_, .post, .posted⟩
+    | exact ⟨_, .post, .ready⟩
+    | exact ⟨_, .take, .taken⟩
+
+inductive CellTrace (child : Nat) : List (JoinEvent α) → JoinCell α → Prop where
+  | empty : CellTrace child [] ⟨true, true, none, none⟩
+  | step : CellTrace child history before → CellStep child before event after →
+      CellTrace child (history ++ [event]) after
+
+theorem cell_trace_sound (trace : CellTrace child history cell) :
+    ∃ state, JoinTrace child .published history state ∧ CellView cell state := by
+  induction trace with
+  | empty => exact ⟨_, .empty, .fresh⟩
+  | step _ step prior =>
+    obtain ⟨_, history, view⟩ := prior
+    obtain ⟨_, advances, next⟩ := cell_step_sound view step
+    exact ⟨_, .step history advances, next⟩
+
+theorem cell_trace_complete (trace : JoinTrace child .published history state) :
+    ∃ cell, CellTrace child history cell ∧ CellView cell state := by
+  generalize start : JoinState.published = initial at trace
+  induction trace with
+  | empty => subst initial; exact ⟨_, .empty, .fresh⟩
+  | step _ step prior =>
+    obtain ⟨_, history, view⟩ := prior
+    obtain ⟨_, advances, next⟩ := cell_step_complete view step
+    exact ⟨_, .step history advances, next⟩
+
 end Heresy
 
 #print axioms Heresy.condition_enroll_releases_and_keeps_ticket
@@ -288,3 +442,7 @@ end Heresy
 #print axioms Heresy.condition_enrolment_survives_handoff
 
 #print axioms Heresy.condition_queued_reacquire
+#print axioms Heresy.join_trace_prefix
+#print axioms Heresy.join_claim_and_post_commute
+#print axioms Heresy.cell_trace_sound
+#print axioms Heresy.cell_trace_complete
