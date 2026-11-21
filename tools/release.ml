@@ -15,18 +15,27 @@ let rec remove path =
 let run program arguments =
   if Process.run ~timeout:0. program arguments <> 0 then failwith (program ^ " failed")
 
-let files = [
-  "Containerfile"; ".dockerignore"; ".gitattributes"; ".gitignore"; "README.md";
-  "dune-project"; "dune"; "heresy.opam";
+let verification = [
+  "README.md"; "lean-toolchain"; "lakefile.toml"; "lake-manifest.json"; "runtime/Heap.hs";
+  "proof/Proof.lean"; "proof/Execution.lean"; "proof/Semantics.lean"; "proof/Synchronisation.lean";
+  "proof/Memory.lean"; "proof/Patricia.lean"; "proof/Containers.lean"; "proof/Runtime.lean";
+  "proof/Ordinary.lean"; "proof/Surface.lean"; "proof/Native.lean"; "proof/Schedule.lean";
+  "proof/Certificate.lean"; "assets/pipeline.svg"; "assets/capability.svg"
+]
+
+let files = verification @ [
+  "Containerfile"; ".dockerignore"; ".gitattributes"; ".gitignore"; "dune-project"; "dune"; "heresy.opam";
   "src/dune"; "src/heresy.ml"; "src/process.ml"; "src/process.mli";
-  "runtime/Heap.hs"; "tools/dune"; "tools/embed.ml"; "tools/release.ml";
-  "test/dune"; "test/verify.ml"; "test/fault.ml"; "test/closed.c"; "test/frames.c"; "test/helpers.c"; "test/recursive.c"; "test/shared.c"; "test/slots.c"; "test/lowering.c"; "test/values.c"; "proof/Proof.lean"; "proof/Execution.lean"; "proof/Semantics.lean"; "proof/Synchronisation.lean"; "proof/Memory.lean"; "proof/Certificate.lean";
-  "test/linkage/entry.c"; "test/linkage/worker.c";
-  "assets/pipeline.svg"; "assets/capability.svg"; "assets/pipeline.dot"; "assets/capability.dot";
-  "lean-toolchain"; "lakefile.toml"; "lake-manifest.json";
-  "examples/alias.c"; "examples/bounds.c"; "examples/codec.c";
-  "examples/flows.c"; "examples/machine.c"; "examples/regression.c";
-  ".github/workflows/verify.yml"
+  "tools/dune"; "tools/embed.ml"; "tools/release.ml"; "test/dune"; "test/verify.ml"; "test/fault.ml";
+  "test/arguments.c"; "test/arithmetic.c"; "test/arrays.c"; "test/atomics.c"; "test/callback.c"; "test/captured.c"; "test/closed.c";
+  "test/condition.c"; "test/control.c"; "test/dispatch.c"; "test/effects.c"; "test/exit.c"; "test/extended.c"; "test/extents.c";
+  "test/fields.c"; "test/frames.c"; "test/handoff.c"; "test/helpers.c"; "test/lowering.c";
+  "test/native/address.c"; "test/order.c"; "test/packets.c"; "test/parameters.c"; "test/records.c"; "test/recursion.c"; "test/recursive.c";
+  "test/shared.c"; "test/stdio.c"; "test/streams.c"; "test/threads.c"; "test/transfers.c"; "test/slots.c"; "test/values.c"; "test/varargs.c";
+  "test/linkage/client.c"; "test/linkage/entry.c"; "test/linkage/packet.c"; "test/linkage/packet.h";
+  "test/linkage/scalar.h"; "test/linkage/server.c"; "test/linkage/shape.c"; "test/linkage/worker.c";
+  "assets/pipeline.dot"; "assets/capability.dot"; "examples/alias.c"; "examples/bounds.c"; "examples/codec.c";
+  "examples/flows.c"; "examples/machine.c"; "examples/regression.c"; ".github/workflows/verify.yml"
 ]
 
 let () =
@@ -45,14 +54,15 @@ let () =
       Unix.mkdir stage 0o755;
       Unix.mkdir (Filename.concat stage "bin") 0o755;
       Unix.mkdir (Filename.concat stage "proof") 0o755;
+      Unix.mkdir (Filename.concat stage "runtime") 0o755;
       Unix.mkdir (Filename.concat stage "assets") 0o755;
       let compiler = Filename.concat (Filename.dirname Sys.executable_name) "../src/heresy.exe" in
-      let target = Filename.concat stage "bin/heresy" in
-      write target (read compiler);
-      Unix.chmod target 0o755;
-      List.iter (fun name -> write (Filename.concat stage name) (read name))
-        ["README.md"; "proof/Proof.lean"; "proof/Execution.lean"; "proof/Semantics.lean"; "proof/Synchronisation.lean"; "proof/Memory.lean"; "proof/Certificate.lean"; "lean-toolchain"; "lakefile.toml"; "lake-manifest.json";
-         "assets/pipeline.svg"; "assets/capability.svg"];
+      run "lake" ["build"; "certificate"];
+      List.iter (fun (path, name) ->
+        let target = Filename.concat stage ("bin/" ^ name) in
+        run "cp" ["--"; path; target];
+        Unix.chmod target 0o755) [compiler, "heresy"; ".lake/build/bin/certificate", "certificate"];
+      List.iter (fun name -> write (Filename.concat stage name) (read name)) verification;
       let archive name directory members =
         let tar = Filename.concat temporary (name ^ ".tar") in
         run "tar" (["--sort=name"; "--format=gnu"; "--mtime=@" ^ epoch; "--owner=0"; "--group=0"; "--numeric-owner"; "--mode=u=rwX,go=rX"; "-cf"; tar; "-C"; directory; "--"] @ members);
