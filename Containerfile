@@ -55,6 +55,10 @@ ENV PATH=/opt/lean/bin:$PATH
 USER heresy
 
 FROM proofchain AS build
+COPY --chown=10001:10001 lean-toolchain lakefile.toml lake-manifest.json ./
+COPY --chown=10001:10001 proof proof
+COPY --chown=10001:10001 runtime/Heap.hs runtime/Heap.hs
+RUN lake build
 COPY --chown=10001:10001 . .
-RUN dune build --profile release @all && lake build
+RUN lake build --no-build && dune build --profile release @all
 CMD ["sh", "-c", "lake build && dune runtest --profile release && dune build --profile release @integration"]
