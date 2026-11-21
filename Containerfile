@@ -57,4 +57,4 @@ USER heresy
 FROM proofchain AS build
 COPY --chown=10001:10001 . .
 RUN dune build --profile release @all && lake build
-CMD ["sh", "-c", "lake build && dune runtest --profile release"]
+CMD ["sh", "-c", "lake build && dune runtest --profile release && dune build --profile release @integration"]

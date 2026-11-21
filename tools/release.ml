@@ -26,7 +26,7 @@ let verification = [
 let files = verification @ [
   "Containerfile"; ".dockerignore"; ".gitattributes"; ".gitignore"; "dune-project"; "dune"; "heresy.opam";
   "src/dune"; "src/heresy.ml"; "src/process.ml"; "src/process.mli";
-  "tools/dune"; "tools/embed.ml"; "tools/release.ml"; "test/dune"; "test/verify.ml"; "test/fault.ml"; "test/differential.ml"; "test/Replay.hs";
+  "tools/dune"; "tools/embed.ml"; "tools/release.ml"; "test/dune"; "test/verify.ml"; "test/fault.ml"; "test/differential.ml"; "test/Replay.hs"; "test/scenarios.sh";
   "test/arguments.c"; "test/arithmetic.c"; "test/arrays.c"; "test/atomics.c"; "test/callback.c"; "test/captured.c"; "test/closed.c";
   "test/condition.c"; "test/control.c"; "test/dispatch.c"; "test/effects.c"; "test/exit.c"; "test/extended.c"; "test/extents.c";
   "test/fields.c"; "test/frames.c"; "test/handoff.c"; "test/helpers.c"; "test/lowering.c";
