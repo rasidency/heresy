@@ -26,7 +26,17 @@ let verification = [
 let files = verification @ [
   "Containerfile"; ".dockerignore"; ".gitattributes"; ".gitignore"; "dune-project"; "dune"; "heresy.opam";
   "src/dune"; "src/heresy.ml"; "src/process.ml"; "src/process.mli";
-  "tools/dune"; "tools/embed.ml"; "tools/release.ml"; "test/dune"; "test/verify.ml"; "test/fault.ml"; "test/differential.ml"; "test/Replay.hs"; "test/scenarios.sh";
+  "tools/dune"; "tools/embed.ml"; "tools/release.ml"; "test/dune"; "test/verify.ml"; "test/fault.ml"; "test/differential.ml"; "test/Replay.hs"; "test/scenario.sh"; "test/scenarios/dune";
+  "test/scenarios/arguments.sh"; "test/scenarios/arithmetic.sh"; "test/scenarios/arrays.sh";
+  "test/scenarios/callback.sh"; "test/scenarios/captured.sh"; "test/scenarios/closed.sh";
+  "test/scenarios/codec.sh"; "test/scenarios/condition.sh"; "test/scenarios/control.sh";
+  "test/scenarios/dispatch.sh"; "test/scenarios/effects.sh"; "test/scenarios/exit.sh";
+  "test/scenarios/extents.sh"; "test/scenarios/fields.sh"; "test/scenarios/handoff.sh";
+  "test/scenarios/linkage.sh"; "test/scenarios/machine.sh"; "test/scenarios/packets.sh";
+  "test/scenarios/parameters.sh"; "test/scenarios/programs.sh"; "test/scenarios/records.sh";
+  "test/scenarios/recursion.sh"; "test/scenarios/shared.sh"; "test/scenarios/stdio.sh";
+  "test/scenarios/streams.sh"; "test/scenarios/threads.sh"; "test/scenarios/values.sh";
+  "test/scenarios/varargs.sh";
   "test/arguments.c"; "test/arithmetic.c"; "test/arrays.c"; "test/atomics.c"; "test/callback.c"; "test/captured.c"; "test/closed.c";
   "test/condition.c"; "test/control.c"; "test/dispatch.c"; "test/effects.c"; "test/exit.c"; "test/extended.c"; "test/extents.c";
   "test/fields.c"; "test/frames.c"; "test/handoff.c"; "test/helpers.c"; "test/lowering.c";

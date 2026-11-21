@@ -1,0 +1,139 @@
+(rule
+ (alias integration)
+ (deps (universe) (source_tree ../../examples) (source_tree ..) ../../runtime/Heap.hs)
+ (action (chdir %{workspace_root} (run sh %{dep:../scenario.sh} %{exe:../../src/heresy.exe} %{env:HERESY_CERTIFICATE=../../.lake/build/bin/certificate} %{dep:arguments.sh}))))
+
+(rule
+ (alias integration)
+ (deps (universe) (source_tree ../../examples) (source_tree ..) ../../runtime/Heap.hs)
+ (action (chdir %{workspace_root} (run sh %{dep:../scenario.sh} %{exe:../../src/heresy.exe} %{env:HERESY_CERTIFICATE=../../.lake/build/bin/certificate} %{dep:arithmetic.sh}))))
+
+(rule
+ (alias integration)
+ (deps (universe) (source_tree ../../examples) (source_tree ..) ../../runtime/Heap.hs)
+ (action (chdir %{workspace_root} (run sh %{dep:../scenario.sh} %{exe:../../src/heresy.exe} %{env:HERESY_CERTIFICATE=../../.lake/build/bin/certificate} %{dep:arrays.sh}))))
+
+(rule
+ (alias integration)
+ (deps (universe) (source_tree ../../examples) (source_tree ..) ../../runtime/Heap.hs)
+ (action (chdir %{workspace_root} (run sh %{dep:../scenario.sh} %{exe:../../src/heresy.exe} %{env:HERESY_CERTIFICATE=../../.lake/build/bin/certificate} %{dep:callback.sh}))))
+
+(rule
+ (alias integration)
+ (deps (universe) (source_tree ../../examples) (source_tree ..) ../../runtime/Heap.hs)
+ (action (chdir %{workspace_root} (run sh %{dep:../scenario.sh} %{exe:../../src/heresy.exe} %{env:HERESY_CERTIFICATE=../../.lake/build/bin/certificate} %{dep:captured.sh}))))
+
+(rule
+ (alias integration)
+ (deps (universe) (source_tree ../../examples) (source_tree ..) ../../runtime/Heap.hs)
+ (action (chdir %{workspace_root} (run sh %{dep:../scenario.sh} %{exe:../../src/heresy.exe} %{env:HERESY_CERTIFICATE=../../.lake/build/bin/certificate} %{dep:closed.sh}))))
+
+(rule
+ (alias integration)
+ (deps (universe) (source_tree ../../examples) (source_tree ..) ../../runtime/Heap.hs)
+ (action (chdir %{workspace_root} (run sh %{dep:../scenario.sh} %{exe:../../src/heresy.exe} %{env:HERESY_CERTIFICATE=../../.lake/build/bin/certificate} %{dep:codec.sh}))))
+
+(rule
+ (alias integration)
+ (deps (universe) (source_tree ../../examples) (source_tree ..) ../../runtime/Heap.hs)
+ (action (chdir %{workspace_root} (run sh %{dep:../scenario.sh} %{exe:../../src/heresy.exe} %{env:HERESY_CERTIFICATE=../../.lake/build/bin/certificate} %{dep:condition.sh}))))
+
+(rule
+ (alias integration)
+ (deps (universe) (source_tree ../../examples) (source_tree ..) ../../runtime/Heap.hs)
+ (action (chdir %{workspace_root} (run sh %{dep:../scenario.sh} %{exe:../../src/heresy.exe} %{env:HERESY_CERTIFICATE=../../.lake/build/bin/certificate} %{dep:control.sh}))))
+
+(rule
+ (alias integration)
+ (deps (universe) (source_tree ../../examples) (source_tree ..) ../../runtime/Heap.hs)
+ (action (chdir %{workspace_root} (run sh %{dep:../scenario.sh} %{exe:../../src/heresy.exe} %{env:HERESY_CERTIFICATE=../../.lake/build/bin/certificate} %{dep:dispatch.sh}))))
+
+(rule
+ (alias integration)
+ (deps (universe) (source_tree ../../examples) (source_tree ..) ../../runtime/Heap.hs)
+ (action (chdir %{workspace_root} (run sh %{dep:../scenario.sh} %{exe:../../src/heresy.exe} %{env:HERESY_CERTIFICATE=../../.lake/build/bin/certificate} %{dep:effects.sh}))))
+
+(rule
+ (alias integration)
+ (deps (universe) (source_tree ../../examples) (source_tree ..) ../../runtime/Heap.hs)
+ (action (chdir %{workspace_root} (run sh %{dep:../scenario.sh} %{exe:../../src/heresy.exe} %{env:HERESY_CERTIFICATE=../../.lake/build/bin/certificate} %{dep:exit.sh}))))
+
+(rule
+ (alias integration)
+ (deps (universe) (source_tree ../../examples) (source_tree ..) ../../runtime/Heap.hs)
+ (action (chdir %{workspace_root} (run sh %{dep:../scenario.sh} %{exe:../../src/heresy.exe} %{env:HERESY_CERTIFICATE=../../.lake/build/bin/certificate} %{dep:extents.sh}))))
+
+(rule
+ (alias integration)
+ (deps (universe) (source_tree ../../examples) (source_tree ..) ../../runtime/Heap.hs)
+ (action (chdir %{workspace_root} (run sh %{dep:../scenario.sh} %{exe:../../src/heresy.exe} %{env:HERESY_CERTIFICATE=../../.lake/build/bin/certificate} %{dep:fields.sh}))))
+
+(rule
+ (alias integration)
+ (deps (universe) (source_tree ../../examples) (source_tree ..) ../../runtime/Heap.hs)
+ (action (chdir %{workspace_root} (run sh %{dep:../scenario.sh} %{exe:../../src/heresy.exe} %{env:HERESY_CERTIFICATE=../../.lake/build/bin/certificate} %{dep:handoff.sh}))))
+
+(rule
+ (alias integration)
+ (deps (universe) (source_tree ../../examples) (source_tree ..) ../../runtime/Heap.hs)
+ (action (chdir %{workspace_root} (run sh %{dep:../scenario.sh} %{exe:../../src/heresy.exe} %{env:HERESY_CERTIFICATE=../../.lake/build/bin/certificate} %{dep:linkage.sh}))))
+
+(rule
+ (alias integration)
+ (deps (universe) (source_tree ../../examples) (source_tree ..) ../../runtime/Heap.hs)
+ (action (chdir %{workspace_root} (run sh %{dep:../scenario.sh} %{exe:../../src/heresy.exe} %{env:HERESY_CERTIFICATE=../../.lake/build/bin/certificate} %{dep:machine.sh}))))
+
+(rule
+ (alias integration)
+ (deps (universe) (source_tree ../../examples) (source_tree ..) ../../runtime/Heap.hs)
+ (action (chdir %{workspace_root} (run sh %{dep:../scenario.sh} %{exe:../../src/heresy.exe} %{env:HERESY_CERTIFICATE=../../.lake/build/bin/certificate} %{dep:packets.sh}))))
+
+(rule
+ (alias integration)
+ (deps (universe) (source_tree ../../examples) (source_tree ..) ../../runtime/Heap.hs)
+ (action (chdir %{workspace_root} (run sh %{dep:../scenario.sh} %{exe:../../src/heresy.exe} %{env:HERESY_CERTIFICATE=../../.lake/build/bin/certificate} %{dep:parameters.sh}))))
+
+(rule
+ (alias integration)
+ (deps (universe) (source_tree ../../examples) (source_tree ..) ../../runtime/Heap.hs)
+ (action (chdir %{workspace_root} (run sh %{dep:../scenario.sh} %{exe:../../src/heresy.exe} %{env:HERESY_CERTIFICATE=../../.lake/build/bin/certificate} %{dep:programs.sh}))))
+
+(rule
+ (alias integration)
+ (deps (universe) (source_tree ../../examples) (source_tree ..) ../../runtime/Heap.hs)
+ (action (chdir %{workspace_root} (run sh %{dep:../scenario.sh} %{exe:../../src/heresy.exe} %{env:HERESY_CERTIFICATE=../../.lake/build/bin/certificate} %{dep:records.sh}))))
+
+(rule
+ (alias integration)
+ (deps (universe) (source_tree ../../examples) (source_tree ..) ../../runtime/Heap.hs)
+ (action (chdir %{workspace_root} (run sh %{dep:../scenario.sh} %{exe:../../src/heresy.exe} %{env:HERESY_CERTIFICATE=../../.lake/build/bin/certificate} %{dep:recursion.sh}))))
+
+(rule
+ (alias integration)
+ (deps (universe) (source_tree ../../examples) (source_tree ..) ../../runtime/Heap.hs)
+ (action (chdir %{workspace_root} (run sh %{dep:../scenario.sh} %{exe:../../src/heresy.exe} %{env:HERESY_CERTIFICATE=../../.lake/build/bin/certificate} %{dep:shared.sh}))))
+
+(rule
+ (alias integration)
+ (deps (universe) (source_tree ../../examples) (source_tree ..) ../../runtime/Heap.hs)
+ (action (chdir %{workspace_root} (run sh %{dep:../scenario.sh} %{exe:../../src/heresy.exe} %{env:HERESY_CERTIFICATE=../../.lake/build/bin/certificate} %{dep:stdio.sh}))))
+
+(rule
+ (alias integration)
+ (deps (universe) (source_tree ../../examples) (source_tree ..) ../../runtime/Heap.hs)
+ (action (chdir %{workspace_root} (run sh %{dep:../scenario.sh} %{exe:../../src/heresy.exe} %{env:HERESY_CERTIFICATE=../../.lake/build/bin/certificate} %{dep:streams.sh}))))
+
+(rule
+ (alias integration)
+ (deps (universe) (source_tree ../../examples) (source_tree ..) ../../runtime/Heap.hs)
+ (action (chdir %{workspace_root} (run sh %{dep:../scenario.sh} %{exe:../../src/heresy.exe} %{env:HERESY_CERTIFICATE=../../.lake/build/bin/certificate} %{dep:threads.sh}))))
+
+(rule
+ (alias integration)
+ (deps (universe) (source_tree ../../examples) (source_tree ..) ../../runtime/Heap.hs)
+ (action (chdir %{workspace_root} (run sh %{dep:../scenario.sh} %{exe:../../src/heresy.exe} %{env:HERESY_CERTIFICATE=../../.lake/build/bin/certificate} %{dep:values.sh}))))
+
+(rule
+ (alias integration)
+ (deps (universe) (source_tree ../../examples) (source_tree ..) ../../runtime/Heap.hs)
+ (action (chdir %{workspace_root} (run sh %{dep:../scenario.sh} %{exe:../../src/heresy.exe} %{env:HERESY_CERTIFICATE=../../.lake/build/bin/certificate} %{dep:varargs.sh}))))
