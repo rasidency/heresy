@@ -13,6 +13,10 @@ jobs:
   verify:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        task: [runtest, integration, release]
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
@@ -23,9 +27,13 @@ jobs:
           tags: heresy
           load: true
           cache-from: type=gha
-          cache-to: type=gha,mode=max
-      - run: docker run --rm --network none heresy
-      - run: >-
+          cache-to: ${{ matrix.task == 'runtest' && 'type=gha,mode=max' || '' }}
+      - if: matrix.task == 'runtest'
+        run: docker run --rm --network none heresy sh -c 'lake build && dune runtest --profile release'
+      - if: matrix.task == 'integration'
+        run: docker run --rm --network none heresy sh -c 'lake build --no-build && dune build --profile release @integration'
+      - if: matrix.task == 'release'
+        run: >-
           docker run --rm --network none heresy sh -c
           'dune exec --profile release tools/release.exe -- /tmp/first &&
           dune exec --profile release tools/release.exe -- /tmp/second &&
