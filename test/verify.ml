@@ -43,9 +43,33 @@ let pcap big nano packets =
   encoded 4 big magic ^ encoded 2 big 2L ^ encoded 2 big 4L ^ String.make 8 '\000' ^ encoded 4 big 65535L ^ encoded 4 big 1L ^
   String.concat "" (List.map (fun packet -> String.make 8 '\000' ^ encoded 4 big (Int64.of_int (String.length packet)) ^ encoded 4 big (Int64.of_int (String.length packet)) ^ packet) packets)
 
+let ordinary_fixtures compiler certificate =
+  let sources dir =
+    Sys.readdir dir |> Array.to_list |> List.filter (fun name -> Filename.check_suffix name ".c")
+    |> List.sort String.compare |> List.map (Filename.concat dir) in
+  let linked = [
+    ["test/packets.c"; "test/linkage/packet.c"];
+    ["test/parameters.c"; "test/linkage/shape.c"];
+    ["test/linkage/entry.c"; "test/linkage/worker.c"];
+    ["test/linkage/client.c"; "test/linkage/server.c"]] in
+  let all = sources "examples" @ sources "test" @ sources "test/linkage" in
+  let grouped = List.concat linked in
+  let builds = List.filter_map (fun file ->
+    if List.mem file grouped then None else Some [file]) all @ linked in
+  let accepted = List.fold_left (fun count files ->
+    let code, _, errors = run compiler (files @ ["--certificate"; certificate; "--check"]) in
+    if code = 0 then count + 1 else begin
+      Printf.eprintf "%s\n%s%!" (String.concat " + " files) errors;
+      count
+    end) 0 builds in
+  Printf.printf "%d/%d ordinary fixture builds certified\n%!" accepted (List.length builds);
+  accepted = List.length builds
+
 let () =
   try
-    if Array.length Sys.argv <> 3 then raise (Failure "usage: verify compiler fault");
+    if Array.length Sys.argv = 4 && Sys.argv.(1) = "--ordinary" then
+      exit (if ordinary_fixtures Sys.argv.(2) Sys.argv.(3) then 0 else 1);
+    if Array.length Sys.argv <> 3 then raise (Failure "usage: verify compiler fault | verify --ordinary compiler certificate");
     let compiler = Unix.realpath Sys.argv.(1) in
     let fault = Unix.realpath Sys.argv.(2) in
     let frontend = match Sys.getenv_opt "FILCC" with Some f -> f | None ->
@@ -214,6 +238,8 @@ let () =
     ignore (fixture "visible" "#include <stdio.h>\nint main(void){for(int i=0;i<2048;i++)putchar(65);FILE *stream=fopen(\"/proc/self/fd/1\",\"rb\");if(!stream)return 2;char bytes[2048];size_t visible=fread(bytes,1,sizeof bytes,stream);return fclose(stream)||visible!=1025;}");
     let calls = fixture "calls" "#include <stdio.h>\nlong wide(long x){return x;} int narrow(void){return -1;} int one(int x){return x;} int main(void){long(*a)(int)=(long(*)(int))wide;long(*r)(void)=(long(*)(void))narrow;int(*many)(int,int)=(int(*)(int,int))one;printf(\"%ld %ld %d\\n\",a(-1),r(),many(3,4));printf(\"%04d %hhd %hhu %o %X\\n\",-7,-1,255,15U,255U);int c=putchar(-1);printf(\" %d\\n\",c);return 0;}" in
     check "calling convention slots and integer formats" (contains calls "4294967295 4294967295 3" && contains calls "-007 -1 255 17 FF" && contains calls "\255 255");
+    let order = fixture "order" (read "test/order.c") in
+    check "scalar updates and aggregate assignments preserve observable operand order" (order = "VBIVBIPRVI 3 0\n");
     let lowered = fixture "lowering" (read "test/lowering.c") in
     let values = fixture "values" (read "test/values.c") in
     check "shared conditional operands retain effects and result conversions"

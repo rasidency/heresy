@@ -37,6 +37,15 @@ right:
     return 73;
 }
 
+static int indexed(int index) {
+    static void *const targets[] = {&&left, &&right};
+    goto *targets[index];
+left:
+    return 72;
+right:
+    return 73;
+}
+
 int main(void) {
     int first = route(1);
     int ranged = route(4);
@@ -50,6 +59,8 @@ int main(void) {
     }
     int left = indirect(1);
     int right = indirect(0);
+    if (left != indexed(0) || right != indexed(1))
+        return 3;
     putchar(left);
     putchar(right);
     putchar(10);
