@@ -2966,6 +2966,6 @@ let () =
   try main () with
   | Error message | Process.Error message | Sys_error message -> prerr_endline ("heresy: " ^ message); exit 1
   | Process.Timeout seconds -> Printf.eprintf "heresy: tool timed out after %.3g seconds\n" seconds; exit 124
-  | Process.Interrupted signal -> prerr_endline "heresy: interrupted"; exit (if signal = Sys.sigint then 130 else 143)
+  | Process.Interrupted signal -> prerr_endline "heresy: interrupted"; exit (128 + Sys.signal_to_int signal)
   | Stack_overflow -> prerr_endline "heresy: input exceeds the compiler nesting limit"; exit 1
   | Unix.Unix_error (error, operation, path) -> prerr_endline ("heresy: " ^ operation ^ " " ^ path ^ ": " ^ Unix.error_message error); exit 1

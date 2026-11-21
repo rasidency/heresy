@@ -88,5 +88,5 @@ let () =
   with
   | Failure message | Process.Error message | Sys_error message -> prerr_endline ("release: " ^ message); exit 1
   | Process.Timeout _ -> prerr_endline "release: tool timed out"; exit 124
-  | Process.Interrupted _ -> prerr_endline "release: interrupted"; exit 130
+  | Process.Interrupted signal -> prerr_endline "release: interrupted"; exit (128 + Sys.signal_to_int signal)
   | Unix.Unix_error (error, operation, path) -> prerr_endline ("release: " ^ operation ^ " " ^ path ^ ": " ^ Unix.error_message error); exit 1

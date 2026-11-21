@@ -7,7 +7,7 @@ let rec wait pid =
 
 let status = function
   | Unix.WEXITED code -> code
-  | Unix.WSIGNALED _ | Unix.WSTOPPED _ -> 128
+  | Unix.WSIGNALED signal | Unix.WSTOPPED signal -> 128 + Sys.signal_to_int signal
 
 let with_child ~timeout ~stdout ~stderr ?env ?observation program arguments action =
   if not (Float.is_finite timeout) || timeout < 0. then invalid_arg "process timeout must be finite and nonnegative";
@@ -61,7 +61,7 @@ let observe ~timeout ~stdout ~argv0 program arguments =
       match result with
       | Unix.WEXITED code -> code
       | Unix.WSIGNALED signal | Unix.WSTOPPED signal ->
-          raise (Error ("observed executable terminated by signal " ^ string_of_int signal))))
+          raise (Error ("observed executable terminated by " ^ Sys.signal_to_string signal))))
 
 let capture ~timeout ~limit ?env program arguments =
   let input, output = Unix.pipe ~cloexec:true () in
@@ -83,6 +83,8 @@ let capture ~timeout ~limit ?env program arguments =
         end
       in
       read ();
-      let code = status (reap ()) in
-      if code <> 0 then raise (Error (program ^ " exited with status " ^ string_of_int code));
-      Buffer.contents buffer))
+      match reap () with
+      | Unix.WEXITED 0 -> Buffer.contents buffer
+      | Unix.WEXITED code -> raise (Error (program ^ " exited with status " ^ string_of_int code))
+      | Unix.WSIGNALED signal | Unix.WSTOPPED signal ->
+          raise (Error (program ^ " terminated by " ^ Sys.signal_to_string signal))))
