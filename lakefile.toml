@@ -50,7 +50,13 @@ srcDir = "proof"
 name = "Schedule"
 srcDir = "proof"
 
+[[input_file]]
+name = "runtime"
+path = "runtime/Heap.hs"
+text = true
+
 [[lean_exe]]
 name = "certificate"
 root = "Certificate"
 srcDir = "proof"
+needs = ["runtime"]
