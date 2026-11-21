@@ -27,8 +27,10 @@
 
 (rule
  (alias integration)
- (deps (universe) test/scenarios.sh test/Replay.hs runtime/Heap.hs (source_tree examples) (source_tree test))
- (action
-  (progn
-   (run sh test/scenarios.sh %{exe:src/heresy.exe} %{env:HERESY_CERTIFICATE=../../.lake/build/bin/certificate})
-   (run %{exe:test/differential.exe} %{env:HERESY_REPLAY=../../.lake/build/bin/replay} runtime test/Replay.hs))))
+ (deps (universe) test/Replay.hs runtime/Heap.hs)
+ (action (run %{exe:test/differential.exe} %{env:HERESY_REPLAY=../../.lake/build/bin/replay} runtime test/Replay.hs)))
+
+(rule
+ (alias integration)
+ (deps (universe) (source_tree examples) (source_tree test))
+ (action (run %{exe:test/verify.exe} --ordinary %{exe:src/heresy.exe} %{env:HERESY_CERTIFICATE=../../.lake/build/bin/certificate})))

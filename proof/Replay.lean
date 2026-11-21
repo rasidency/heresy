@@ -25,7 +25,11 @@ partial def replay (stdin : IO.FS.Stream) (state : HeapState) (table : Array Poi
   let some request := effect table words
     | IO.eprintln s!"malformed request: {line.trim}"; return 2
   match heap_effect state request with
-  | .error _ => IO.println "fault"; return 0
+  | .error _ =>
+    IO.println "fault"
+    match request with
+    | .allocate .. | .loadPointer _ => replay stdin state (table.push ⟨0, 0⟩)
+    | _ => replay stdin state table
   | .ok edit =>
     let state := apply_heap_edit state edit
     match edit.reply with
