@@ -7,3 +7,8 @@
  (name fault)
  (modules fault)
  (libraries unix))
+
+(executable
+ (name differential)
+ (modules differential)
+ (libraries unix execution))
